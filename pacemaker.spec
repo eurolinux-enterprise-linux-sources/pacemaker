@@ -56,7 +56,7 @@
 Name:          pacemaker
 Summary:       Scalable High-Availability cluster resource manager
 Version:       1.1.14
-Release:       %{pcmk_release}%{?dist}.1
+Release:       %{pcmk_release}%{?dist}.2
 License:       GPLv2+ and LGPLv2+
 Url:           http://www.clusterlabs.org
 Group:         System Environment/Daemons
@@ -68,6 +68,7 @@ Patch1:        pcmk-plugin-warning.patch
 Patch2:        pacemaker-no-doxygen.patch
 Patch3:        README_RGManager_porting.patch
 Patch4:        pacemaker-sbd-start.patch
+Patch5:        CVE-2016-7035.patch
 
 # graceful stops of pacemaker_remote
 Patch100:      0100-Refactor-lrmd-handle-shutdown-a-little-more-cleanly.patch
@@ -295,6 +296,7 @@ cp extra/rgmanager/README README_RGManager_porting
 %patch2 -p1
 %patch3 -p0
 %patch4 -p0
+%patch5 -p1
 
 %patch100 -p1
 %patch101 -p1
@@ -639,6 +641,11 @@ exit 0
 %doc AUTHORS
 
 %changelog
+* Mon Oct 24 2016 Ken Gaillot <kgaillot@redhat.com> - 1.1.14-8.2
+- Fix CVE-2016-7035
+
+  Resolves: rhbz#1374774
+
 * Fri Jul 15 2016 Ken Gaillot <kgaillot@redhat.com> - 1.1.14-8.1
  - add --skip-cman option when stopping pacemaker
 

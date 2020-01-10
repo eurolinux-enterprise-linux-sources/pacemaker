@@ -91,10 +91,11 @@ native_add_running(resource_t * rsc, node_t * node, pe_working_set_t * data_set)
                 clear_bit(rsc->flags, pe_rsc_managed);
                 set_bit(rsc->flags, pe_rsc_block);
 
-                /* If the group that the resource belongs to is configured with multiple-active=block, */
-                /* block the whole group. */
+                /* If the resource belongs to a group or bundle configured with
+                 * multiple-active=block, block the entire entity.
+                 */
                 if (rsc->parent
-                    && rsc->parent->variant == pe_group
+                    && (rsc->parent->variant == pe_group || rsc->parent->variant == pe_container)
                     && rsc->parent->recovery_type == recovery_block) {
                     GListPtr gIter = rsc->parent->children;
 
@@ -136,14 +137,14 @@ native_unpack(resource_t * rsc, pe_working_set_t * data_set)
 
     if (is_set(rsc->flags, pe_rsc_unique) && rsc->parent) {
 
-        if (safe_str_eq(class, "lsb")) {
+        if (safe_str_eq(class, PCMK_RESOURCE_CLASS_LSB)) {
             resource_t *top = uber_parent(rsc);
 
             force_non_unique_clone(top, rsc->id, data_set);
         }
     }
 
-    if (safe_str_eq(class, "ocf") == FALSE) {
+    if (safe_str_eq(class, PCMK_RESOURCE_CLASS_OCF) == FALSE) {
         const char *stateful = g_hash_table_lookup(parent->meta, "stateful");
 
         if (safe_str_eq(stateful, XML_BOOLEAN_TRUE)) {
@@ -157,65 +158,76 @@ native_unpack(resource_t * rsc, pe_working_set_t * data_set)
     return TRUE;
 }
 
+static bool
+rsc_is_on_node(resource_t *rsc, node_t *node, int flags)
+{
+    pe_rsc_trace(rsc, "Checking whether %s is on %s",
+                 rsc->id, node->details->uname);
+
+    if (is_set(flags, pe_find_current) && rsc->running_on) {
+
+        for (GListPtr iter = rsc->running_on; iter; iter = iter->next) {
+            node_t *loc = (node_t *) iter->data;
+
+            if (loc->details == node->details) {
+                return TRUE;
+            }
+        }
+
+    } else if (is_set(flags, pe_find_inactive) && (rsc->running_on == NULL)) {
+        return TRUE;
+
+    } else if (is_not_set(flags, pe_find_current) && rsc->allocated_to
+               && (rsc->allocated_to->details == node->details)) {
+        return TRUE;
+    }
+    return FALSE;
+}
+
 resource_t *
 native_find_rsc(resource_t * rsc, const char *id, node_t * on_node, int flags)
 {
-    gboolean match = FALSE;
+    bool match = FALSE;
     resource_t *result = NULL;
-    GListPtr gIter = rsc->children;
 
-    CRM_ASSERT(id != NULL);
+    CRM_CHECK(id && rsc && rsc->id, return NULL);
 
     if (flags & pe_find_clone) {
         const char *rid = ID(rsc->xml);
 
-        if (rsc->parent == NULL) {
+        if (!pe_rsc_is_clone(uber_parent(rsc))) {
             match = FALSE;
 
-        } else if (safe_str_eq(rsc->id, id)) {
-            match = TRUE;
-
-        } else if (safe_str_eq(rid, id)) {
+        } else if (!strcmp(id, rsc->id) || safe_str_eq(id, rid)) {
             match = TRUE;
         }
 
-    } else {
-        if (strcmp(rsc->id, id) == 0) {
-            match = TRUE;
+    } else if (!strcmp(id, rsc->id)) {
+        match = TRUE;
 
-        } else if (is_set(flags, pe_find_renamed)
-                   && rsc->clone_name && strcmp(rsc->clone_name, id) == 0) {
-            match = TRUE;
-        }
+    } else if (is_set(flags, pe_find_renamed)
+               && rsc->clone_name && strcmp(rsc->clone_name, id) == 0) {
+        match = TRUE;
+
+    } else if (is_set(flags, pe_find_any)
+               || (is_set(flags, pe_find_anon)
+                   && is_not_set(rsc->flags, pe_rsc_unique))) {
+        match = pe_base_name_eq(rsc, id);
     }
 
     if (match && on_node) {
-        pe_rsc_trace(rsc, "Now checking %s is on %s", rsc->id, on_node->details->uname);
-        if (is_set(flags, pe_find_current) && rsc->running_on) {
+        bool match_node = rsc_is_on_node(rsc, on_node, flags);
 
-            GListPtr gIter = rsc->running_on;
-
-            for (; gIter != NULL; gIter = gIter->next) {
-                node_t *loc = (node_t *) gIter->data;
-
-                if (loc->details == on_node->details) {
-                    return rsc;
-                }
-            }
-
-        } else if (is_set(flags, pe_find_inactive) && rsc->running_on == NULL) {
-            return rsc;
-
-        } else if (is_not_set(flags, pe_find_current) && rsc->allocated_to
-                   && rsc->allocated_to->details == on_node->details) {
-            return rsc;
+        if (match_node == FALSE) {
+            match = FALSE;
         }
+    }
 
-    } else if (match) {
+    if (match) {
         return rsc;
     }
 
-    for (; gIter != NULL; gIter = gIter->next) {
+    for (GListPtr gIter = rsc->children; gIter != NULL; gIter = gIter->next) {
         resource_t *child = (resource_t *) gIter->data;
 
         result = rsc->fns->find_rsc(child, id, on_node, flags);
@@ -247,8 +259,7 @@ native_parameter(resource_t * rsc, node_t * node, gboolean create, const char *n
             pe_rsc_trace(rsc, "Creating default hash");
         }
 
-        local_hash = g_hash_table_new_full(crm_str_hash, g_str_equal,
-                                           g_hash_destroy_str, g_hash_destroy_str);
+        local_hash = crm_str_table_new();
 
         get_rsc_attributes(local_hash, rsc, node, data_set);
 
@@ -360,17 +371,40 @@ native_pending_task(resource_t * rsc)
     return pending_task;
 }
 
+static enum rsc_role_e
+native_displayable_role(resource_t *rsc)
+{
+    enum rsc_role_e role = rsc->role;
+
+    if ((role == RSC_ROLE_STARTED)
+        && (uber_parent(rsc)->variant == pe_master)) {
+
+        role = RSC_ROLE_SLAVE;
+    }
+    return role;
+}
+
+static const char *
+native_displayable_state(resource_t *rsc, long options)
+{
+    const char *rsc_state = NULL;
+
+    if (options & pe_print_pending) {
+        rsc_state = native_pending_state(rsc);
+    }
+    if (rsc_state == NULL) {
+        rsc_state = role2text(native_displayable_role(rsc));
+    }
+    return rsc_state;
+}
+
 static void
 native_print_xml(resource_t * rsc, const char *pre_text, long options, void *print_data)
 {
-    enum rsc_role_e role = rsc->role;
     const char *class = crm_element_value(rsc->xml, XML_AGENT_ATTR_CLASS);
     const char *prov = crm_element_value(rsc->xml, XML_AGENT_ATTR_PROVIDER);
-    const char *rsc_state = NULL;
-
-    if(role == RSC_ROLE_STARTED && uber_parent(rsc)->variant == pe_master) {
-        role = RSC_ROLE_SLAVE;
-    }
+    const char *rsc_state = native_displayable_state(rsc, options);
+    const char *target_role = NULL;
 
     /* resource information. */
     status_print("%s<resource ", pre_text);
@@ -379,15 +413,16 @@ native_print_xml(resource_t * rsc, const char *pre_text, long options, void *pri
                  class,
                  prov ? "::" : "", prov ? prov : "", crm_element_value(rsc->xml, XML_ATTR_TYPE));
 
-    if (options & pe_print_pending) {
-        rsc_state = native_pending_state(rsc);
-    }
-    if (rsc_state == NULL) {
-        rsc_state = role2text(role);
-    }
     status_print("role=\"%s\" ", rsc_state);
+    if (rsc->meta) {
+        target_role = g_hash_table_lookup(rsc->meta, XML_RSC_ATTR_TARGET_ROLE);
+    }
+    if (target_role) {
+        status_print("target_role=\"%s\" ", target_role);
+    }
     status_print("active=\"%s\" ", rsc->fns->active(rsc, TRUE) ? "true" : "false");
     status_print("orphaned=\"%s\" ", is_set(rsc->flags, pe_rsc_orphan) ? "true" : "false");
+    status_print("blocked=\"%s\" ", is_set(rsc->flags, pe_rsc_block) ? "true" : "false");
     status_print("managed=\"%s\" ", is_set(rsc->flags, pe_rsc_managed) ? "true" : "false");
     status_print("failed=\"%s\" ", is_set(rsc->flags, pe_rsc_failed) ? "true" : "false");
     status_print("failure_ignored=\"%s\" ",
@@ -431,16 +466,23 @@ native_print_xml(resource_t * rsc, const char *pre_text, long options, void *pri
     }
 }
 
+/* making this inline rather than a macro prevents a coverity "unreachable"
+ * warning on the first usage
+ */
+static inline const char *
+comma_if(int i)
+{
+    return i? ", " : "";
+}
 
 void
-native_print(resource_t * rsc, const char *pre_text, long options, void *print_data)
+common_print(resource_t * rsc, const char *pre_text, const char *name, node_t *node, long options, void *print_data)
 {
-    node_t *node = NULL;
     const char *desc = NULL;
     const char *class = crm_element_value(rsc->xml, XML_AGENT_ATTR_CLASS);
     const char *kind = crm_element_value(rsc->xml, XML_ATTR_TYPE);
     const char *target_role = NULL;
-    enum rsc_role_e role = rsc->role;
+    enum rsc_role_e role = native_displayable_role(rsc);
 
     int offset = 0;
     int flagOffset = 0;
@@ -452,15 +494,11 @@ native_print(resource_t * rsc, const char *pre_text, long options, void *print_d
 
     if (rsc->meta) {
         const char *is_internal = g_hash_table_lookup(rsc->meta, XML_RSC_ATTR_INTERNAL_RSC);
-        if (crm_is_true(is_internal)) {
+        if (crm_is_true(is_internal) && is_not_set(options, pe_print_implicit)) {
             crm_trace("skipping print of internal resource %s", rsc->id);
             return;
         }
         target_role = g_hash_table_lookup(rsc->meta, XML_RSC_ATTR_TARGET_ROLE);
-    }
-
-    if(role == RSC_ROLE_STARTED && uber_parent(rsc)->variant == pe_master) {
-        role = RSC_ROLE_SLAVE;
     }
 
     if (pre_text == NULL && (options & pe_print_printf)) {
@@ -472,9 +510,6 @@ native_print(resource_t * rsc, const char *pre_text, long options, void *print_d
         return;
     }
 
-    if (rsc->running_on != NULL) {
-        node = rsc->running_on->data;
-    }
     if ((options & pe_print_rsconly) || g_list_length(rsc->running_on) > 1) {
         node = NULL;
     }
@@ -503,9 +538,9 @@ native_print(resource_t * rsc, const char *pre_text, long options, void *print_d
     if(pre_text) {
         offset += snprintf(buffer + offset, LINE_MAX - offset, "%s", pre_text);
     }
-    offset += snprintf(buffer + offset, LINE_MAX - offset, "%s", rsc_printable_id(rsc));
+    offset += snprintf(buffer + offset, LINE_MAX - offset, "%s", name);
     offset += snprintf(buffer + offset, LINE_MAX - offset, "\t(%s", class);
-    if (safe_str_eq(class, "ocf")) {
+    if (crm_provider_required(class)) {
         const char *prov = crm_element_value(rsc->xml, XML_AGENT_ATTR_PROVIDER);
         offset += snprintf(buffer + offset, LINE_MAX - offset, "::%s", prov);
     }
@@ -518,13 +553,8 @@ native_print(resource_t * rsc, const char *pre_text, long options, void *print_d
     } else if(is_set(rsc->flags, pe_rsc_failed)) {
         offset += snprintf(buffer + offset, LINE_MAX - offset, "FAILED");
     } else {
-        const char *rsc_state = NULL;
-        if (options & pe_print_pending) {
-            rsc_state = native_pending_state(rsc);
-        }
-        if (rsc_state == NULL) {
-            rsc_state = role2text(role);
-        }
+        const char *rsc_state = native_displayable_state(rsc, options);
+
         offset += snprintf(buffer + offset, LINE_MAX - offset, "%s", rsc_state);
     }
 
@@ -532,7 +562,8 @@ native_print(resource_t * rsc, const char *pre_text, long options, void *print_d
         offset += snprintf(buffer + offset, LINE_MAX - offset, " %s", node->details->uname);
 
         if (node->details->online == FALSE && node->details->unclean) {
-            flagOffset += snprintf(flagBuffer + flagOffset, LINE_MAX - flagOffset, "%sUNCLEAN", flagOffset?", ":"");
+            flagOffset += snprintf(flagBuffer + flagOffset, LINE_MAX - flagOffset,
+                                   "%sUNCLEAN", comma_if(flagOffset));
         }
     }
 
@@ -540,7 +571,8 @@ native_print(resource_t * rsc, const char *pre_text, long options, void *print_d
         const char *pending_task = native_pending_task(rsc);
 
         if (pending_task) {
-            flagOffset += snprintf(flagBuffer + flagOffset, LINE_MAX - flagOffset, "%s%s", flagOffset?", ":"", pending_task);
+            flagOffset += snprintf(flagBuffer + flagOffset, LINE_MAX - flagOffset,
+                                   "%s%s", comma_if(flagOffset), pending_task);
         }
     }
 
@@ -551,26 +583,31 @@ native_print(resource_t * rsc, const char *pre_text, long options, void *print_d
          * (and would also allow a Master to be Master).
          * Show if target role limits our abilities. */
         if (target_role_e == RSC_ROLE_STOPPED) {
-            flagOffset += snprintf(flagBuffer + flagOffset, LINE_MAX - flagOffset, "%sdisabled", flagOffset?", ":"");
+            flagOffset += snprintf(flagBuffer + flagOffset, LINE_MAX - flagOffset,
+                                   "%sdisabled", comma_if(flagOffset));
             rsc->cluster->disabled_resources++;
 
         } else if (uber_parent(rsc)->variant == pe_master
                    && target_role_e == RSC_ROLE_SLAVE) {
-            flagOffset += snprintf(flagBuffer + flagOffset, LINE_MAX - flagOffset, "%starget-role:%s", flagOffset?", ":"", target_role);
+            flagOffset += snprintf(flagBuffer + flagOffset, LINE_MAX - flagOffset,
+                                   "%starget-role:%s", comma_if(flagOffset), target_role);
             rsc->cluster->disabled_resources++;
         }
     }
 
     if (is_set(rsc->flags, pe_rsc_block)) {
-        flagOffset += snprintf(flagBuffer + flagOffset, LINE_MAX - flagOffset, "%sblocked", flagOffset?", ":"");
+        flagOffset += snprintf(flagBuffer + flagOffset, LINE_MAX - flagOffset,
+                               "%sblocked", comma_if(flagOffset));
         rsc->cluster->blocked_resources++;
 
     } else if (is_not_set(rsc->flags, pe_rsc_managed)) {
-        flagOffset += snprintf(flagBuffer + flagOffset, LINE_MAX - flagOffset, "%sunmanaged", flagOffset?", ":"");
+        flagOffset += snprintf(flagBuffer + flagOffset, LINE_MAX - flagOffset,
+                               "%sunmanaged", comma_if(flagOffset));
     }
 
     if(is_set(rsc->flags, pe_rsc_failure_ignored)) {
-        flagOffset += snprintf(flagBuffer + flagOffset, LINE_MAX - flagOffset, "%sfailure ignored", flagOffset?", ":"");
+        flagOffset += snprintf(flagBuffer + flagOffset, LINE_MAX - flagOffset,
+                               "%sfailure ignored", comma_if(flagOffset));
     }
 
     if ((options & pe_print_rsconly) || g_list_length(rsc->running_on) > 1) {
@@ -612,22 +649,22 @@ native_print(resource_t * rsc, const char *pre_text, long options, void *print_d
         }
 
         for (; gIter != NULL; gIter = gIter->next) {
-            node_t *node = (node_t *) gIter->data;
+            node_t *n = (node_t *) gIter->data;
 
             counter++;
 
             if (options & pe_print_html) {
-                status_print("<li>\n%s", node->details->uname);
+                status_print("<li>\n%s", n->details->uname);
 
             } else if ((options & pe_print_printf)
                        || (options & pe_print_ncurses)) {
-                status_print(" %s", node->details->uname);
+                status_print(" %s", n->details->uname);
 
             } else if ((options & pe_print_log)) {
-                status_print("\t%d : %s", counter, node->details->uname);
+                status_print("\t%d : %s", counter, n->details->uname);
 
             } else {
-                status_print("%s", node->details->uname);
+                status_print("%s", n->details->uname);
             }
             if (options & pe_print_html) {
                 status_print("</li>\n");
@@ -661,7 +698,7 @@ native_print(resource_t * rsc, const char *pre_text, long options, void *print_d
 
     if (options & pe_print_dev) {
         GHashTableIter iter;
-        node_t *node = NULL;
+        node_t *n = NULL;
 
         status_print("%s\t(%s%svariant=%s, priority=%f)", pre_text,
                      is_set(rsc->flags, pe_rsc_provisional) ? "provisional, " : "",
@@ -669,21 +706,38 @@ native_print(resource_t * rsc, const char *pre_text, long options, void *print_d
                      crm_element_name(rsc->xml), (double)rsc->priority);
         status_print("%s\tAllowed Nodes", pre_text);
         g_hash_table_iter_init(&iter, rsc->allowed_nodes);
-        while (g_hash_table_iter_next(&iter, NULL, (void **)&node)) {
-            status_print("%s\t * %s %d", pre_text, node->details->uname, node->weight);
+        while (g_hash_table_iter_next(&iter, NULL, (void **)&n)) {
+            status_print("%s\t * %s %d", pre_text, n->details->uname, n->weight);
         }
     }
 
     if (options & pe_print_max_details) {
         GHashTableIter iter;
-        node_t *node = NULL;
+        node_t *n = NULL;
 
         status_print("%s\t=== Allowed Nodes\n", pre_text);
         g_hash_table_iter_init(&iter, rsc->allowed_nodes);
-        while (g_hash_table_iter_next(&iter, NULL, (void **)&node)) {
-            print_node("\t", node, FALSE);
+        while (g_hash_table_iter_next(&iter, NULL, (void **)&n)) {
+            print_node("\t", n, FALSE);
         }
     }
+}
+
+void
+native_print(resource_t * rsc, const char *pre_text, long options, void *print_data)
+{
+    node_t *node = NULL;
+
+    CRM_ASSERT(rsc->variant == pe_native);
+    if (options & pe_print_xml) {
+        native_print_xml(rsc, pre_text, options, print_data);
+        return;
+    }
+
+    if (rsc->running_on != NULL) {
+        node = rsc->running_on->data;
+    }
+    common_print(rsc, pre_text, rsc_printable_id(rsc), node, options, print_data);
 }
 
 void
@@ -769,7 +823,7 @@ get_rscs_brief(GListPtr rsc_list, GHashTable * rsc_table, GHashTable * active_ta
         }
 
         offset += snprintf(buffer + offset, LINE_MAX - offset, "%s", class);
-        if (safe_str_eq(class, "ocf")) {
+        if (crm_provider_required(class)) {
             const char *prov = crm_element_value(rsc->xml, XML_AGENT_ATTR_PROVIDER);
             offset += snprintf(buffer + offset, LINE_MAX - offset, "::%s", prov);
         }
@@ -799,7 +853,7 @@ get_rscs_brief(GListPtr rsc_list, GHashTable * rsc_table, GHashTable * active_ta
 
                 node_table = g_hash_table_lookup(active_table, node->details->uname);
                 if (node_table == NULL) {
-                    node_table = g_hash_table_new_full(crm_str_hash, g_str_equal, free, free);
+                    node_table = crm_str_table_new();
                     g_hash_table_insert(active_table, strdup(node->details->uname), node_table);
                 }
 
@@ -829,7 +883,7 @@ void
 print_rscs_brief(GListPtr rsc_list, const char *pre_text, long options,
                  void *print_data, gboolean print_all)
 {
-    GHashTable *rsc_table = g_hash_table_new_full(crm_str_hash, g_str_equal, free, free);
+    GHashTable *rsc_table = crm_str_table_new();
     GHashTable *active_table = g_hash_table_new_full(crm_str_hash, g_str_equal,
                                                      free, destroy_node_table);
     GHashTableIter hash_iter;

@@ -455,7 +455,7 @@ remove_cib_device(xmlXPathObjectPtr xpathObj)
             standard = crm_element_value(match, XML_AGENT_ATTR_CLASS);
         }
 
-        if (safe_str_neq(standard, "stonith")) {
+        if (safe_str_neq(standard, PCMK_RESOURCE_CLASS_STONITH)) {
             continue;
         }
 
@@ -620,7 +620,7 @@ static void cib_device_update(resource_t *rsc, pe_working_set_t *data_set)
         GListPtr gIter = NULL;
         for (gIter = rsc->children; gIter != NULL; gIter = gIter->next) {
             cib_device_update(gIter->data, data_set);
-            if(rsc->variant == pe_clone || rsc->variant == pe_master) {
+            if(pe_rsc_is_clone(rsc)) {
                 crm_trace("Only processing one copy of the clone %s", rsc->id);
                 break;
             }
@@ -630,7 +630,7 @@ static void cib_device_update(resource_t *rsc, pe_working_set_t *data_set)
 
     /* We only care about STONITH resources. */
     rclass = crm_element_value(rsc->xml, XML_AGENT_ATTR_CLASS);
-    if(safe_str_neq(rclass, "stonith")) {
+    if (safe_str_neq(rclass, PCMK_RESOURCE_CLASS_STONITH)) {
         return;
     }
 
@@ -710,7 +710,6 @@ update_done:
 }
 
 extern xmlNode *do_calculations(pe_working_set_t * data_set, xmlNode * xml_input, crm_time_t * now);
-extern node_t *create_node(const char *id, const char *uname, const char *type, const char *score, pe_working_set_t * data_set);
 
 /*!
  * \internal
@@ -782,13 +781,13 @@ update_cib_stonith_devices_v2(const char *event, xmlNode * msg)
             }
             free(mutable);
 
-        } else if(strstr(xpath, "/"XML_CIB_TAG_RESOURCES)) {
+        } else if(strstr(xpath, XML_CIB_TAG_RESOURCES)) {
             shortpath = strrchr(xpath, '/'); CRM_ASSERT(shortpath);
             reason = crm_strdup_printf("%s %s", op, shortpath+1);
             needs_update = TRUE;
             break;
 
-        } else if(strstr(xpath, XML_CONS_TAG_RSC_LOCATION)) {
+        } else if(strstr(xpath, XML_CIB_TAG_CONSTRAINTS)) {
             shortpath = strrchr(xpath, '/'); CRM_ASSERT(shortpath);
             reason = crm_strdup_printf("%s %s", op, shortpath+1);
             needs_update = TRUE;
@@ -799,6 +798,8 @@ update_cib_stonith_devices_v2(const char *event, xmlNode * msg)
     if(needs_update) {
         crm_info("Updating device list from the cib: %s", reason);
         cib_devices_update();
+    } else {
+        crm_trace("No updates for device list found in cib");
     }
     free(reason);
 }
@@ -848,7 +849,7 @@ update_cib_stonith_devices_v1(const char *event, xmlNode * msg)
             rsc_id = crm_element_value(match, XML_ATTR_ID);
             standard = crm_element_value(match, XML_AGENT_ATTR_CLASS);
 
-            if (safe_str_neq(standard, "stonith")) {
+            if (safe_str_neq(standard, PCMK_RESOURCE_CLASS_STONITH)) {
                 continue;
             }
 
@@ -888,7 +889,7 @@ update_cib_stonith_devices(const char *event, xmlNode * msg)
 /* Needs to hold node name + attribute name + attribute value + 75 */
 #define XPATH_MAX 512
 
-/*
+/*!
  * \internal
  * \brief Check whether a node has a specific attribute name/value
  *
@@ -1139,7 +1140,8 @@ static void
 stonith_shutdown(int nsig)
 {
     stonith_shutdown_flag = TRUE;
-    crm_info("Terminating with  %d clients", crm_hash_table_size(client_connections));
+    crm_info("Terminating with %d clients",
+             crm_hash_table_size(client_connections));
     if (mainloop != NULL && g_main_is_running(mainloop)) {
         g_main_quit(mainloop);
     } else {
@@ -1217,7 +1219,7 @@ setup_cib(void)
 
     do {
         sleep(retries);
-        rc = cib_api->cmds->signon(cib_api, CRM_SYSTEM_CRMD, cib_command);
+        rc = cib_api->cmds->signon(cib_api, CRM_SYSTEM_STONITHD, cib_command);
     } while (rc == -ENOTCONN && ++retries < 5);
 
     if (rc != pcmk_ok) {
@@ -1288,7 +1290,7 @@ main(int argc, char **argv)
     int argerr = 0;
     int option_index = 0;
     crm_cluster_t cluster;
-    const char *actions[] = { "reboot", "off", "list", "monitor", "status" };
+    const char *actions[] = { "reboot", "off", "on", "list", "monitor", "status" };
 
     crm_log_preinit("stonith-ng", argc, argv);
     crm_set_options(NULL, "mode [options]", long_options,
@@ -1377,10 +1379,21 @@ main(int argc, char **argv)
 
         printf("  <parameter name=\"%s\" unique=\"0\">\n", STONITH_ATTR_DELAY_MAX);
         printf
-            ("    <shortdesc lang=\"en\">Enable random delay for stonith actions and specify the maximum of random delay</shortdesc>\n");
+            ("    <shortdesc lang=\"en\">Enable a random delay for stonith actions and specify the maximum of random delay.</shortdesc>\n");
         printf
             ("    <longdesc lang=\"en\">This prevents double fencing when using slow devices such as sbd.\n"
-             "Use this to enable random delay for stonith actions and specify the maximum of random delay.</longdesc>\n");
+             "Use this to enable a random delay for stonith actions.\n"
+             "The overall delay is derived from this random delay value adding a static delay so that the sum is kept below the maximum delay.</longdesc>\n");
+        printf("    <content type=\"time\" default=\"0s\"/>\n");
+        printf("  </parameter>\n");
+
+        printf("  <parameter name=\"%s\" unique=\"0\">\n", STONITH_ATTR_DELAY_BASE);
+        printf
+            ("    <shortdesc lang=\"en\">Enable a base delay for stonith actions and specify base delay value.</shortdesc>\n");
+        printf
+            ("    <longdesc lang=\"en\">This prevents double fencing when different delays are configured on the nodes.\n"
+             "Use this to enable a static delay for stonith actions.\n"
+             "The overall delay is derived from a random delay value adding this static delay so that the sum is kept below the maximum delay.</longdesc>\n");
         printf("    <content type=\"time\" default=\"0s\"/>\n");
         printf("  </parameter>\n");
 

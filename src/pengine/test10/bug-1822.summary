@@ -11,8 +11,9 @@ Online: [ process1a process2b ]
          master_slave_procdctl:1	(ocf::heartbeat:procdctl):	Master process1a
 
 Transition Summary:
- * Demote  master_slave_Stateful:1	(Master -> Stopped process1a)
- * Demote  master_slave_procdctl:1	(Master -> Stopped process1a)
+ * Shutdown process1a
+ * Stop       master_slave_Stateful:1     ( Master process1a )   due to node availability
+ * Stop       master_slave_procdctl:1     ( Master process1a )   due to node availability
 
 Executing cluster transition:
  * Pseudo action:   ms-sf_demote_0

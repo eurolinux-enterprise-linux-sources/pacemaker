@@ -44,8 +44,8 @@ static struct crm_option long_options[] = {
 
     {"-spacer-",1, 0, '-', "\nCommands:"},
     {"update",  1, 0, 'U', "Update the attribute's value in attrd.  If this causes the value to change, it will also be updated in the cluster configuration"},
-#ifdef HAVE_ATOMIC_ATTRD
     {"update-both", 1, 0, 'B', "Update the attribute's value and time to wait (dampening) in attrd. If this causes the value or dampening to change, the attribute will also be written to the cluster configuration, so be aware that repeatedly changing the dampening reduces its effectiveness."},
+#if HAVE_ATOMIC_ATTRD
     {"update-delay", 0, 0, 'Y', "Update the attribute's dampening in attrd (requires -d/--delay). If this causes the dampening to change, the attribute will also be written to the cluster configuration, so be aware that repeatedly changing the dampening reduces its effectiveness."},
     {"query",   0, 0, 'Q', "\tQuery the attribute's value from attrd"},
 #endif
@@ -56,7 +56,7 @@ static struct crm_option long_options[] = {
     {"delay",   1, 0, 'd', "The time to wait (dampening) in seconds for further changes before writing"},
     {"set",     1, 0, 's', "(Advanced) The attribute set in which to place the value"},
     {"node",    1, 0, 'N', "Set the attribute for the named node (instead of the local one)"},
-#ifdef HAVE_ATOMIC_ATTRD
+#if HAVE_ATOMIC_ATTRD
     {"all",     0, 0, 'A', "Show values of the attribute for all nodes (query only)"},
     /* lifetime could be implemented for atomic attrd if there is sufficient user demand */
     {"lifetime",1, 0, 'l', "(Deprecated) Lifetime of the node attribute (silently ignored by cluster)"},
@@ -73,7 +73,9 @@ static struct crm_option long_options[] = {
 };
 /* *INDENT-ON* */
 
+#if HAVE_ATOMIC_ATTRD
 static int do_query(const char *attr_name, const char *attr_node, gboolean query_all);
+#endif
 static int do_update(char command, const char *attr_node, const char *attr_name,
                      const char *attr_value, const char *attr_section,
                      const char *attr_set, const char *attr_dampen, int attr_options);
@@ -93,7 +95,7 @@ main(int argc, char **argv)
     const char *attr_dampen = NULL;
     char command = 'Q';
 
-#ifdef HAVE_ATOMIC_ATTRD
+#if HAVE_ATOMIC_ATTRD
     gboolean query_all = FALSE;
 #endif
 
@@ -134,23 +136,24 @@ main(int argc, char **argv)
             case 'N':
                 attr_node = strdup(optarg);
                 break;
-#ifdef HAVE_ATOMIC_ATTRD
+#if HAVE_ATOMIC_ATTRD
             case 'A':
                 query_all = TRUE;
+                break;
             case 'p':
                 set_bit(attr_options, attrd_opt_private);
                 break;
 #endif
             case 'q':
                 break;
-#ifdef HAVE_ATOMIC_ATTRD
+#if HAVE_ATOMIC_ATTRD
             case 'Y':
                 command = flag;
                 crm_log_args(argc, argv); /* Too much? */
                 break;
-            case 'B':
             case 'Q':
 #endif
+            case 'B':
             case 'R':
             case 'D':
             case 'U':
@@ -178,17 +181,33 @@ main(int argc, char **argv)
     }
 
     if (command == 'Q') {
-#ifdef HAVE_ATOMIC_ATTRD
+#if HAVE_ATOMIC_ATTRD
         crm_exit(do_query(attr_name, attr_node, query_all));
 #else
         crm_help('?', EX_USAGE);
 #endif
     } else {
+        /* @TODO We don't know whether the specified node is a Pacemaker Remote
+         * node or not, so we can't set attrd_opt_remote when appropriate.
+         * That's OK with atomic attrd, because it will learn and remember a
+         * node's "remoteness".
+         *
+         * Legacy attrd will simply ignore the request if it's a remote node. A
+         * possible solution would be to call query_node_uuid() (which is the
+         * approach crm_attribute takes), but that would require linking against
+         * libcluster, and would add the overhead of a synchronous CIB call to
+         * every update, even in clusters with no remote nodes. Since we haven't
+         * had user requests for this support, we'll leave it as it is for now.
+         */
+
+        attr_node = attrd_get_target(attr_node);
         crm_exit(do_update(command, attr_node, attr_name, attr_value,
                            attr_section, attr_set, attr_dampen, attr_options));
     }
     return crm_exit(pcmk_ok);
 }
+
+#if HAVE_ATOMIC_ATTRD
 
 /*!
  * \internal
@@ -330,9 +349,8 @@ do_query(const char *attr_name, const char *attr_node, gboolean query_all)
     /* Decide which node(s) to query */
     if (query_all == TRUE) {
         attr_node = NULL;
-    } else if (attr_node == NULL) {
-        crm_debug("User did not specify node for query, using localhost");
-        attr_node = "localhost";
+    } else {
+        attr_node = attrd_get_target(attr_node);
     }
 
     /* Build and send attrd request, and get XML reply */
@@ -362,6 +380,8 @@ do_query(const char *attr_name, const char *attr_node, gboolean query_all)
 
     return pcmk_ok;
 }
+
+#endif
 
 static int
 do_update(char command, const char *attr_node, const char *attr_name,

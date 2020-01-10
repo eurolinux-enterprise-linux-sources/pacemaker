@@ -262,17 +262,17 @@ cluster_connect_quorum(gboolean(*dispatch) (unsigned long long, gboolean),
 
     rc = quorum_initialize(&pcmk_quorum_handle, &quorum_callbacks, &quorum_type);
     if (rc != CS_OK) {
-        crm_err("Could not connect to the Quorum API: %d\n", rc);
+        crm_err("Could not connect to the Quorum API: %d", rc);
         goto bail;
 
     } else if (quorum_type != QUORUM_SET) {
-        crm_err("Corosync quorum is not configured\n");
+        crm_err("Corosync quorum is not configured");
         goto bail;
     }
 
     rc = quorum_getquorate(pcmk_quorum_handle, &quorate);
     if (rc != CS_OK) {
-        crm_err("Could not obtain the current Quorum API state: %d\n", rc);
+        crm_err("Could not obtain the current Quorum API state: %d", rc);
         goto bail;
     }
 
@@ -286,13 +286,13 @@ cluster_connect_quorum(gboolean(*dispatch) (unsigned long long, gboolean),
 
     rc = quorum_trackstart(pcmk_quorum_handle, CS_TRACK_CHANGES | CS_TRACK_CURRENT);
     if (rc != CS_OK) {
-        crm_err("Could not setup Quorum API notifications: %d\n", rc);
+        crm_err("Could not setup Quorum API notifications: %d", rc);
         goto bail;
     }
 
     rc = quorum_fd_get(pcmk_quorum_handle, &fd);
     if (rc != CS_OK) {
-        crm_err("Could not obtain the Quorum API connection: %d\n", rc);
+        crm_err("Could not obtain the Quorum API connection: %d", rc);
         goto bail;
     }
 
@@ -509,7 +509,7 @@ corosync_initialize_nodelist(void *cluster, gboolean force_member, xmlNode * xml
 
     crm_peer_init();
     crm_trace("Initializing corosync nodelist");
-    for (lpc = 0;; lpc++) {
+    for (lpc = 0; TRUE; lpc++) {
         uint32_t nodeid = 0;
         char *name = NULL;
         char *key = NULL;
@@ -548,12 +548,9 @@ corosync_initialize_nodelist(void *cluster, gboolean force_member, xmlNode * xml
             any = TRUE;
 
             if (xml_parent) {
-                char buffer[64];
                 xmlNode *node = create_xml_node(xml_parent, XML_CIB_TAG_NODE);
 
-                if(snprintf(buffer, 63, "%u", nodeid) > 0) {
-                    crm_xml_add(node, XML_ATTR_ID, buffer);
-                }
+                crm_xml_set_id(node, "%u", nodeid);
                 crm_xml_add(node, XML_ATTR_UNAME, name);
                 if (force_member) {
                     crm_xml_add(node, XML_ATTR_TYPE, CRM_NODE_MEMBER);

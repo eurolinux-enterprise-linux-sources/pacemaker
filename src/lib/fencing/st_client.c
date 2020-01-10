@@ -300,7 +300,7 @@ stonith_api_remove_level(stonith_t * st, int options, const char *node, int leve
                                          NULL, NULL, NULL, level);
 }
 
-/*
+/*!
  * \internal
  * \brief Create XML for stonithd topology level registration request
  *
@@ -353,7 +353,11 @@ create_level_registration_xml(const char *node, const char *pattern,
 
         crm_trace("Adding %s (%dc) at offset %d", device_list->value, adding, len);
         list = realloc_safe(list, len + adding + 1);       /* +1 EOS */
-        CRM_CHECK(list != NULL, free_xml(data); return NULL);
+        if (list == NULL) {
+            crm_perror(LOG_CRIT, "Could not create device list");
+            free_xml(data);
+            return NULL;
+        }
         sprintf(list + len, "%s%s", len?",":"", device_list->value);
         len += adding;
     }
@@ -390,11 +394,10 @@ stonith_api_register_level(stonith_t * st, int options, const char *node, int le
 }
 
 static void
-append_arg(gpointer key, gpointer value, gpointer user_data)
+append_arg(const char *key, const char *value, char **args)
 {
     int len = 3;                /* =, \n, \0 */
     int last = 0;
-    char **args = user_data;
 
     CRM_CHECK(key != NULL, return);
     CRM_CHECK(value != NULL, return);
@@ -414,22 +417,20 @@ append_arg(gpointer key, gpointer value, gpointer user_data)
     }
 
     *args = realloc_safe(*args, last + len);
-    crm_trace("Appending: %s=%s", (char *)key, (char *)value);
-    sprintf((*args) + last, "%s=%s\n", (char *)key, (char *)value);
+    crm_trace("Appending: %s=%s", key, value);
+    sprintf((*args) + last, "%s=%s\n", key, value);
 }
 
 static void
-append_const_arg(const char *key, const char *value, char **arg_list)
+append_config_arg(gpointer key, gpointer value, gpointer user_data)
 {
-    CRM_LOG_ASSERT(key && value);
-    if(key && value) {
-        char *glib_sucks_key = strdup(key);
-        char *glib_sucks_value = strdup(value);
-
-        append_arg(glib_sucks_key, glib_sucks_value, arg_list);
-
-        free(glib_sucks_value);
-        free(glib_sucks_key);
+    /* stonithd will filter action out when it registers the device,
+     * but ignore it here just in case any other library callers
+     * fail to do so.
+     */
+    if (safe_str_neq(key, STONITH_ATTR_ACTION_OP)) {
+        append_arg(key, value, user_data);
+        return;
     }
 }
 
@@ -442,7 +443,7 @@ append_host_specific_args(const char *victim, const char *map, GHashTable * para
     if (map == NULL) {
         /* The best default there is for now... */
         crm_debug("Using default arg map: port=uname");
-        append_const_arg("port", victim, arg_list);
+        append_arg("port", victim, arg_list);
         return;
     }
 
@@ -485,7 +486,7 @@ append_host_specific_args(const char *victim, const char *map, GHashTable * para
 
             if (value) {
                 crm_debug("Setting '%s'='%s' (%s) for %s", name, value, param, victim);
-                append_const_arg(name, value, arg_list);
+                append_arg(name, value, arg_list);
 
             } else {
                 crm_err("No node attribute '%s' for '%s'", name, victim);
@@ -512,24 +513,22 @@ make_args(const char *agent, const char *action, const char *victim, uint32_t vi
     char buffer[512];
     char *arg_list = NULL;
     const char *value = NULL;
-    const char *_action = action;
 
     CRM_CHECK(action != NULL, return NULL);
 
-    buffer[511] = 0;
-    snprintf(buffer, 511, "pcmk_%s_action", action);
+    snprintf(buffer, sizeof(buffer), "pcmk_%s_action", action);
     if (device_args) {
         value = g_hash_table_lookup(device_args, buffer);
     }
 
     if (value == NULL && device_args) {
-        /* Legacy support for early 1.1 releases - Remove for 1.4 */
-        snprintf(buffer, 511, "pcmk_%s_cmd", action);
+        /* @COMPAT deprecated since 1.1.6 */
+        snprintf(buffer, sizeof(buffer), "pcmk_%s_cmd", action);
         value = g_hash_table_lookup(device_args, buffer);
     }
 
     if (value == NULL && device_args && safe_str_eq(action, "off")) {
-        /* Legacy support for late 1.1 releases - Remove for 1.4 */
+        /* @COMPAT deprecated since 1.1.8 */
         value = g_hash_table_lookup(device_args, "pcmk_poweroff_action");
     }
 
@@ -538,7 +537,7 @@ make_args(const char *agent, const char *action, const char *victim, uint32_t vi
         action = value;
     }
 
-    append_const_arg(STONITH_ATTR_ACTION_OP, action, &arg_list);
+    append_arg(STONITH_ATTR_ACTION_OP, action, &arg_list);
     if (victim && device_args) {
         const char *alias = victim;
         const char *param = g_hash_table_lookup(device_args, STONITH_ATTR_HOSTARG);
@@ -550,13 +549,13 @@ make_args(const char *agent, const char *action, const char *victim, uint32_t vi
         /* Always supply the node's name too:
          *    https://fedorahosted.org/cluster/wiki/FenceAgentAPI
          */
-        append_const_arg("nodename", victim, &arg_list);
+        append_arg("nodename", victim, &arg_list);
         if (victim_nodeid) {
             char nodeid_str[33] = { 0, };
             if (snprintf(nodeid_str, 33, "%u", (unsigned int)victim_nodeid)) {
-                crm_info("For stonith action (%s) for victim %s, adding nodeid (%d) to parameters",
+                crm_info("For stonith action (%s) for victim %s, adding nodeid (%s) to parameters",
                          action, victim, nodeid_str);
-                append_const_arg("nodeid", nodeid_str, &arg_list);
+                append_arg("nodeid", nodeid_str, &arg_list);
             }
         }
 
@@ -565,6 +564,8 @@ make_args(const char *agent, const char *action, const char *victim, uint32_t vi
             value = agent;
 
         } else if (param == NULL) {
+            // @COMPAT config < 1.1.6
+            // pcmk_arg_map is deprecated in favor of pcmk_host_argument
             const char *map = g_hash_table_lookup(device_args, STONITH_ATTR_ARGMAP);
 
             if (map == NULL) {
@@ -572,7 +573,6 @@ make_args(const char *agent, const char *action, const char *victim, uint32_t vi
                 value = g_hash_table_lookup(device_args, param);
 
             } else {
-                /* Legacy handling */
                 append_host_specific_args(alias, map, device_args, &arg_list);
                 value = map;    /* Nothing more to do */
             }
@@ -588,24 +588,12 @@ make_args(const char *agent, const char *action, const char *victim, uint32_t vi
         if (value == NULL || safe_str_eq(value, "dynamic")) {
             crm_debug("Performing %s action for node '%s' as '%s=%s'", action, victim, param,
                       alias);
-            append_const_arg(param, alias, &arg_list);
+            append_arg(param, alias, &arg_list);
         }
     }
 
     if (device_args) {
-        g_hash_table_foreach(device_args, append_arg, &arg_list);
-    }
-
-    if(device_args && g_hash_table_lookup(device_args, STONITH_ATTR_ACTION_OP)) {
-        if(safe_str_eq(_action,"list")
-           || safe_str_eq(_action,"status")
-           || safe_str_eq(_action,"monitor")
-           || safe_str_eq(_action,"metadata")) {
-            /* Force use of the calculated command for support ops
-             * We don't want list or monitor ops initiating fencing, regardless of what the admin configured
-             */
-            append_const_arg(STONITH_ATTR_ACTION_OP, action, &arg_list);
-        }
+        g_hash_table_foreach(device_args, append_config_arg, &arg_list);
     }
 
     return arg_list;
@@ -707,7 +695,7 @@ stonith_action_create(const char *agent,
         char buffer[512];
         const char *value = NULL;
 
-        snprintf(buffer, 511, "pcmk_%s_retries", _action);
+        snprintf(buffer, sizeof(buffer), "pcmk_%s_retries", _action);
         value = g_hash_table_lookup(device_args, buffer);
 
         if (value) {
@@ -926,15 +914,17 @@ internal_stonith_action_execute(stonith_action_t * action)
 
     /* parent */
     action->pid = pid;
-    ret = fcntl(p_read_fd, F_SETFL, fcntl(p_read_fd, F_GETFL, 0) | O_NONBLOCK);
+    ret = crm_set_nonblocking(p_read_fd);
     if (ret < 0) {
-        crm_perror(LOG_NOTICE, "Could not change the output of %s to be non-blocking",
-                   action->agent);
+        crm_notice("Could not set output of %s to be non-blocking: %s "
+                   CRM_XS " rc=%d",
+                   action->agent, pcmk_strerror(rc), rc);
     }
-    ret = fcntl(p_stderr_fd, F_SETFL, fcntl(p_stderr_fd, F_GETFL, 0) | O_NONBLOCK);
+    ret = crm_set_nonblocking(p_stderr_fd);
     if (ret < 0) {
-        crm_perror(LOG_NOTICE, "Could not change the stderr of %s to be non-blocking",
-                   action->agent);
+        crm_notice("Could not set error output of %s to be non-blocking: %s "
+                   CRM_XS " rc=%d",
+                   action->agent, pcmk_strerror(rc), rc);
     }
 
     do {
@@ -1184,8 +1174,8 @@ stonith_api_device_list(stonith_t * stonith, int call_options, const char *names
                     free(namelist[file_num]);
                     continue;
 
-                } else if (0 != strncmp(RH_STONITH_PREFIX,
-                                        namelist[file_num]->d_name, strlen(RH_STONITH_PREFIX))) {
+                } else if (!crm_starts_with(namelist[file_num]->d_name,
+                                            RH_STONITH_PREFIX)) {
                     free(namelist[file_num]);
                     continue;
                 }
@@ -1289,11 +1279,11 @@ stonith_api_device_metadata(stonith_t * stonith, int call_options, const char *a
 
             tmp = create_xml_node(actions, "action");
             crm_xml_add(tmp, "name", "stop");
-            crm_xml_add(tmp, "timeout", "20s");
+            crm_xml_add(tmp, "timeout", CRM_DEFAULT_OP_TIMEOUT_S);
 
             tmp = create_xml_node(actions, "action");
             crm_xml_add(tmp, "name", "start");
-            crm_xml_add(tmp, "timeout", "20s");
+            crm_xml_add(tmp, "timeout", CRM_DEFAULT_OP_TIMEOUT_S);
         }
 
         freeXpathObject(xpathObj);

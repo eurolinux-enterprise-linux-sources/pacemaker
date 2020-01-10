@@ -37,13 +37,13 @@
 #  include <libxml/tree.h>
 #  include <libxml/xpath.h>
 
-/* Compression costs a LOT, don't do it unless we're hitting message limits
+/* Define compression parameters for IPC messages
  *
- * For now, use 256k as the lower size, which means we can have 4 big data fields
- *  before we hit heartbeat's message limit
- *
- * The previous limit was 10k, compressing 184 of 1071 messages accounted for 23%
- *  of the total CPU used by the cib
+ * Compression costs a LOT, so we don't want to do it unless we're hitting
+ * message limits. Currently, we use 128KB as the threshold, because higher
+ * values don't play well with the heartbeat stack. With an earlier limit of
+ * 10KB, compressing 184 of 1071 messages accounted for 23% of the total CPU
+ * used by the cib.
  */
 #  define CRM_BZ2_BLOCKS		4
 #  define CRM_BZ2_WORK		20
@@ -54,6 +54,9 @@
 gboolean add_message_xml(xmlNode * msg, const char *field, xmlNode * xml);
 xmlNode *get_message_xml(xmlNode * msg, const char *field);
 GHashTable *xml2list(xmlNode * parent);
+
+xmlNode *crm_create_nvpair_xml(xmlNode *parent, const char *id,
+                               const char *name, const char *value);
 
 void hash2nvpair(gpointer key, gpointer value, gpointer user_data);
 void hash2field(gpointer key, gpointer value, gpointer user_data);
@@ -107,7 +110,7 @@ const char *crm_xml_add_int(xmlNode * node, const char *name, int value);
  * Add an attribute with the value XML_BOOLEAN_TRUE or XML_BOOLEAN_FALSE
  * as appropriate to an XML object.
  *
- * \param[in/out] node   XML object to add attribute to
+ * \param[in,out] node   XML object to add attribute to
  * \param[in]     name   Name of attribute to add
  * \param[in]     value  Boolean whose value will be tested
  *
@@ -210,6 +213,24 @@ crm_element_name(xmlNode *xml)
 
 const char *crm_element_value(xmlNode * data, const char *name);
 
+/*!
+ * \brief Copy an element from one XML object to another
+ *
+ * \param[in]     obj1     Source XML
+ * \param[in,out] obj2     Destination XML
+ * \param[in]     element  Name of element to copy
+ *
+ * \return Pointer to copied value (from source)
+ */
+static inline const char *
+crm_copy_xml_element(xmlNode *obj1, xmlNode *obj2, const char *element)
+{
+    const char *value = crm_element_value(obj1, element);
+
+    crm_xml_add(obj2, element, value);
+    return value;
+}
+
 void xml_validate(const xmlNode * root);
 
 gboolean xml_has_children(const xmlNode * root);
@@ -219,11 +240,54 @@ char *calculate_operation_digest(xmlNode * local_cib, const char *version);
 char *calculate_xml_versioned_digest(xmlNode * input, gboolean sort, gboolean do_filter,
                                      const char *version);
 
+/* schema-related functions (from schemas.c) */
 gboolean validate_xml(xmlNode * xml_blob, const char *validation, gboolean to_logs);
 gboolean validate_xml_verbose(xmlNode * xml_blob);
-int update_validation(xmlNode ** xml_blob, int *best, int max, gboolean transform, gboolean to_logs);
+
+/*!
+ * \brief Update CIB XML to most recent schema version
+ *
+ * "Update" means either actively employ XSLT-based transformation(s)
+ * (if intermediate product to transform valid per its declared schema version,
+ * transformation available, proceeded successfully with a result valid per
+ * expectated newer schema version), or just try to bump the marked validating
+ * schema until all gradually rising schema versions attested or the first
+ * such attempt subsequently fails to validate.   Which of the two styles will
+ * be used depends on \p transform parameter (positive/negative, respectively).
+ *
+ * \param[in,out] xml_blob   XML tree representing CIB, may be swapped with
+ *                           an "updated" one
+ * \param[out]    best       The highest configuration version (per its index
+ *                           in the global schemas table) it was possible to
+ *                           reach during the update steps while ensuring
+ *                           the validity of the result; if no validation
+ *                           success was observed against possibly multiple
+ *                           schemas, the value is less or equal the result
+ *                           of <tt>get_schema_version</tt> applied on the
+ *                           input \p xml_blob value (unless that function
+ *                           maps it to -1, then 0 would be used instead)
+ * \param[in]     max        When \p transform is positive, this allows to
+ *                           set upper boundary schema (per its index in the
+ *                           global schemas table) beyond which its forbidden
+ *                           to update by the means of XSLT transformation
+ * \param[in]     transform  Whether to employ XSLT-based transformation so
+ *                           as allow overcoming possible incompatibilities
+ *                           between major schema versions (see above)
+ * \param[in]     to_logs    If true, output notable progress info to
+ *                           internal log streams; if false, to stderr
+ *
+ * \return <tt>pcmk_ok</tt> if no non-recoverable error encountered (up to
+ *         caller to evaluate if the update satisfies the requirements
+ *         per returned \p best value), negative value carrying the reason
+ *         otherwise
+ */
+int update_validation(xmlNode **xml_blob, int *best, int max,
+                      gboolean transform, gboolean to_logs);
+
 int get_schema_version(const char *name);
 const char *get_schema_name(int version);
+const char *xml_latest_schema(void);
+gboolean cli_config_update(xmlNode ** xml, int *best_version, gboolean to_logs);
 
 void crm_xml_init(void);
 void crm_xml_cleanup(void);
@@ -255,26 +319,44 @@ __xml_next(xmlNode * child)
 }
 
 static inline xmlNode *
+__xml_first_child_element(xmlNode * parent)
+{
+    xmlNode *child = NULL;
+
+    if (parent) {
+        child = parent->children;
+    }
+
+    while (child) {
+        if(child->type == XML_ELEMENT_NODE) {
+            return child;
+        }
+        child = child->next;
+    }
+    return NULL;
+}
+
+static inline xmlNode *
 __xml_next_element(xmlNode * child)
 {
-    if (child) {
+    while (child) {
         child = child->next;
-        while (child && child->type != XML_ELEMENT_NODE) {
-            child = child->next;
+        if(child && child->type == XML_ELEMENT_NODE) {
+            return child;
         }
     }
-    return child;
+    return NULL;
 }
 
 void free_xml(xmlNode * child);
 
 xmlNode *first_named_child(xmlNode * parent, const char *name);
+xmlNode *crm_next_same_xml(xmlNode *sibling);
 
 xmlNode *sorted_xml(xmlNode * input, xmlNode * parent, gboolean recursive);
 xmlXPathObjectPtr xpath_search(xmlNode * xml_top, const char *path);
 void crm_foreach_xpath_result(xmlNode *xml, const char *xpath,
                               void (*helper)(xmlNode*, void*), void *user_data);
-gboolean cli_config_update(xmlNode ** xml, int *best_version, gboolean to_logs);
 xmlNode *expand_idref(xmlNode * input, xmlNode * top);
 
 void freeXpathObject(xmlXPathObjectPtr xpathObj);
@@ -288,8 +370,6 @@ static inline int numXpathResults(xmlXPathObjectPtr xpathObj)
     }
     return xpathObj->nodesetval->nodeNr;
 }
-
-const char *xml_latest_schema(void);
 
 bool xml_acl_enabled(xmlNode *xml);
 void xml_acl_disable(xmlNode *xml);
@@ -315,4 +395,13 @@ void save_xml_to_file(xmlNode * xml, const char *desc, const char *filename);
 char *xml_get_path(xmlNode *xml);
 
 char * crm_xml_escape(const char *text);
+void crm_xml_sanitize_id(char *id);
+void crm_xml_set_id(xmlNode *xml, const char *format, ...)
+    __attribute__ ((__format__ (__printf__, 2, 3)));
+
+/*!
+ * \brief xmlNode destructor which can be used in glib collections
+ */
+void crm_destroy_xml(gpointer data);
+
 #endif

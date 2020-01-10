@@ -11,7 +11,8 @@ OFFLINE: [ xen-c ]
      apache_6	(ocf::heartbeat:apache):	Stopped 
 
 Transition Summary:
- * Stop    IPaddr_192_168_1_102	(xen-b)
+ * Shutdown xen-b
+ * Stop    IPaddr_192_168_1_102	(xen-b)  	due to node availability
 
 Executing cluster transition:
  * Pseudo action:   group_11_stop_0

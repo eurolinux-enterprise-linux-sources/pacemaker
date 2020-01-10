@@ -31,9 +31,8 @@
 
 #  include <crm/lrmd.h>
 #  include <crm/common/logging.h>
-#  include <crm/common/io.h>
 #  include <crm/common/ipcs.h>
-#  include <crm/common/procfs.h>
+#  include <crm/common/internal.h>
 
 /* Dynamic loading of libraries */
 void *find_library_function(void **handle, const char *lib, const char *fn, int fatal);
@@ -127,18 +126,12 @@ gboolean check_time(const char *value);
 gboolean check_timer(const char *value);
 gboolean check_boolean(const char *value);
 gboolean check_number(const char *value);
+gboolean check_positive_number(const char *value);
 gboolean check_quorum(const char *value);
 gboolean check_script(const char *value);
 gboolean check_utilization(const char *value);
+long crm_get_sbd_timeout(void);
 gboolean check_sbd_timeout(const char *value);
-
-/* Shared PE/crmd functionality */
-void filter_action_parameters(xmlNode * param_set, const char *version);
-
-/* Resource operation updates */
-xmlNode *create_operation_update(xmlNode * parent, lrmd_event_data_t * event,
-                                 const char * caller_version, int target_rc, const char * node,
-                                 const char * origin, int level);
 
 /* char2score */
 extern int node_score_red;
@@ -147,66 +140,57 @@ extern int node_score_yellow;
 extern int node_score_infinity;
 
 /* Assorted convenience functions */
-static inline int
-crm_strlen_zero(const char *s)
-{
-    return !s || *s == '\0';
-}
-
-char *add_list_element(char *list, const char *value);
-
 int crm_pid_active(long pid, const char *daemon);
 void crm_make_daemon(const char *name, gboolean daemonize, const char *pidfile);
 
+/* from operations.c */
 char *generate_op_key(const char *rsc_id, const char *op_type, int interval);
 char *generate_notify_key(const char *rsc_id, const char *notify_type, const char *op_type);
 char *generate_transition_magic_v202(const char *transition_key, int op_status);
 char *generate_transition_magic(const char *transition_key, int op_status, int op_rc);
 char *generate_transition_key(int action, int transition_id, int target_rc, const char *node);
+void filter_action_parameters(xmlNode *param_set, const char *version);
+xmlNode *create_operation_update(xmlNode *parent, lrmd_event_data_t *event,
+                                 const char *caller_version, int target_rc,
+                                 const char *node, const char *origin,
+                                 int level);
 
 static inline long long
-crm_clear_bit(const char *function, const char *target, long long word, long long bit)
+crm_clear_bit(const char *function, int line, const char *target, long long word, long long bit)
 {
     long long rc = (word & ~bit);
 
     if (rc == word) {
         /* Unchanged */
     } else if (target) {
-        crm_trace("Bit 0x%.8llx for %s cleared by %s", bit, target, function);
+        crm_trace("Bit 0x%.8llx for %s cleared by %s:%d", bit, target, function, line);
     } else {
-        crm_trace("Bit 0x%.8llx cleared by %s", bit, function);
+        crm_trace("Bit 0x%.8llx cleared by %s:%d", bit, function, line);
     }
 
     return rc;
 }
 
 static inline long long
-crm_set_bit(const char *function, const char *target, long long word, long long bit)
+crm_set_bit(const char *function, int line, const char *target, long long word, long long bit)
 {
     long long rc = (word | bit);
 
     if (rc == word) {
         /* Unchanged */
     } else if (target) {
-        crm_trace("Bit 0x%.8llx for %s set by %s", bit, target, function);
+        crm_trace("Bit 0x%.8llx for %s set by %s:%d", bit, target, function, line);
     } else {
-        crm_trace("Bit 0x%.8llx set by %s", bit, function);
+        crm_trace("Bit 0x%.8llx set by %s:%d", bit, function, line);
     }
 
     return rc;
 }
 
-#  define set_bit(word, bit) word = crm_set_bit(__FUNCTION__, NULL, word, bit)
-#  define clear_bit(word, bit) word = crm_clear_bit(__FUNCTION__, NULL, word, bit)
+#  define set_bit(word, bit) word = crm_set_bit(__FUNCTION__, __LINE__, NULL, word, bit)
+#  define clear_bit(word, bit) word = crm_clear_bit(__FUNCTION__, __LINE__, NULL, word, bit)
 
-void g_hash_destroy_str(gpointer data);
-
-long long crm_int_helper(const char *text, char **end_text);
-char *crm_concat(const char *prefix, const char *suffix, char join);
 char *generate_hash_key(const char *crm_msg_reference, const char *sys);
-
-bool crm_compress_string(const char *data, int length, int max, char **result,
-                         unsigned int *result_len);
 
 /*! remote tcp/tls helper functions */
 typedef struct crm_remote_s crm_remote_t;
@@ -218,6 +202,8 @@ xmlNode *crm_remote_parse_buffer(crm_remote_t * remote);
 int crm_remote_tcp_connect(const char *host, int port);
 int crm_remote_tcp_connect_async(const char *host, int port, int timeout,       /*ms */
                                  int *timer_id, void *userdata, void (*callback) (void *userdata, int sock));
+int crm_remote_accept(int ssock);
+void crm_sockaddr2str(void *sa, char *s);
 
 #  ifdef HAVE_GNUTLS_GNUTLS_H
 /*!
@@ -287,6 +273,9 @@ long crm_read_pidfile(const char *filename);
 #  define F_ATTRD_USER		"attr_user"
 #  define F_ATTRD_WRITER	"attr_writer"
 #  define F_ATTRD_VERSION	"attr_version"
+#  define F_ATTRD_RESOURCE          "attr_resource"
+#  define F_ATTRD_OPERATION         "attr_clear_operation"
+#  define F_ATTRD_INTERVAL          "attr_clear_interval"
 
 /* attrd operations */
 #  define ATTRD_OP_PEER_REMOVE   "peer-remove"
@@ -298,6 +287,10 @@ long crm_read_pidfile(const char *filename);
 #  define ATTRD_OP_FLUSH         "flush"
 #  define ATTRD_OP_SYNC          "sync"
 #  define ATTRD_OP_SYNC_RESPONSE "sync-response"
+#  define ATTRD_OP_CLEAR_FAILURE "clear-failure"
+
+#  define PCMK_ENV_PHYSICAL_HOST "physical_host"
+
 
 #  if SUPPORT_COROSYNC
 #    if CS_USES_LIBQB
@@ -309,12 +302,6 @@ typedef struct qb_ipc_response_header cs_ipc_header_response_t;
 #      include <corosync/corodefs.h>
 #      include <corosync/coroipcc.h>
 #      include <corosync/coroipc_types.h>
-static inline int
-qb_to_cs_error(int a)
-{
-    return a;
-}
-
 typedef coroipc_request_header_t cs_ipc_header_request_t;
 typedef coroipc_response_header_t cs_ipc_header_response_t;
 #    endif
@@ -381,14 +368,24 @@ typedef struct remote_proxy_s {
     crm_ipc_t *ipc;
     mainloop_io_t *source;
     uint32_t last_request_id;
+    lrmd_t *lrm;
 
 } remote_proxy_t;
-void remote_proxy_notify_destroy(lrmd_t *lrmd, const char *session_id);
+
+remote_proxy_t *remote_proxy_new(
+    lrmd_t *lrmd, struct ipc_client_callbacks *proxy_callbacks,
+    const char *node_name, const char *session_id, const char *channel);
+
+int  remote_proxy_check(lrmd_t *lrmd, GHashTable *hash);
+void remote_proxy_cb(lrmd_t *lrmd, const char *node_name, xmlNode *msg);
 void remote_proxy_ack_shutdown(lrmd_t *lrmd);
-void remote_proxy_relay_event(lrmd_t *lrmd, const char *session_id, xmlNode *msg);
-void remote_proxy_relay_response(lrmd_t *lrmd, const char *session_id, xmlNode *msg, int msg_id);
-void remote_proxy_end_session(const char *session);
+void remote_proxy_nack_shutdown(lrmd_t *lrmd);
+
+int  remote_proxy_dispatch(const char *buffer, ssize_t length, gpointer userdata);
+void remote_proxy_disconnected(gpointer data);
 void remote_proxy_free(gpointer data);
-int  remote_proxy_check(lrmd_t * lrmd, GHashTable *hash);
+
+void remote_proxy_relay_event(remote_proxy_t *proxy, xmlNode *msg);
+void remote_proxy_relay_response(remote_proxy_t *proxy, xmlNode *msg, int msg_id);
 
 #endif                          /* CRM_INTERNAL__H */

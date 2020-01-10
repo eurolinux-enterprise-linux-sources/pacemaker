@@ -33,6 +33,8 @@
 #include <crm/common/mainloop.h>
 #include <crm/common/ipcs.h>
 
+#include <qb/qbarray.h>
+
 struct mainloop_child_s {
     pid_t pid;
     char *desc;
@@ -1059,7 +1061,7 @@ mainloop_child_kill(pid_t pid)
 
     rc = child_kill_helper(match);
     if(rc == -ESRCH) {
-        /* Its gone, but hasn't shown up in waitpid() yet
+        /* It's gone, but hasn't shown up in waitpid() yet
          *
          * Wait until we get SIGCHLD and let child_death_dispatch()
          * clean it up as normal (so we get the correct return

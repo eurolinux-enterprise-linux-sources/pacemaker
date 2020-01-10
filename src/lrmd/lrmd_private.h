@@ -61,7 +61,7 @@ typedef struct lrmd_rsc_s {
 
 #  ifdef HAVE_GNUTLS_GNUTLS_H
 /* in remote_tls.c */
-int lrmd_init_remote_tls_server(int port);
+int lrmd_init_remote_tls_server(void);
 void lrmd_tls_server_destroy(void);
 
 /* Hidden in lrmd client lib */
@@ -81,6 +81,8 @@ void process_lrmd_message(crm_client_t * client, uint32_t id, xmlNode * request)
 void free_rsc(gpointer data);
 
 void handle_shutdown_ack(void);
+
+void handle_shutdown_nack(void);
 
 void lrmd_client_destroy(crm_client_t *client);
 
@@ -109,5 +111,6 @@ crm_client_t *ipc_proxy_get_provider(void);
 int ipc_proxy_shutdown_req(crm_client_t *ipc_proxy);
 #endif
 
+int process_lrmd_alert_exec(crm_client_t *client, uint32_t id, xmlNode *request);
+void lrmd_drain_alerts(GMainContext *ctx);
 #endif
-

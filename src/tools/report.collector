@@ -249,13 +249,17 @@ getconfig() {
     else
 	echo "$host" > $target/STOPPED
     fi
+}
+
+get_readable_cib() {
+    target="$1"; shift;
 
     if [ -f "$target/$CIB_F" ]; then
-	crm_verify -V -x $target/$CIB_F >$target/$CRM_VERIFY_F 2>&1
+        crm_verify -V -x "$target/$CIB_F" >"$target/$CRM_VERIFY_F" 2>&1
         if which crm >/dev/null 2>&1 ; then
-            CIB_file=$target/$CIB_F crm configure show >$target/$CIB_TXT_F 2>&1
+            CIB_file="$target/$CIB_F" crm configure show >"$target/$CIB_TXT_F" 2>&1
         elif which pcs >/dev/null 2>&1 ; then
-            pcs config -f $target/$CIB_F >$target/$CIB_TXT_F 2>&1
+            pcs config -f "$target/$CIB_F" >"$target/$CIB_TXT_F" 2>&1
         fi
     fi
 }
@@ -539,6 +543,39 @@ dlm_dump() {
     fi
 }
 
+drbd_info() {
+    test -f /proc/drbd && {
+        echo "--- /proc/drbd:"
+        cat /proc/drbd 2>&1
+        echo
+    }
+
+    if which drbd-overview >/dev/null 2>&1; then
+        echo "--- drbd-overview:"
+        drbd-overview 2>&1
+        echo
+    fi
+
+    if which drbdsetup >/dev/null 2>&1; then
+        echo "--- drbdsetup status:"
+        drbdsetup status --verbose --statistics 2>&1
+        echo
+
+        echo "--- drbdsetup events2:"
+        drbdsetup events2 --timestamps --statistics --now 2>&1
+        echo
+    fi
+
+    if which drbdadm >/dev/null 2>&1; then
+        echo "--- drbdadm show-gi:"
+        for res in $(drbdsetup status | grep -e ^\\S | awk '{ print $1 }'); do
+            echo "$res:"
+            drbdadm show-gi $res 2>&1
+            echo
+        done
+    fi
+}
+
 iscfvarset() {
     test "`getcfvar $1 $2`"
 }
@@ -656,6 +693,85 @@ EOF
     esac
 }
 
+# Trim leading and ending whitespace (using only POSIX expressions)
+trim() {
+    TRIM_S="$1"
+
+    TRIM_S="${TRIM_S#"${TRIM_S%%[![:space:]]*}"}"
+    TRIM_S="${TRIM_S%"${TRIM_S##*[![:space:]]}"}"
+    echo -n "$TRIM_S"
+}
+
+collect_logs() {
+    CL_START="$1"
+    shift
+    CL_END="$1"
+    shift
+    CL_LOGFILES="$@"
+
+    which journalctl > /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        cl_have_journald=1
+    else
+        cl_have_journald=0
+    fi
+
+    cl_lognames="$CL_LOGFILES"
+    if [ $cl_have_journald -eq 1 ]; then
+        cl_lognames="$cl_lognames journalctl"
+    fi
+    cl_lognames=$(trim "$cl_lognames")
+    if [ -z "$cl_lognames" ]; then
+        return
+    fi
+
+    # YYYY-MM-DD HH:MM:SS
+    cl_start_ymd=$(date -d @${CL_START} +"%F %T")
+    cl_end_ymd=$(date -d @${CL_END} +"%F %T")
+
+    debug "Gathering logs from $cl_start_ymd to $cl_end_ymd:"
+    debug "   $cl_lognames"
+
+    # Remove our temporary file if we get interrupted here
+    trap '[ -z "$cl_pattfile" ] || rm -f "$cl_pattfile"' 0
+
+    # Create a temporary file with patterns to grep for
+    cl_pattfile=$(mktemp) || fatal "cannot create temporary files"
+    for cl_pattern in $LOG_PATTERNS; do
+        echo "$cl_pattern"
+    done > $cl_pattfile
+
+    echo "Log pattern matches from $REPORT_TARGET:" > $ANALYSIS_F
+    if [ -n "$CL_LOGFILES" ]; then
+        for cl_logfile in $CL_LOGFILES; do
+            cl_extract="$(basename $cl_logfile).extract.txt"
+
+            if [ ! -f "$cl_logfile" ]; then
+                # Not a file
+                continue
+
+            elif [ -f "$cl_extract" ]; then
+                # We already have it
+                continue
+            fi
+
+            dumplogset "$cl_logfile" $LOG_START $LOG_END > "$cl_extract"
+            sanitize "$cl_extract"
+
+            grep -f "$cl_pattfile" "$cl_extract" >> $ANALYSIS_F
+        done
+    fi
+
+    # Collect systemd logs if present
+    if [ $cl_have_journald -eq 1 ]; then
+        journalctl --since "$cl_start_ymd" --until "$cl_end_ymd" > journal.log
+        grep -f "$cl_pattfile" journal.log >> $ANALYSIS_F
+    fi
+
+    rm -f $cl_pattfile
+    trap "" 0
+}
+
 debug "Initializing $REPORT_TARGET subdir"
 if [ "$REPORT_MASTER" != "$REPORT_TARGET" ]; then
   if [ -e $REPORT_HOME/$REPORT_TARGET ]; then
@@ -681,17 +797,19 @@ if [ -z "$cluster_cf" ] && [ $cluster != "any" ]; then
    warning "Could not determine the location of your cluster configuration"
 fi
 
-if [ $SEARCH_LOGS = 1 ]; then
-    logfiles=`get_logfiles $cluster "$cluster_cf" "$logd_cf" | sort -u`
-    if [ -z "$logfiles" ]; then
-	fatal "Logfile discovery disabled, try specifying --logfile /some/path"
+if [ "$SEARCH_LOGS" = "1" ]; then
+    logfiles=$(get_logfiles "$cluster" "$cluster_cf" "$logd_cf" | sort -u)
+fi
+logfiles="$(trim "$logfiles $EXTRA_LOGS")"
+
+if [ -z "$logfiles" ]; then
+    which journalctl > /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        info "Systemd journal will be only log collected"
+    else
+        info "No logs will be collected"
     fi
-
-elif [ -z "$EXTRA_LOGS" ]; then
-   fatal "Could not determine the location of your cluster logs, try specifying --logfile /some/path"
-
-else
-    logfiles="$EXTRA_LOGS"
+    info "No log files found or specified with --logfile /some/path"
 fi
 
 debug "Config: $cluster ($cluster_cf $logd_cf) $logfiles"
@@ -726,6 +844,7 @@ fi
 
 dlm_dump  > $DLM_DUMP_F 2>&1
 sys_stats > $SYSSTATS_F 2>&1
+drbd_info > $DRBD_INFO_F 2>&1
 
 debug "Sanitizing files: $SANITIZE"
 #
@@ -735,51 +854,17 @@ cf=""
 if [ ! -z "$cluster_cf" ]; then
    cf=`basename $cluster_cf`
 fi
-for f in $cf $CIB_F $CIB_TXT_F $CIB_F.live pengine/*; do
+for f in "$cf" "$CIB_F" "$CIB_F.live" pengine/*; do
     if [ -f "$f" ]; then
-	sanitize $f
+	sanitize "$f"
     fi
 done
 
-# Grab logs
-start=`date -d @${LOG_START} +"%F %T"`
-end=`date -d @${LOG_END} +"%F %T"`
+# For convenience, generate human-readable version of CIB and any XML errors
+# in it (AFTER sanitizing, so we don't need to sanitize this output)
+get_readable_cib "$REPORT_HOME/$REPORT_TARGET"
 
-debug "Gathering logs from $start to $end: $logfiles $EXTRA_LOGS"
-trap '[ -z "$pattfile" ] || rm -f "$pattfile"' 0
-pattfile=`mktemp` || fatal "cannot create temporary files"
-for p in $LOG_PATTERNS; do
-    echo "$p"
-done > $pattfile
-
-for l in $logfiles $EXTRA_LOGS; do
-    b="$(basename $l).extract.txt"
-
-    if [ ! -f "$l" ]; then
-	# Not a file
-	continue
-
-    elif [ -f "$b" ]; then
-	# We already have it
-	continue
-    fi
-
-    dumplogset "$l" $LOG_START $LOG_END > "$b"
-    sanitize "$b"
-
-    echo "Log patterns $REPORT_TARGET:"  > $ANALYSIS_F
-    grep -f "$pattfile" "$b" >> $ANALYSIS_F
-done
-
-which journalctl > /dev/null 2>&1
-if [ $? = 0 ]; then
-   log "Including segment [$LOG_START-$LOG_END] from journald"
-   journalctl --since "$start" --until "$end" > journal.log
-   cat journal.log | grep -f $pattfile >> $ANALYSIS_F
-fi
-
-rm -f $pattfile
-trap "" 0
+collect_logs "$LOG_START" "$LOG_END" $logfiles
 
 # Purge files containing no information
 for f in `ls -1`; do
@@ -796,7 +881,7 @@ for f in `ls -1`; do
 done
 
 # Parse for events
-for l in $logfiles $EXTRA_LOGS; do
+for l in $logfiles; do
     b="$(basename $l).extract.txt"
     node_events "$b" > $EVENTS_F
 

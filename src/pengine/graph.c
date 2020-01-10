@@ -40,7 +40,7 @@ get_action_flags(action_t * action, node_t * node)
     if (action->rsc) {
         flags = action->rsc->cmds->action_flags(action, NULL);
 
-        if (action->rsc->variant >= pe_clone && node) {
+        if (pe_rsc_is_clone(action->rsc) && node) {
 
             /* We only care about activity on $node */
             enum pe_action_flags clone_flags = action->rsc->cmds->action_flags(action, node);
@@ -146,25 +146,33 @@ convert_non_atomic_uuid(char *old_uuid, resource_t * rsc, gboolean allow_notify,
 static action_t *
 rsc_expand_action(action_t * action)
 {
+    gboolean notify = FALSE;
     action_t *result = action;
+    resource_t *rsc = action->rsc;
 
-    if (action->rsc && action->rsc->variant >= pe_group) {
+    if (rsc == NULL) {
+        return action;
+    }
+
+    if ((rsc->parent == NULL)
+        || (pe_rsc_is_clone(rsc) && (rsc->parent->variant == pe_container))) {
+        /* Only outermost resources have notification actions.
+         * The exception is those in bundles.
+         */
+        notify = is_set(rsc->flags, pe_rsc_notify);
+    }
+
+    if (rsc->variant >= pe_group) {
         /* Expand 'start' -> 'started' */
         char *uuid = NULL;
-        gboolean notify = FALSE;
 
-        if (action->rsc->parent == NULL) {
-            /* Only outter-most resources have notification actions */
-            notify = is_set(action->rsc->flags, pe_rsc_notify);
-        }
-
-        uuid = convert_non_atomic_uuid(action->uuid, action->rsc, notify, FALSE);
+        uuid = convert_non_atomic_uuid(action->uuid, rsc, notify, FALSE);
         if (uuid) {
-            pe_rsc_trace(action->rsc, "Converting %s to %s %d", action->uuid, uuid,
-                         is_set(action->rsc->flags, pe_rsc_notify));
-            result = find_first_action(action->rsc->actions, uuid, NULL, NULL);
+            pe_rsc_trace(rsc, "Converting %s to %s %d", action->uuid, uuid,
+                         is_set(rsc->flags, pe_rsc_notify));
+            result = find_first_action(rsc->actions, uuid, NULL, NULL);
             if (result == NULL) {
-                crm_err("Couldn't expand %s", action->uuid);
+                crm_err("Couldn't expand %s to %s in %s", action->uuid, uuid, rsc->id);
                 result = action;
             }
             free(uuid);
@@ -174,23 +182,45 @@ rsc_expand_action(action_t * action)
 }
 
 static enum pe_graph_flags
-graph_update_action(action_t * first, action_t * then, node_t * node, enum pe_action_flags flags,
-                    enum pe_ordering type)
+graph_update_action(action_t * first, action_t * then, node_t * node,
+                    enum pe_action_flags first_flags, enum pe_action_flags then_flags,
+                    action_wrapper_t *order)
 {
     enum pe_graph_flags changed = pe_graph_none;
+    enum pe_ordering type = order->type;
     gboolean processed = FALSE;
 
     /* TODO: Do as many of these in parallel as possible */
+
+    if(is_set(type, pe_order_implies_then_on_node)) {
+        /* Normally we want the _whole_ 'then' clone to
+         * restart if 'first' is restarted, so then->node is
+         * needed.
+         *
+         * However for unfencing, we want to limit this to
+         * instances on the same node as 'first' (the
+         * unfencing operation), so first->node is supplied.
+         *
+         * Swap the node, from then on we can can treat it
+         * like any other 'pe_order_implies_then'
+         */
+
+        clear_bit(type, pe_order_implies_then_on_node);
+        set_bit(type, pe_order_implies_then);
+        node = first->node;
+    }
+
+    clear_bit(first_flags, pe_action_pseudo);
 
     if (type & pe_order_implies_then) {
         processed = TRUE;
         if (then->rsc) {
             changed |=
-                then->rsc->cmds->update_actions(first, then, node, flags & pe_action_optional,
+                then->rsc->cmds->update_actions(first, then, node, first_flags & pe_action_optional,
                                                 pe_action_optional, pe_order_implies_then);
 
-        } else if (is_set(flags, pe_action_optional) == FALSE) {
-            if (update_action_flags(then, pe_action_optional | pe_action_clear)) {
+        } else if (is_set(first_flags, pe_action_optional) == FALSE) {
+            if (update_action_flags(then, pe_action_optional | pe_action_clear, __FUNCTION__, __LINE__)) {
                 changed |= pe_graph_updated_then;
             }
         }
@@ -206,7 +236,7 @@ graph_update_action(action_t * first, action_t * then, node_t * node, enum pe_ac
 
         processed = TRUE;
         changed |=
-            then->rsc->cmds->update_actions(first, then, node, flags, restart, pe_order_restart);
+            then->rsc->cmds->update_actions(first, then, node, first_flags, restart, pe_order_restart);
         if (changed) {
             pe_rsc_trace(then->rsc, "restart: %s then %s: changed", first->uuid, then->uuid);
         } else {
@@ -218,11 +248,14 @@ graph_update_action(action_t * first, action_t * then, node_t * node, enum pe_ac
         processed = TRUE;
         if (first->rsc) {
             changed |=
-                first->rsc->cmds->update_actions(first, then, node, flags,
+                first->rsc->cmds->update_actions(first, then, node, first_flags,
                                                  pe_action_optional, pe_order_implies_first);
 
-        } else if (is_set(flags, pe_action_optional) == FALSE) {
-            if (update_action_flags(first, pe_action_runnable | pe_action_clear)) {
+        } else if (is_set(first_flags, pe_action_optional) == FALSE) {
+            pe_rsc_trace(first->rsc, "first unrunnable: %s (%d) then %s (%d)",
+                         first->uuid, is_set(first_flags, pe_action_optional),
+                         then->uuid, is_set(then_flags, pe_action_optional));
+            if (update_action_flags(first, pe_action_runnable | pe_action_clear, __FUNCTION__, __LINE__)) {
                 changed |= pe_graph_updated_first;
             }
         }
@@ -230,7 +263,9 @@ graph_update_action(action_t * first, action_t * then, node_t * node, enum pe_ac
         if (changed) {
             pe_rsc_trace(then->rsc, "implies left: %s then %s: changed", first->uuid, then->uuid);
         } else {
-            crm_trace("implies left: %s then %s", first->uuid, then->uuid);
+            crm_trace("implies left: %s (%d) then %s (%d)",
+                      first->uuid, is_set(first_flags, pe_action_optional),
+                      then->uuid, is_set(then_flags, pe_action_optional));
         }
     }
 
@@ -238,7 +273,7 @@ graph_update_action(action_t * first, action_t * then, node_t * node, enum pe_ac
         processed = TRUE;
         if (then->rsc) {
             changed |=
-                then->rsc->cmds->update_actions(first, then, node, flags & pe_action_optional,
+                then->rsc->cmds->update_actions(first, then, node, first_flags & pe_action_optional,
                                                 pe_action_optional, pe_order_implies_first_master);
         }
 
@@ -256,10 +291,10 @@ graph_update_action(action_t * first, action_t * then, node_t * node, enum pe_ac
         processed = TRUE;
         if (then->rsc) {
             changed |=
-                then->rsc->cmds->update_actions(first, then, node, flags,
+                then->rsc->cmds->update_actions(first, then, node, first_flags,
                                                 pe_action_runnable, pe_order_one_or_more);
 
-        } else if (is_set(flags, pe_action_runnable)) {
+        } else if (is_set(first_flags, pe_action_runnable)) {
             /* alright. a "first" action is considered runnable, incremente
              * the 'runnable_before' counter */
             then->runnable_before++;
@@ -267,7 +302,7 @@ graph_update_action(action_t * first, action_t * then, node_t * node, enum pe_ac
             /* if the runnable before count for then exceeds the required number
              * of "before" runnable actions... mark then as runnable */
             if (then->runnable_before >= then->required_runnable_before) {
-                if (update_action_flags(then, pe_action_runnable)) {
+                if (update_action_flags(then, pe_action_runnable, __FUNCTION__, __LINE__)) {
                     changed |= pe_graph_updated_then;
                 }
             }
@@ -280,16 +315,39 @@ graph_update_action(action_t * first, action_t * then, node_t * node, enum pe_ac
         }
     }
 
+    if (then->rsc && is_set(type, pe_order_probe)) {
+        processed = TRUE;
+
+        if (is_not_set(first_flags, pe_action_runnable) && first->rsc->running_on != NULL) {
+            pe_rsc_trace(then->rsc, "Ignoring %s then %s - %s is about to be stopped",
+                         first->uuid, then->uuid, first->rsc->id);
+            type = pe_order_none;
+            order->type = pe_order_none;
+
+        } else {
+            pe_rsc_trace(then->rsc, "Enforcing %s then %s", first->uuid, then->uuid);
+            changed |= then->rsc->cmds->update_actions(first, then, node, first_flags,
+                                                       pe_action_runnable, pe_order_runnable_left);
+        }
+
+        if (changed) {
+            pe_rsc_trace(then->rsc, "runnable: %s then %s: changed", first->uuid, then->uuid);
+        } else {
+            crm_trace("runnable: %s then %s", first->uuid, then->uuid);
+        }
+    }
+
     if (type & pe_order_runnable_left) {
         processed = TRUE;
         if (then->rsc) {
             changed |=
-                then->rsc->cmds->update_actions(first, then, node, flags,
+                then->rsc->cmds->update_actions(first, then, node, first_flags,
                                                 pe_action_runnable, pe_order_runnable_left);
 
-        } else if (is_set(flags, pe_action_runnable) == FALSE) {
-            if (update_action_flags(then, pe_action_runnable | pe_action_clear)) {
-                changed |= pe_graph_updated_then;
+        } else if (is_set(first_flags, pe_action_runnable) == FALSE) {
+            pe_rsc_trace(then->rsc, "then unrunnable: %s then %s", first->uuid, then->uuid);
+            if (update_action_flags(then, pe_action_runnable | pe_action_clear, __FUNCTION__, __LINE__)) {
+                 changed |= pe_graph_updated_then;
             }
         }
         if (changed) {
@@ -303,7 +361,7 @@ graph_update_action(action_t * first, action_t * then, node_t * node, enum pe_ac
         processed = TRUE;
         if (then->rsc) {
             changed |=
-                then->rsc->cmds->update_actions(first, then, node, flags,
+                then->rsc->cmds->update_actions(first, then, node, first_flags,
                                                 pe_action_optional, pe_order_implies_first_migratable);
         }
         if (changed) {
@@ -317,7 +375,7 @@ graph_update_action(action_t * first, action_t * then, node_t * node, enum pe_ac
         processed = TRUE;
         if (then->rsc) {
             changed |=
-                then->rsc->cmds->update_actions(first, then, node, flags,
+                then->rsc->cmds->update_actions(first, then, node, first_flags,
                                                 pe_action_optional, pe_order_pseudo_left);
         }
         if (changed) {
@@ -331,7 +389,7 @@ graph_update_action(action_t * first, action_t * then, node_t * node, enum pe_ac
         processed = TRUE;
         if (then->rsc) {
             changed |=
-                then->rsc->cmds->update_actions(first, then, node, flags,
+                then->rsc->cmds->update_actions(first, then, node, first_flags,
                                                 pe_action_runnable, pe_order_optional);
         }
         if (changed) {
@@ -345,7 +403,7 @@ graph_update_action(action_t * first, action_t * then, node_t * node, enum pe_ac
         processed = TRUE;
         if (then->rsc) {
             changed |=
-                then->rsc->cmds->update_actions(first, then, node, flags,
+                then->rsc->cmds->update_actions(first, then, node, first_flags,
                                                 pe_action_runnable, pe_order_asymmetrical);
         }
 
@@ -358,16 +416,16 @@ graph_update_action(action_t * first, action_t * then, node_t * node, enum pe_ac
     }
 
     if ((first->flags & pe_action_runnable) && (type & pe_order_implies_then_printed)
-        && (flags & pe_action_optional) == 0) {
+        && (first_flags & pe_action_optional) == 0) {
         processed = TRUE;
         crm_trace("%s implies %s printed", first->uuid, then->uuid);
-        update_action_flags(then, pe_action_print_always);      /* dont care about changed */
+        update_action_flags(then, pe_action_print_always, __FUNCTION__, __LINE__);  /* don't care about changed */
     }
 
-    if ((type & pe_order_implies_first_printed) && (flags & pe_action_optional) == 0) {
+    if (is_set(type, pe_order_implies_first_printed) && is_set(then_flags, pe_action_optional) == FALSE) {
         processed = TRUE;
         crm_trace("%s implies %s printed", then->uuid, first->uuid);
-        update_action_flags(first, pe_action_print_always);     /* dont care about changed */
+        update_action_flags(first, pe_action_print_always, __FUNCTION__, __LINE__); /* don't care about changed */
     }
 
     if ((type & pe_order_implies_then
@@ -379,7 +437,7 @@ graph_update_action(action_t * first, action_t * then, node_t * node, enum pe_ac
         && is_set(first->rsc->flags, pe_rsc_block)
         && is_not_set(first->flags, pe_action_runnable)) {
 
-        if (update_action_flags(then, pe_action_runnable | pe_action_clear)) {
+        if (update_action_flags(then, pe_action_runnable | pe_action_clear, __FUNCTION__, __LINE__)) {
             changed |= pe_graph_updated_then;
         }
 
@@ -398,9 +456,10 @@ graph_update_action(action_t * first, action_t * then, node_t * node, enum pe_ac
 }
 
 static void
-mark_start_blocked(resource_t *rsc)
+mark_start_blocked(resource_t *rsc, resource_t *reason)
 {
     GListPtr gIter = rsc->actions;
+    char *reason_text = crm_strdup_printf("colocation with %s", reason->id);
 
     for (; gIter != NULL; gIter = gIter->next) {
         action_t *action = (action_t *) gIter->data;
@@ -409,11 +468,12 @@ mark_start_blocked(resource_t *rsc)
             continue;
         }
         if (is_set(action->flags, pe_action_runnable)) {
-            clear_bit(action->flags, pe_action_runnable);
+            pe_action_set_flag_reason(__FUNCTION__, __LINE__, action, NULL, reason_text, pe_action_runnable, FALSE);
             update_colo_start_chain(action);
             update_action(action);
         }
     }
+    free(reason_text);
 }
 
 void
@@ -424,6 +484,14 @@ update_colo_start_chain(action_t *action)
 
     if (is_not_set(action->flags, pe_action_runnable) && safe_str_eq(action->task, RSC_START)) {
         rsc = uber_parent(action->rsc);
+        if (rsc->parent) {
+            /* For bundles, uber_parent() returns the clone/master, not the
+             * bundle, so the existence of rsc->parent implies this is a bundle.
+             * In this case, we need the bundle resource, so that we can check
+             * if all containers are stopped/stopping.
+             */
+            rsc = rsc->parent;
+        }
     }
 
     if (rsc == NULL || rsc->rsc_cons_lhs == NULL) {
@@ -443,7 +511,7 @@ update_colo_start_chain(action_t *action)
     for (gIter = rsc->rsc_cons_lhs; gIter != NULL; gIter = gIter->next) {
         rsc_colocation_t *colocate_with = (rsc_colocation_t *)gIter->data;
         if (colocate_with->score == INFINITY) {
-            mark_start_blocked(colocate_with->rsc_lh);
+            mark_start_blocked(colocate_with->rsc_lh, action->rsc);
         }
     }
 }
@@ -475,7 +543,7 @@ update_action(action_t * then)
         if (then->required_runnable_before == 0) {
             then->required_runnable_before = 1;
         }
-        clear_bit(then->flags, pe_action_runnable);
+        pe_clear_action_bit(then, pe_action_runnable);
         /* We are relying on the pe_order_one_or_more clause of
          * graph_update_action(), called as part of the:
          *
@@ -508,11 +576,32 @@ update_action(action_t * then)
                 crm_trace("Then: Found node %s for %s", then_node->details->uname, then->uuid);
             }
         }
+        /* Disable constraint if it only applies when on same node, but isn't */
+        if (is_set(other->type, pe_order_same_node) && first_node && then_node
+            && (first_node->details != then_node->details)) {
+
+            crm_trace("Disabled constraint %s on %s -> %s on %s",
+                       other->action->uuid, first_node->details->uname,
+                       then->uuid, then_node->details->uname);
+            other->type = pe_order_none;
+            continue;
+        }
 
         clear_bit(changed, pe_graph_updated_first);
 
-        if (first->rsc != then->rsc
-            && first->rsc != NULL && then->rsc != NULL && first->rsc != then->rsc->parent) {
+        if (first->rsc && is_set(other->type, pe_order_then_cancels_first)
+            && is_not_set(then->flags, pe_action_optional)) {
+
+            /* 'then' is required, so we must abandon 'first'
+             * (e.g. a required stop cancels any reload).
+             * Only used with reload actions as 'first'.
+             */
+            set_bit(other->action->flags, pe_action_optional);
+            clear_bit(first->rsc->flags, pe_rsc_reload);
+        }
+
+        if (first->rsc && then->rsc && (first->rsc != then->rsc)
+            && (is_parent(then->rsc, first->rsc) == FALSE)) {
             first = rsc_expand_action(first);
         }
         if (first != other->action) {
@@ -538,10 +627,10 @@ update_action(action_t * then)
 
         if (first == other->action) {
             /*
-             * 'first' was not expanded (ie. from 'start' to 'running'), which could mean it:
+             * 'first' was not expanded (e.g. from 'start' to 'running'), which could mean it:
              * - has no associated resource,
              * - was a primitive,
-             * - was pre-expanded (ie. 'running' instead of 'start')
+             * - was pre-expanded (e.g. 'running' instead of 'start')
              *
              * The third argument here to graph_update_action() is a node which is used under two conditions:
              * - Interleaving, in which case first->node and
@@ -550,28 +639,8 @@ update_action(action_t * then)
              *   constraint to instances on the supplied node
              *
              */
-            int otype = other->type;
             node_t *node = then->node;
-
-            if(is_set(otype, pe_order_implies_then_on_node)) {
-                /* Normally we want the _whole_ 'then' clone to
-                 * restart if 'first' is restarted, so then->node is
-                 * needed.
-                 *
-                 * However for unfencing, we want to limit this to
-                 * instances on the same node as 'first' (the
-                 * unfencing operation), so first->node is supplied.
-                 *
-                 * Swap the node, from then on we can can treat it
-                 * like any other 'pe_order_implies_then'
-                 */
-
-                clear_bit(otype, pe_order_implies_then_on_node);
-                set_bit(otype, pe_order_implies_then);
-                node = first->node;
-            }
-            clear_bit(first_flags, pe_action_pseudo);
-            changed |= graph_update_action(first, then, node, first_flags, otype);
+            changed |= graph_update_action(first, then, node, first_flags, then_flags, other);
 
             /* 'first' was for a complex resource (clone, group, etc),
              * create a new dependency if necessary
@@ -584,7 +653,8 @@ update_action(action_t * then)
         }
 
         if (changed & pe_graph_disable) {
-            crm_trace("Disabled constraint %s -> %s", other->action->uuid, then->uuid);
+            crm_trace("Disabled constraint %s -> %s in favor of %s -> %s",
+                      other->action->uuid, then->uuid, first->uuid, then->uuid);
             clear_bit(changed, pe_graph_disable);
             other->type = pe_order_none;
         }
@@ -693,7 +763,7 @@ shutdown_constraints(node_t * node, action_t * shutdown_op, pe_working_set_t * d
  *
  * \param[in]     node        Node to be fenced
  * \param[in]     stonith_op  Fencing operation
- * \param[in/out] data_set    Working set of cluster
+ * \param[in,out] data_set    Working set of cluster
  */
 gboolean
 stonith_constraints(node_t * node, action_t * stonith_op, pe_working_set_t * data_set)
@@ -702,13 +772,7 @@ stonith_constraints(node_t * node, action_t * stonith_op, pe_working_set_t * dat
 
     CRM_CHECK(stonith_op != NULL, return FALSE);
     for (r = data_set->resources; r != NULL; r = r->next) {
-        resource_t *rsc = (resource_t *) r->data;
-
-        if ((stonith_op->rsc == NULL)
-            || ((stonith_op->rsc != rsc) && (stonith_op->rsc != rsc->container))) {
-
-            rsc_stonith_ordering(rsc, stonith_op, data_set);
-        }
+        rsc_stonith_ordering((resource_t *) r->data, stonith_op, data_set);
     }
     return TRUE;
 }
@@ -781,13 +845,15 @@ get_router_node(action_t *action)
  * \param[in]     id      Node UUID to add
  * \param[in,out] xml     Parent XML tag to add to
  */
-static void
+static xmlNode*
 add_node_to_xml_by_id(const char *id, xmlNode *xml)
 {
     xmlNode *node_xml;
 
     node_xml = create_xml_node(xml, XML_CIB_TAG_NODE);
     crm_xml_add(node_xml, XML_ATTR_UUID, id);
+
+    return node_xml;
 }
 
 /*!
@@ -795,12 +861,68 @@ add_node_to_xml_by_id(const char *id, xmlNode *xml)
  * \brief Add an XML node tag for a specified node
  *
  * \param[in]     node  Node to add
- * \param[in/out] xml   XML to add node to
+ * \param[in,out] xml   XML to add node to
  */
 static void
 add_node_to_xml(const node_t *node, void *xml)
 {
     add_node_to_xml_by_id(node->details->id, (xmlNode *) xml);
+}
+
+/*!
+ * \internal
+ * \brief Add XML with nodes that need an update of their maintenance state
+ *
+ * \param[in,out] xml       Parent XML tag to add to
+ * \param[in]     data_set  Working set for cluster
+ */
+static int
+add_maintenance_nodes(xmlNode *xml, const pe_working_set_t *data_set)
+{
+    GListPtr gIter = NULL;
+    xmlNode *maintenance =
+        xml?create_xml_node(xml, XML_GRAPH_TAG_MAINTENANCE):NULL;
+    int count = 0;
+
+    for (gIter = data_set->nodes; gIter != NULL;
+         gIter = gIter->next) {
+        node_t *node = (node_t *) gIter->data;
+        struct node_shared_s *details = node->details;
+
+        if (!(is_remote_node(node))) {
+            continue; /* just remote nodes need to know atm */
+        }
+
+        if (details->maintenance != details->remote_maintenance) {
+            if (maintenance) {
+                crm_xml_add(
+                    add_node_to_xml_by_id(node->details->id, maintenance),
+                    XML_NODE_IS_MAINTENANCE, details->maintenance?"1":"0");
+            }
+            count++;
+        }
+    }
+    crm_trace("%s %d nodes to adjust maintenance-mode "
+              "to transition", maintenance?"Added":"Counted", count);
+    return count;
+}
+
+/*!
+ * \internal
+ * \brief Add pseudo action with nodes needing maintenance state update
+ *
+ * \param[in,out] data_set  Working set for cluster
+ */
+void
+add_maintenance_update(pe_working_set_t *data_set)
+{
+    action_t *action = NULL;
+
+    if (add_maintenance_nodes(NULL, data_set)) {
+        crm_trace("adding maintenance state update pseudo action");
+        action = get_pseudo_op(CRM_OP_MAINTENANCE_NODES, data_set);
+        set_bit(action->flags, pe_action_print_always);
+    }
 }
 
 /*!
@@ -867,15 +989,23 @@ static xmlNode *
 action2xml(action_t * action, gboolean as_input, pe_working_set_t *data_set)
 {
     gboolean needs_node_info = TRUE;
+    gboolean needs_maintenance_info = FALSE;
     xmlNode *action_xml = NULL;
     xmlNode *args_xml = NULL;
+#if ENABLE_VERSIONED_ATTRS
+    pe_rsc_action_details_t *rsc_details = NULL;
+#endif
 
     if (action == NULL) {
         return NULL;
     }
 
     if (safe_str_eq(action->task, CRM_OP_FENCE)) {
-        action_xml = create_xml_node(NULL, XML_GRAPH_TAG_CRM_EVENT);
+        /* All fences need node info; guest node fences are pseudo-events */
+        action_xml = create_xml_node(NULL,
+                                     is_set(action->flags, pe_action_pseudo)?
+                                     XML_GRAPH_TAG_PSEUDO_EVENT :
+                                     XML_GRAPH_TAG_CRM_EVENT);
 
     } else if (safe_str_eq(action->task, CRM_OP_SHUTDOWN)) {
         action_xml = create_xml_node(NULL, XML_GRAPH_TAG_CRM_EVENT);
@@ -890,15 +1020,20 @@ action2xml(action_t * action, gboolean as_input, pe_working_set_t *data_set)
 /* 		action_xml = create_xml_node(NULL, XML_GRAPH_TAG_CRM_EVENT); */
 
     } else if (is_set(action->flags, pe_action_pseudo)) {
+        if (safe_str_eq(action->task, CRM_OP_MAINTENANCE_NODES)) {
+            needs_maintenance_info = TRUE;
+        }
         action_xml = create_xml_node(NULL, XML_GRAPH_TAG_PSEUDO_EVENT);
         needs_node_info = FALSE;
 
     } else {
         action_xml = create_xml_node(NULL, XML_GRAPH_TAG_RSC_OP);
+#if ENABLE_VERSIONED_ATTRS
+        rsc_details = pe_rsc_action_details(action);
+#endif
     }
 
     crm_xml_add_int(action_xml, XML_ATTR_ID, action->id);
-
     crm_xml_add(action_xml, XML_LRM_ATTR_TASK, action->task);
     if (action->rsc != NULL && action->rsc->clone_name != NULL) {
         char *clone_key = NULL;
@@ -937,6 +1072,9 @@ action2xml(action_t * action, gboolean as_input, pe_working_set_t *data_set)
         if (router_node) {
             crm_xml_add(action_xml, XML_LRM_ATTR_ROUTER_NODE, router_node->details->uname);
         }
+
+        g_hash_table_insert(action->meta, strdup(XML_LRM_ATTR_TARGET), strdup(action->node->details->uname));
+        g_hash_table_insert(action->meta, strdup(XML_LRM_ATTR_TARGET_UUID), strdup(action->node->details->id));
     }
 
     /* No details if this action is only being listed in the inputs section */
@@ -991,7 +1129,7 @@ action2xml(action_t * action, gboolean as_input, pe_working_set_t *data_set)
                  *
                  * If anyone toggles the unique flag to 'on', the
                  * 'instance free' name will correspond to an orphan
-                 * and fall into the claus above instead
+                 * and fall into the clause above instead
                  */
                 crm_xml_add(rsc_xml, XML_ATTR_ID, xml_id);
                 if (action->rsc->clone_name && safe_str_neq(xml_id, action->rsc->clone_name)) {
@@ -1018,19 +1156,51 @@ action2xml(action_t * action, gboolean as_input, pe_working_set_t *data_set)
 
     g_hash_table_foreach(action->extra, hash2field, args_xml);
     if (action->rsc != NULL && action->node) {
-        GHashTable *p = g_hash_table_new_full(crm_str_hash, g_str_equal, g_hash_destroy_str, g_hash_destroy_str);
+        GHashTable *p = crm_str_table_new();
 
         get_rsc_attributes(p, action->rsc, action->node, data_set);
         g_hash_table_foreach(p, hash2smartfield, args_xml);
-
         g_hash_table_destroy(p);
+
+#if ENABLE_VERSIONED_ATTRS
+        {
+            xmlNode *versioned_parameters = create_xml_node(NULL, XML_TAG_RSC_VER_ATTRS);
+
+            pe_get_versioned_attributes(versioned_parameters, action->rsc,
+                                        action->node, data_set);
+            if (xml_has_children(versioned_parameters)) {
+                add_node_copy(action_xml, versioned_parameters);
+            }
+            free_xml(versioned_parameters);
+        }
+#endif
+
     } else if(action->rsc && action->rsc->variant <= pe_native) {
         g_hash_table_foreach(action->rsc->parameters, hash2smartfield, args_xml);
+
+#if ENABLE_VERSIONED_ATTRS
+        if (xml_has_children(action->rsc->versioned_parameters)) {
+            add_node_copy(action_xml, action->rsc->versioned_parameters);
+        }
+#endif
     }
+
+#if ENABLE_VERSIONED_ATTRS
+    if (rsc_details) {
+        if (xml_has_children(rsc_details->versioned_parameters)) {
+            add_node_copy(action_xml, rsc_details->versioned_parameters);
+        }
+
+        if (xml_has_children(rsc_details->versioned_meta)) {
+            add_node_copy(action_xml, rsc_details->versioned_meta);
+        }
+    }
+#endif
 
     g_hash_table_foreach(action->meta, hash2metafield, args_xml);
     if (action->rsc != NULL) {
         int isolated = 0;
+        const char *value = g_hash_table_lookup(action->rsc->meta, "external-ip");
         resource_t *parent = action->rsc;
 
         while (parent != NULL) {
@@ -1045,7 +1215,56 @@ action2xml(action_t * action, gboolean as_input, pe_working_set_t *data_set)
             free(nodeattr);
         }
 
+        if(value) {
+            hash2smartfield((gpointer)"pcmk_external_ip", (gpointer)value, (gpointer)args_xml);
+        }
+
+        if(is_container_remote_node(action->node)) {
+            pe_node_t *host = NULL;
+            enum action_tasks task = text2task(action->task);
+
+            if(task == action_notify || task == action_notified) {
+                const char *n_task = g_hash_table_lookup(action->meta, "notify_operation");
+                task = text2task(n_task);
+            }
+
+            // Differentiate between up and down actions
+            switch (task) {
+                case stop_rsc:
+                case stopped_rsc:
+                case action_demote:
+                case action_demoted:
+                    if(action->node->details->remote_rsc->container->running_on) {
+                        host = action->node->details->remote_rsc->container->running_on->data;
+                    }
+                    break;
+                case start_rsc:
+                case started_rsc:
+                case monitor_rsc:
+                case action_promote:
+                case action_promoted:
+                    if(action->node->details->remote_rsc->container->allocated_to) {
+                        host = action->node->details->remote_rsc->container->allocated_to;
+                    }
+                    break;
+                default:
+                    break;
+            }
+
+            if(host) {
+                hash2metafield((gpointer)XML_RSC_ATTR_TARGET,
+                               (gpointer)g_hash_table_lookup(action->rsc->meta, XML_RSC_ATTR_TARGET), (gpointer)args_xml);
+                hash2metafield((gpointer)PCMK_ENV_PHYSICAL_HOST, (gpointer)host->details->uname, (gpointer)args_xml);
+            }
+        }
+
     } else if (safe_str_eq(action->task, CRM_OP_FENCE) && action->node) {
+        /* Pass the node's attributes as meta-attributes.
+         *
+         * @TODO: Determine whether it is still necessary to do this. It was
+         * added in 33d99707, probably for the libfence-based implementation in
+         * c9a90bd, which is no longer used.
+         */
         g_hash_table_foreach(action->node->details->attrs, hash2metafield, args_xml);
     }
 
@@ -1055,6 +1274,10 @@ action2xml(action_t * action, gboolean as_input, pe_working_set_t *data_set)
     /* List any nodes this action is expected to make down */
     if (needs_node_info && (action->node != NULL)) {
         add_downed_nodes(action_xml, action, data_set);
+    }
+
+    if (needs_maintenance_info) {
+        add_maintenance_nodes(action_xml, data_set);
     }
 
     crm_log_xml_trace(action_xml, "dumped action");
@@ -1076,7 +1299,7 @@ should_dump_action(action_t * action)
         /* This is a horrible but convenient hack
          *
          * It mimimizes the number of actions with unsatisfied inputs
-         * (ie. not included in the graph)
+         * (i.e. not included in the graph)
          *
          * This in turn, means we can be more concise when printing
          * aborted/incomplete graphs.
@@ -1142,6 +1365,9 @@ should_dump_action(action_t * action)
         log_action(LOG_DEBUG, "Unallocated action", action, FALSE);
         return FALSE;
 
+    } else if(is_container_remote_node(action->node) && action->node->details->remote_requires_reset == FALSE) {
+        crm_trace("Assuming action %s for %s will be runnable", action->uuid, action->node->details->uname);
+
     } else if (action->node->details->online == FALSE) {
         pe_err("action %d was (%s) scheduled for offline node", action->id, action->uuid);
         log_action(LOG_DEBUG, "Action for offline node", action, FALSE);
@@ -1199,20 +1425,13 @@ check_dump_input(int last_action, action_t * action, action_wrapper_t * wrapper)
     type &= ~pe_order_implies_then_printed;
     type &= ~pe_order_optional;
 
-    if (wrapper->action->node
+    if (is_not_set(type, pe_order_preserve)
         && action->rsc && action->rsc->fillers
-        && is_not_set(type, pe_order_preserve)
+        && wrapper->action->rsc && wrapper->action->node
         && wrapper->action->node->details->remote_rsc
-        && uber_parent(action->rsc) != uber_parent(wrapper->action->rsc)
-        ) {
-        /* This prevents user-defined ordering constraints between
-         * resources in remote nodes and the resources that
-         * define/represent a remote node.
-         *
-         * There is no known valid reason to allow this sort of thing
-         * but if one arises, we'd need to change the
-         * action->rsc->fillers clause to be more specific, possibly
-         * to check that it contained wrapper->action->rsc
+        && (wrapper->action->node->details->remote_rsc->container == action->rsc)) {
+        /* This prevents user-defined ordering constraints between resources
+         * running in a guest node and the resource that defines that node.
          */
         crm_warn("Invalid ordering constraint between %s and %s",
                  wrapper->action->rsc->id, action->rsc->id);
@@ -1257,7 +1476,7 @@ check_dump_input(int last_action, action_t * action, action_wrapper_t * wrapper)
         return FALSE;
 
     } else if ((wrapper->type == pe_order_optional)
-               && strstr(wrapper->action->uuid, "_stop_0")
+               && crm_ends_with(wrapper->action->uuid, "_stop_0")
                && is_set(wrapper->action->flags, pe_action_migrate_runnable)) {
 
         /* for optional only ordering, ordering is not preserved for
@@ -1327,8 +1546,8 @@ check_dump_input(int last_action, action_t * action, action_wrapper_t * wrapper)
                && wrapper->action->rsc != action->rsc
                && is_set(wrapper->action->rsc->flags, pe_rsc_failed)
                && is_not_set(wrapper->action->rsc->flags, pe_rsc_managed)
-               && strstr(wrapper->action->uuid, "_stop_0")
-               && action->rsc && action->rsc->variant >= pe_clone) {
+               && crm_ends_with(wrapper->action->uuid, "_stop_0")
+               && action->rsc && pe_rsc_is_clone(action->rsc)) {
         crm_warn("Ignoring requirement that %s complete before %s:"
                  " unmanaged failed resources cannot prevent clone shutdown",
                  wrapper->action->uuid, action->uuid);
@@ -1423,7 +1642,7 @@ graph_has_loop(action_t * init_action, action_t * action, action_wrapper_t * wra
     }
 
 done:
-    clear_bit(wrapper->action->flags, pe_action_tracking);
+    pe_clear_action_bit(wrapper->action, pe_action_tracking);
 
     return has_loop;
 }

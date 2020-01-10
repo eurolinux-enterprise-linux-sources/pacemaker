@@ -1,3 +1,197 @@
+* Tue Nov 14 2017 Ken Gaillot <kgaillot@redhat.com> Pacemaker-1.1.18-1
+- Update source tarball to revision: a9fbd15
+- Changesets: 644
+- Diff:       167 files changed, 9753 insertions(+), 5596 deletions(-)
+
+- Features added since Pacemaker-1.1.17
+  + warnings are now logged when using legacy syntax to be removed in 2.0
+  + agents: ifspeed agent is now installed when building
+  + agents: ifspeed agent can optionally detect interface name from IP address
+  + alerts: support alert filters
+  + alerts: experimental support for alerts for node attribute changes
+  + crmd,pengine: support unfencing of remote nodes
+  + pengine: bundles now support all constraint types
+  + pengine: bundles now support rkt containers
+  + pengine: bundles support new container-attribute-target parameter
+  + pengine,tools: logs and crm_mon show why resources changed state
+  + stonith-ng: support new fencing resource parameter pcmk_delay_base
+  + tools: new crm_resource option --why explains why resources are stopped
+
+- Changes since Pacemaker-1.1.17
+  + many documentation improvements
+  + agents: ifspeed properly calculates speed of hfi1 interfaces
+  + agents: ClusterMon now interprets "update" less than 1000 as seconds
+  + attrd: don't lose attributes set between attrd start-up and cluster join
+  + attrd: fix multiple minor memory leaks
+  + crmd: correctly record that unfencing is complete
+  + crmd: error more quickly if remote start fails due to missing key
+  + lrmd: remote resource operations return immediate error if key setup fails
+  + lrmd: allow pre-1.1.15 cluster nodes to connect to current Pacemaker Remote
+  + pengine: guest nodes are now probed like other nodes
+  + pengine: probe remote nodes for guest node resources
+  + pengine: do not probe guest/bundle connections until guest/bundle is active
+  + pengine: allow resources to stop prior to probes completing
+  + pengine: bundles wait only for other containers on same node to be probed
+  + pengine: have bundles log to stderr so 'docker logs'/'journalctl -M' works
+  + pengine: only pass requests for promote/demote flags onto the bundle's child
+  + pengine: do not map ports into Docker container when net=host is specified
+  + pengine: allow resources inside bundles to receive clone notifications
+  + pengine: default to non-interleaved bundle ordering for safety
+  + pengine: ensure bundle nodes and child resources are correctly cleaned up
+  + pengine: prevent graph loops when fencing the host underneath a bundle
+  + pengine: fix multiple memory issues (use-after-free, use-of-NULL) with bundles
+  + pengine: resources in bundles respect failcounts
+  + pengine: ensure nested container connections run on the same host
+  + pengine: ensure unrecoverable remote nodes are fenced even with no resources
+  + pengine: handle resource migrating behind a migrating remote connection
+  + pengine: don't prefer to keep unique instances on same node
+  + pengine: exclude exclusive resources and nodes from symmetric default score
+  + pengine: if ignoring failure, also ignore migration-threshold
+  + pengine: restore the ability to send the transition graph via the disk if it gets too big
+  + pengine: validate no-quorum-policy=suicide correctly
+  + pengine: avoid crash when alerts section has comments
+  + pengine: detect permanent master scores at start-up
+  + pengine: do not re-add a node's default score for each location constraint
+  + pengine: make sure calculated resource scores are consistent on different architectures
+  + pengine: retrigger unfencing for changed device parameters only when necessary
+  + pengine: don't schedule reload and restart in same transition (CLBZ#5309, regression introduced in 1.1.15)
+  + stonith-ng: make fencing-device reappear properly after reenabling
+  + stonith-ng: include pcmk_on_action in meta-data so 'on' can be overridden
+  + tools: allow crm_report to work with no log files specified
+  + tools: fix use-after-free in crm_diff introduced in 1.1.17
+  + tools: allow crm_resource to operate on anonymous clones in unknown states
+  + tools: crm_resource --cleanup on appropriate nodes if we don't know state of resource
+  + tools: prevent disconnection from crmd during crm_resource --cleanup
+  + tools: improve messages for crm_resource --force-* options
+  + tools: crm_mon: avoid infinite process spawning if -E script can't be run
+  + tools: crm_mon: don't show previous exit-reason for failed action with none
+  + libcrmservice: list systemd unit files, not only active units (CLBZ#5299)
+  + libcrmservice: parse long description correctly for LSB meta-data
+
+
+* Thu Jul 06 2017 Ken Gaillot <kgaillot@redhat.com> Pacemaker-1.1.17-1
+- Update source tarball to revision: 301bc44
+- Changesets: 539
+- Diff:       177 files changed, 11525 insertions(+), 5036 deletions(-)
+
+- Features added since Pacemaker-1.1.16
+  + New "bundle" resource type for Docker container use cases (experimental)
+  + New "PCMK_node_start_state" environment variable to start node in standby
+  + New "value-source" rule expression attribute in location constraints to
+    compare a node attribute against a resource parameter
+  + New "stonith-max-attempts" cluster option to specify how many times
+    fencing can fail for a target before the cluster will no longer
+    immediately re-attempt it (previously hard-coded at 10) 
+  + New "cluster-ipc-limit" cluster option to avoid IPC client eviction in
+    large clusters
+  + Failures are now tracked per operation type, as well as per node and
+    resource (the "fail-count" and "last-failure" node attribute names now end
+    in "#OPERATION_INTERVAL")
+  + attrd: Pacemaker Remote node attributes and regular expressions are now
+    supported on legacy cluster stacks (heartbeat, CMAN, and corosync plugin)
+  + tools: New "crm_resource --validate" option
+  + tools: New "stonith_admin --list-targets" option
+  + tools: New "crm_attribute --pattern" option to match a regular expression
+  + tools: "crm_resource --cleanup" and "crm_failcount" can now take
+    --operation and --interval options to operate on a single operation type
+
+- Changes since Pacemaker-1.1.16
+  + Fix multiple memory issues (leaks, use-after-free) in libraries
+  + pengine: unmanaging a guest node resource puts guest in maintenance mode
+  + cib: broadcasts of cib changes should always pass ACL checks
+  + crmd,libcrmcommon: update throttling when CPUs are hot-plugged
+  + crmd: abort transition whenever we lose quorum
+  + crmd: avoid attribute write-out on join when atomic attrd is used
+  + crmd: check for too many stonith failures only when aborting for that reason
+  + crmd: correctly clear failure counts only for a specified node
+  + crmd: don't fence old DC if it's shutting down as soon-to-be DC joins
+  + crmd: forget stonith failures when forgetting node
+  + crmd: all nodes should track stonith failure counts in case they become DC
+  + crmd: update cache status for guest node whose host is fenced
+  + dbus: prevent lrmd from hanging on dbus calls
+  + fencing: detect newly added constraints for stonith devices
+  + pengine: order remote actions after connection recovery
+    (regression introduced in 1.1.15)
+  + pengine: quicker recovery from failed demote
+  + libcib: determine remote nodes correctly from node status entries
+  + libcrmcommon: avoid evicting IPC client if messages spike briefly
+  + libcrmcommon: better XML comment handling prevents infinite election loop
+  + libcrmcommon: set month correctly in date/time string sent to alert agents
+  + libfencing,fencing: intelligently remap "action" wrongly specified in config
+  + libservices: ensure completed ops aren't on blocked ops list
+  + libservices: properly detect and cancel in-flight systemd/upstart ops
+  + libservices: properly watch writable DBus handles
+  + libservices: systemd service that is reloading doesn't cause monitor failure
+  + pacemaker_remoted: allow graceful shutdown while unmanaged
+  + pengine,libpe_status: don't clear same fail-count twice
+  + pengine: consider guest node unclean if its host is unclean
+  + pengine: do not re-add a node's default score for each location constraint
+  + pengine: avoid restarting services when recovering remote connection
+  + pengine: better guest node recovery when host fails
+  + pengine: guest node fencing doesn't require stonith enabled
+  + pengine: allow probes of guest node connection resources
+  + pengine: properly handle allow-migrate explicitly set for remote connection
+  + pengine: fence failed remote nodes even if no resources can run on them
+  + tools: resource agents will now get the correct node name on
+    Pacemaker Remote nodes when using crm_node and crm_attribute
+  + tools: avoid grep crashes in crm_report when looking for system logs
+  + tools: crm_resource -C now clears last-failure as well as fail-count
+  + tools: implement crm_failcount command-line options correctly
+  + tools: properly ignore version with crm_diff --no-version
+
+
+* Wed Nov 30 2016 Ken Gaillot <kgaillot@redhat.com> Pacemaker-1.1.16-1
+- Update source tarball to revision: 76876b3
+- Changesets: 382
+- Diff:       145 files changed, 7200 insertions(+), 5621 deletions(-)
+
+- Features added since Pacemaker-1.1.15
+  + Location constraints may use rsc-pattern, with submatches expanded
+  + node-health-base available with node-health-strategy=progressive
+  + new Pacemaker Development document for working on pacemaker code base
+  + new PCMK_panic_action variable allows crash instead of reboot on panic
+  + resources: add resource agent for managing a node attribute
+  + systemd: include socket units when listing all systemd agents
+
+- Changes since Pacemaker-1.1.15
+  + Important security fix for CVE-2016-7035
+  + Logging is now synchronous when blackboxes are enabled
+  + All python code except CTS is now compatible with python 2.6+ and 3.2+
+  + build: take advantage of compiler features for security and performance
+  + build: update SuSE spec modifications for recent spec changes
+  + build: avoid watchdog reboot when upgrading pacemaker_remote with sbd
+  + build: numerous other improvements in environment detection, etc.
+  + cib: fix infinite loop when no schema validates
+  + crmd: cl#5185 - record pending operations in CIB before they are performed
+  + crmd: don't abort transitions for CIB comment changes
+  + crmd: resend shutdown request if DC loses original request
+  + documentation: install improved README in doc instead of now-removed AUTHORS
+  + documentation: clarify licensing and provide copy of all licenses
+  + documentation: document various features and upgrades better
+  + fence_legacy: use "list" action when searching cluster-glue agents
+  + libcib: don't stop sending alerts after releasing DC role
+  + libcrmcommon: properly handle XML comments when comparing v2 patchset diffs
+  + libcrmcommon: report errors consistently when waiting for data on connection
+  + libpengine: avoid potential use-of-NULL
+  + libservices: use DBusError API properly
+  + pacemaker_remote: init script stop should always return 0
+  + pacemaker_remote: allow remote clients to timeout/reconnect
+  + pacemaker_remote: correctly calculate remaining timeout when receiving messages
+  + pengine: avoid transition loop for start-then-stop + unfencing
+  + pengine: correctly update dependent actions of un-runnable clones
+  + pengine: do not fence a node in maintenance mode if it shuts down cleanly
+  + pengine: set OCF_RESKEY_CRM_meta_notify_active_* for multistate resources
+  + resources: ping - avoid temporary files for fping check, support FreeBSD
+  + resources: SysInfo - better support for FreeBSD
+  + resources: variable name typo in docker-wrapper
+  + systemd: order pacemaker after time-sync target
+  + tools: correct attrd_updater help and error messages when using CMAN
+  + tools: crm_standby --version/--help should work without cluster running
+  + tools: make crm_report sanitize CIB before generating readable version
+  + tools: display pending resource state by default when available
+  + tools: avoid matching other process with same PID in ClusterMon
+
+
 * Tue Jun 21 2016 Ken Gaillot <kgaillot@redhat.com> Pacemaker-1.1.15-1
 - Update source tarball to revision: 32fa6a5
 - Changesets: 533
@@ -389,7 +583,7 @@
   + cib: Ensure 'cibadmin -R/--replace' commands get replies
   + cib: Erasing the cib is an admin action, bump the admin_epoch instead
   + cib: Fix remote cib based on TLS
-  + cib: Ingore patch failures if we already have their contents
+  + cib: Ignore patch failures if we already have their contents
   + cib: Validate that everyone still sees the same configuration once all updates have completed
   + cibadmin: Allow priviliged clients to perform tasks as unpriviliged users
   + cibadmin: Remove dangerous commands that exposed unnecessary implementation internal details
@@ -825,7 +1019,7 @@
   + corosync: Populate the cib nodelist from corosync if available
   + corosync: Use the CFG API and DNS to determine node names if not configured in corosync.conf
   + crmd: Block after 10 failed fencing attempts for a node
-  + crmd: cl#5051 - Fixes file leak in pe ipc connection initialization.
+  + crmd: cl#5051 - Fixes file leak in PE ipc connection initialization.
   + crmd: cl#5053 - Fixes fail-count not being updated properly.
   + crmd: cl#5057 - Restart sub-systems correctly (bnc#755671)
   + crmd: cl#5068 - Fixes crm_node -R option so it works with corosync 2.0
@@ -1525,7 +1719,7 @@
   + Medium: Extra: Refresh showscores script from Dominik
   + Medium: pengine: Build a statically linked version of ptest
   + Medium: pengine: Correctly log the actions for resources that are being recovered
-  + Medium: pengine: Correctly log the occurance of promotion events
+  + Medium: pengine: Correctly log the occurrence of promotion events
   + Medium: pengine: Implememt node health based on a patch from Mark Hamzy
   + Medium: Tools: Add examples to help text outputs
   + Medium: Tools: crm: catch syntax errors for configure load
@@ -1625,7 +1819,7 @@
   + Medium: crmd: Clean up and optimize the DC election algorithm
   + Medium: crmd: Fix memory leak in shutdown
   + Medium: crmd: Fix memory leaks spotted by Valgrind
-  + Medium: crmd: Ingore join messages from hosts other than our DC
+  + Medium: crmd: Ignore join messages from hosts other than our DC
   + Medium: crmd: Limit the scope of resource updates to the status section
   + Medium: crmd: Prevent the crmd from being respawned if its told to shut down when it did not ask to be
   + Medium: crmd: Re-check the election status after membership events
@@ -2109,7 +2303,7 @@
   + Medium: Core: Allow more than one item to be modified/deleted in XPath based operations
   + Medium: Core: Fix the sort_pairs function for creating sorted xml objects
   + Medium: Core: iso8601 - Implement subtract_duration and fix subtract_time
-  + Medium: Core: Reduce the amount of xml copying occuring
+  + Medium: Core: Reduce the amount of xml copying
   + Medium: Core: Support value='value+=N' XML updates (in addtion to value='value++')
   + Medium: crmd: Add support for lrm_ops->fail_rsc if its available
   + Medium: crmd: HB - watch link status for node leaving events
@@ -2260,8 +2454,8 @@
     Changesets:      347
     Diff:            2272 files changed, 132508 insertions(+), 305991 deletions(-)
 - Test hardware:
-    + 6-node vmware cluster (sles10-sp1/256Mb/vmware stonith) on a single host (opensuse10.3/2Gb/2.66Ghz Quad Core2)
-    + 7-node EMC Centera cluster (sles10/512Mb/2Ghz Xeon/ssh stonith)
+    + 6-node vmware cluster (sles10-sp1/256MB/vmware stonith) on a single host (opensuse10.3/2GB/2.66GHz Quad Core2)
+    + 7-node EMC Centera cluster (sles10/512MB/2GHz Xeon/ssh stonith)
 - Notes: Heartbeat Stack
     + All testing was performed with STONITH enabled
     + The CRM was enabled using the "crm respawn" directive

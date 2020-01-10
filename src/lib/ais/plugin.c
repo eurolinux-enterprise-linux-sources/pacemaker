@@ -629,7 +629,7 @@ pcmk_startup(struct corosync_api_v1 *init_with)
         }
 #if 0
         /* system() is not thread-safe, can't call from here
-         * Actually, its a pretty hacky way to try and achieve this anyway
+         * Actually, it's a pretty hacky way to try and achieve this anyway
          */
         if (system("echo 1 > /proc/sys/kernel/core_uses_pid") != 0) {
             ais_perror("Could not enable /proc/sys/kernel/core_uses_pid");
@@ -663,7 +663,7 @@ pcmk_startup(struct corosync_api_v1 *init_with)
     if (use_mcp == FALSE) {
         pthread_create(&pcmk_wait_thread, NULL, pcmk_wait_dispatch, NULL);
         for (start_seq = 1; start_seq < max; start_seq++) {
-            /* dont start anything with start_seq < 1 */
+            /* don't start anything with start_seq < 1 */
             for (lpc = 0; lpc < max; lpc++) {
                 if (start_seq == pcmk_children[lpc].start_seq) {
                     spawn_child(&(pcmk_children[lpc]));
@@ -673,22 +673,6 @@ pcmk_startup(struct corosync_api_v1 *init_with)
     }
     return 0;
 }
-
-/*
-  static void ais_print_node(const char *prefix, struct totem_ip_address *host)
-  {
-  int len = 0;
-  char *buffer = NULL;
-
-  ais_malloc0(buffer, INET6_ADDRSTRLEN+1);
-
-  inet_ntop(host->family, host->addr, buffer, INET6_ADDRSTRLEN);
-
-  len = strlen(buffer);
-  ais_info("%s: %.*s", prefix, len, buffer);
-  ais_free(buffer);
-  }
-*/
 
 #if 0
 /* copied here for reference from exec/totempg.c */
@@ -1108,7 +1092,7 @@ pcmk_shutdown(void)
     wait_active = FALSE;        /* stop the wait loop */
 
     for (; phase > 0; phase--) {
-        /* dont stop anything with start_seq < 1 */
+        /* don't stop anything with start_seq < 1 */
 
         for (lpc = max - 1; lpc >= 0; lpc--) {
             if (phase != pcmk_children[lpc].start_seq) {
@@ -1160,7 +1144,7 @@ pcmk_shutdown(void)
 
     send_cluster_id();
     ais_notice("Shutdown complete");
-    /* TODO: Add back the logsys flush call once its written */
+    /* TODO: Add back the logsys flush call once it's written */
 
     return 0;
 }

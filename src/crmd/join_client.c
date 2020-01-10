@@ -30,6 +30,26 @@ void join_query_callback(xmlNode * msg, int call_id, int rc, xmlNode * output, v
 
 extern ha_msg_input_t *copy_ha_msg_input(ha_msg_input_t * orig);
 
+/*!
+ * \internal
+ * \brief Remember if DC is shutting down as we join
+ *
+ * If we're joining while the current DC is shutting down, update its expected
+ * state, so we don't fence it if we become the new DC. (We weren't a peer
+ * when it broadcast its shutdown request.)
+ *
+ * \param[in] msg  A join message from the DC
+ */
+static void
+update_dc_expected(xmlNode *msg)
+{
+    if (fsa_our_dc && crm_is_true(crm_element_value(msg, F_CRM_DC_LEAVING))) {
+        crm_node_t *dc_node = crm_get_peer(0, fsa_our_dc);
+
+        crm_update_peer_expected(__FUNCTION__, dc_node, CRMD_JOINSTATE_DOWN);
+    }
+}
+
 /*	A_CL_JOIN_QUERY		*/
 /* is there a DC out there? */
 void
@@ -128,6 +148,8 @@ do_cl_join_offer_respond(long long action,
         return;
     }
 
+    update_dc_expected(input->msg);
+
     CRM_LOG_ASSERT(input != NULL);
     query_call_id =
         fsa_cib_conn->cmds->query(fsa_cib_conn, NULL, NULL, cib_scope_local | cib_no_children);
@@ -177,6 +199,30 @@ join_query_callback(xmlNode * msg, int call_id, int rc, xmlNode * output, void *
     free_xml(generation);
 }
 
+static void
+set_join_state(const char * start_state)
+{
+    if (safe_str_eq(start_state, "standby")) {
+        crm_notice("Forcing node %s to join in %s state per configured environment",
+                   fsa_our_uname, start_state);
+        update_attr_delegate(fsa_cib_conn, cib_sync_call, XML_CIB_TAG_NODES, fsa_our_uuid,
+                             NULL, NULL, NULL, "standby", "on", TRUE, NULL, NULL);
+
+    } else if (safe_str_eq(start_state, "online")) {
+        crm_notice("Forcing node %s to join in %s state per configured environment",
+                   fsa_our_uname, start_state);
+        update_attr_delegate(fsa_cib_conn, cib_sync_call, XML_CIB_TAG_NODES, fsa_our_uuid,
+                             NULL, NULL, NULL, "standby", "off", TRUE, NULL, NULL);
+
+    } else if (safe_str_eq(start_state, "default")) {
+        crm_debug("Not forcing a starting state on node %s", fsa_our_uname);
+
+    } else {
+        crm_warn("Unrecognized start state '%s', using 'default' (%s)",
+                 start_state, fsa_our_uname);
+    }
+}
+
 /*	A_CL_JOIN_RESULT	*/
 /* aka. this is notification that we have (or have not) been accepted */
 void
@@ -189,6 +235,7 @@ do_cl_join_finalize_respond(long long action,
     gboolean was_nack = TRUE;
     static gboolean first_join = TRUE;
     ha_msg_input_t *input = fsa_typed_data(fsa_dt_ha_msg);
+    const char *start_state = daemon_option("node_start_state");
 
     int join_id = -1;
     const char *op = crm_element_value(input->msg, F_CRM_TASK);
@@ -225,8 +272,9 @@ do_cl_join_finalize_respond(long long action,
         return;
     }
 
+    update_dc_expected(input->msg);
+
     /* send our status section to the DC */
-    crm_debug("Confirming join join-%d: %s", join_id, crm_element_value(input->msg, F_CRM_TASK));
     tmp1 = do_lrm_query(TRUE, fsa_our_uname);
     if (tmp1 != NULL) {
         xmlNode *reply = create_request(CRM_OP_JOIN_CONFIRM, tmp1, fsa_our_dc,
@@ -234,35 +282,35 @@ do_cl_join_finalize_respond(long long action,
 
         crm_xml_add_int(reply, F_CRM_JOIN_ID, join_id);
 
-        crm_debug("join-%d: Join complete."
-                  "  Sending local LRM status to %s", join_id, fsa_our_dc);
+        crm_debug("Confirming join-%d: sending local operation history to %s",
+                  join_id, fsa_our_dc);
 
-        if (first_join) {
+        /*
+         * If this is the node's first join since the crmd started on it,
+         * set its initial state (standby or member) according to the user's
+         * preference.
+         *
+         * We do not clear the LRM history here. Even if the DC failed to do it
+         * when we last left, removing them here creates a race condition if the
+         * crmd is being recovered. Instead of a list of active resources from
+         * the lrmd, we may end up with a blank status section. If we are _NOT_
+         * lucky, we will probe for the "wrong" instance of anonymous clones and
+         * end up with multiple active instances on the machine.
+         */
+        if (first_join && is_not_set(fsa_input_register, R_SHUTDOWN)) {
             first_join = FALSE;
-
-            /*
-             * Clear any previous transient node attribute and lrm operations
-             *
-             * Corosync has a nasty habit of not being able to tell if a
-             *   node is returning or didn't leave in the first place.
-             * This confuses Pacemaker because it never gets a "node up"
-             *   event which is normally used to clean up the status section.
-             *
-             * Do not remove the resources though, they'll be cleaned up in
-             *   do_dc_join_ack().  Removing them here creates a race
-             *   condition if the crmd is being recovered.
-             * Instead of a list of active resources from the lrmd
-             *   we may end up with a blank status section.
-             * If we are _NOT_ lucky, we will probe for the "wrong" instance
-             *   of anonymous clones and end up with multiple active
-             *   instances on the machine.
+#if !HAVE_ATOMIC_ATTRD
+            /* c9d1c3cd made this unnecessary for atomic attrd.
+             * This means that the issue addressed by that commit is still
+             * present for legacy attrd, but given legacy attrd's imminent
+             * demise, this is preferable to making intrusive changes to it.
              */
             erase_status_tag(fsa_our_uname, XML_TAG_TRANSIENT_NODEATTRS, 0);
-
-            /* Just in case attrd was still around too */
-            if (is_not_set(fsa_input_register, R_SHUTDOWN)) {
-                update_attrd(fsa_our_uname, "terminate", NULL, NULL, FALSE);
-                update_attrd(fsa_our_uname, XML_CIB_ATTR_SHUTDOWN, "0", NULL, FALSE);
+            update_attrd(fsa_our_uname, "terminate", NULL, NULL, FALSE);
+            update_attrd(fsa_our_uname, XML_CIB_ATTR_SHUTDOWN, "0", NULL, FALSE);
+#endif
+            if (start_state) {
+                set_join_state(start_state);
             }
         }
 
@@ -271,13 +319,20 @@ do_cl_join_finalize_respond(long long action,
 
         if (AM_I_DC == FALSE) {
             register_fsa_input_adv(cause, I_NOT_DC, NULL, A_NOTHING, TRUE, __FUNCTION__);
+#if !HAVE_ATOMIC_ATTRD
+            /* Ask attrd to write all attributes to disk. This is not needed for
+             * atomic attrd because atomic attrd does a peer sync and write-out
+             * when winning an election.
+             */
             update_attrd(NULL, NULL, NULL, NULL, FALSE);
+#endif
         }
 
         free_xml(tmp1);
 
     } else {
-        crm_err("Could not send our LRM state to the DC");
+        crm_err("Could not confirm join-%d with %s: Local operation history failed",
+                join_id, fsa_our_dc);
         register_fsa_error(C_FSA_INTERNAL, I_FAIL, NULL);
     }
 }

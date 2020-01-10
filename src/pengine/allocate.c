@@ -35,9 +35,37 @@
 CRM_TRACE_INIT_DATA(pe_allocate);
 
 void set_alloc_actions(pe_working_set_t * data_set);
-void migrate_reload_madness(pe_working_set_t * data_set);
 extern void ReloadRsc(resource_t * rsc, node_t *node, pe_working_set_t * data_set);
 extern gboolean DeleteRsc(resource_t * rsc, node_t * node, gboolean optional, pe_working_set_t * data_set);
+static void apply_remote_node_ordering(pe_working_set_t *data_set);
+static enum remote_connection_state get_remote_node_state(pe_node_t *node);
+
+enum remote_connection_state {
+    remote_state_unknown = 0,
+    remote_state_alive = 1,
+    remote_state_resting = 2,
+    remote_state_failed = 3,
+    remote_state_stopped = 4
+};
+
+static const char *
+state2text(enum remote_connection_state state)
+{
+    switch (state) {
+        case remote_state_unknown:
+            return "unknown";
+        case remote_state_alive:
+            return "alive";
+        case remote_state_resting:
+            return "resting";
+        case remote_state_failed:
+            return "failed";
+        case remote_state_stopped:
+            return "stopped";
+    }
+
+    return "impossible";
+}
 
 resource_alloc_functions_t resource_class_alloc_functions[] = {
     {
@@ -78,7 +106,7 @@ resource_alloc_functions_t resource_class_alloc_functions[] = {
      clone_rsc_colocation_rh,
      clone_rsc_location,
      clone_action_flags,
-     clone_update_actions,
+     container_update_actions,
      clone_expand,
      clone_append_meta,
      },
@@ -92,14 +120,28 @@ resource_alloc_functions_t resource_class_alloc_functions[] = {
      master_rsc_colocation_rh,
      clone_rsc_location,
      clone_action_flags,
-     clone_update_actions,
+     container_update_actions,
      clone_expand,
      master_append_meta,
+     },
+    {
+     container_merge_weights,
+     container_color,
+     container_create_actions,
+     container_create_probe,
+     container_internal_constraints,
+     container_rsc_colocation_lh,
+     container_rsc_colocation_rh,
+     container_rsc_location,
+     container_action_flags,
+     container_update_actions,
+     container_expand,
+     container_append_meta,
      }
 };
 
 gboolean
-update_action_flags(action_t * action, enum pe_action_flags flags)
+update_action_flags(action_t * action, enum pe_action_flags flags, const char *source, int line)
 {
     static unsigned long calls = 0;
     gboolean changed = FALSE;
@@ -107,9 +149,9 @@ update_action_flags(action_t * action, enum pe_action_flags flags)
     enum pe_action_flags last = action->flags;
 
     if (clear) {
-        pe_clear_action_bit(action, flags);
+        action->flags = crm_clear_bit(source, line, action->uuid, action->flags, flags);
     } else {
-        pe_set_action_bit(action, flags);
+        action->flags = crm_set_bit(source, line, action->uuid, action->flags, flags);
     }
 
     if (last != action->flags) {
@@ -118,9 +160,9 @@ update_action_flags(action_t * action, enum pe_action_flags flags)
         /* Useful for tracking down _who_ changed a specific flag */
         /* CRM_ASSERT(calls != 534); */
         clear_bit(flags, pe_action_clear);
-        crm_trace("%s on %s: %sset flags 0x%.6x (was 0x%.6x, now 0x%.6x, %lu)",
+        crm_trace("%s on %s: %sset flags 0x%.6x (was 0x%.6x, now 0x%.6x, %lu, %s)",
                   action->uuid, action->node ? action->node->details->uname : "[none]",
-                  clear ? "un-" : "", flags, last, action->flags, calls);
+                  clear ? "un-" : "", flags, last, action->flags, calls, source);
     }
 
     return changed;
@@ -147,7 +189,7 @@ check_rsc_parameters(resource_t * rsc, node_t * node, xmlNode * rsc_entry,
     for (; attr_lpc < DIMOF(attr_list); attr_lpc++) {
         value = crm_element_value(rsc->xml, attr_list[attr_lpc]);
         old_value = crm_element_value(rsc_entry, attr_list[attr_lpc]);
-        if (value == old_value  /* ie. NULL */
+        if (value == old_value  /* i.e. NULL */
             || crm_str_eq(value, old_value, TRUE)) {
             continue;
         }
@@ -228,7 +270,6 @@ check_action_definition(resource_t * rsc, node_t * active_node, xmlNode * xml_op
     gboolean did_change = FALSE;
 
     const char *task = crm_element_value(xml_op, XML_LRM_ATTR_TASK);
-    const char *op_version;
     const char *digest_secure = NULL;
 
     CRM_CHECK(active_node != NULL, return FALSE);
@@ -262,7 +303,8 @@ check_action_definition(resource_t * rsc, node_t * active_node, xmlNode * xml_op
         key = NULL;
     }
 
-    crm_trace("Testing %s_%s_%d on %s", rsc->id, task, interval, active_node?active_node->details->uname:"N/A");
+    crm_trace("Testing %s_%s_%d on %s",
+              rsc->id, task, interval, active_node->details->uname);
     if (interval == 0 && safe_str_eq(task, RSC_STATUS)) {
         /* Reload based on the start action not a probe */
         task = RSC_START;
@@ -275,7 +317,6 @@ check_action_definition(resource_t * rsc, node_t * active_node, xmlNode * xml_op
         task = RSC_START;
     }
 
-    op_version = crm_element_value(xml_op, XML_ATTR_CRM_VERSION);
     digest_data = rsc_action_digest_cmp(rsc, xml_op, active_node, data_set);
 
     if(is_set(data_set->flags, pe_flag_sanitized)) {
@@ -286,38 +327,33 @@ check_action_definition(resource_t * rsc, node_t * active_node, xmlNode * xml_op
        && digest_secure
        && digest_data->digest_secure_calc
        && strcmp(digest_data->digest_secure_calc, digest_secure) == 0) {
-        fprintf(stdout, "Only 'private' parameters to %s_%s_%d on %s changed: %s\n",
-                rsc->id, task, interval, active_node->details->uname,
-                crm_element_value(xml_op, XML_ATTR_TRANSITION_MAGIC));
+        if (is_set(data_set->flags, pe_flag_sanitized)) {
+            printf("Only 'private' parameters to %s_%s_%d on %s changed: %s\n",
+                   rsc->id, task, interval, active_node->details->uname,
+                   crm_element_value(xml_op, XML_ATTR_TRANSITION_MAGIC));
+        }
 
     } else if (digest_data->rc == RSC_DIGEST_RESTART) {
         /* Changes that force a restart */
-        const char *digest_restart = crm_element_value(xml_op, XML_LRM_ATTR_RESTART_DIGEST);
+        pe_action_t *required = NULL;
 
         did_change = TRUE;
         key = generate_op_key(rsc->id, task, interval);
         crm_log_xml_info(digest_data->params_restart, "params:restart");
-        pe_rsc_info(rsc, "Parameters to %s on %s changed: was %s vs. now %s (restart:%s) %s",
-                 key, active_node->details->uname,
-                 crm_str(digest_restart), digest_data->digest_restart_calc,
-                 op_version, crm_element_value(xml_op, XML_ATTR_TRANSITION_MAGIC));
+        required = custom_action(rsc, key, task, NULL, TRUE, TRUE, data_set);
+        pe_action_set_flag_reason(__FUNCTION__, __LINE__, required, NULL,
+                                  "resource definition change", pe_action_optional, TRUE);
 
-        custom_action(rsc, key, task, NULL, FALSE, TRUE, data_set);
-        trigger_unfencing(rsc, NULL, "Device parameters changed", NULL, data_set);
+        trigger_unfencing(rsc, active_node, "Device parameters changed", NULL, data_set);
 
     } else if ((digest_data->rc == RSC_DIGEST_ALL) || (digest_data->rc == RSC_DIGEST_UNKNOWN)) {
         /* Changes that can potentially be handled by a reload */
         const char *digest_restart = crm_element_value(xml_op, XML_LRM_ATTR_RESTART_DIGEST);
-        const char *digest_all = crm_element_value(xml_op, XML_LRM_ATTR_OP_DIGEST);
 
         did_change = TRUE;
-        trigger_unfencing(rsc, NULL, "Device parameters changed (reload)", NULL, data_set);
+        trigger_unfencing(rsc, active_node, "Device parameters changed (reload)", NULL, data_set);
         crm_log_xml_info(digest_data->params_all, "params:reload");
         key = generate_op_key(rsc->id, task, interval);
-        pe_rsc_info(rsc, "Parameters to %s on %s changed: was %s vs. now %s (reload:%s) %s",
-                 key, active_node->details->uname,
-                 crm_str(digest_all), digest_data->digest_all_calc, op_version,
-                 crm_element_value(xml_op, XML_ATTR_TRANSITION_MAGIC));
 
         if (interval > 0) {
             action_t *op = NULL;
@@ -339,12 +375,15 @@ check_action_definition(resource_t * rsc, node_t * active_node, xmlNode * xml_op
             free(key);
 
         } else {
+            pe_action_t *required = NULL;
             pe_rsc_trace(rsc, "Resource %s doesn't know how to reload", rsc->id);
 
             /* Re-send the start/demote/promote op
              * Recurring ops will be detected independently
              */
-            custom_action(rsc, key, task, NULL, FALSE, TRUE, data_set);
+            required = custom_action(rsc, key, task, NULL, TRUE, TRUE, data_set);
+            pe_action_set_flag_reason(__FUNCTION__, __LINE__, required, NULL,
+                                      "resource definition change", pe_action_optional, TRUE);
         }
     }
 
@@ -375,7 +414,7 @@ check_actions_for(xmlNode * rsc_entry, resource_t * rsc, node_t * node, pe_worki
     if (is_set(rsc->flags, pe_rsc_orphan)) {
         resource_t *parent = uber_parent(rsc);
         if(parent == NULL
-           || parent->variant < pe_clone
+           || pe_rsc_is_clone(parent) == FALSE
            || is_set(parent->flags, pe_rsc_unique)) {
             pe_rsc_trace(rsc, "Skipping param check for %s and deleting: orphan", rsc->id);
             DeleteRsc(rsc, node, FALSE, data_set);
@@ -441,7 +480,9 @@ check_actions_for(xmlNode * rsc_entry, resource_t * rsc, node_t * node, pe_worki
             did_change = check_action_definition(rsc, node, rsc_op, data_set);
         }
 
-        if (did_change && get_failcount(node, rsc, NULL, data_set)) {
+        if (did_change && pe_get_failcount(node, rsc, NULL, pe_fc_effective,
+                                           NULL, data_set)) {
+
             char *key = NULL;
             action_t *action_clear = NULL;
 
@@ -449,6 +490,10 @@ check_actions_for(xmlNode * rsc_entry, resource_t * rsc, node_t * node, pe_worki
             action_clear =
                 custom_action(rsc, key, CRM_OP_CLEAR_FAILCOUNT, node, FALSE, TRUE, data_set);
             set_bit(action_clear->flags, pe_action_runnable);
+
+            crm_notice("Clearing failure of %s on %s "
+                       "because action definition changed " CRM_XS " %s",
+                       rsc->id, node->details->uname, action_clear->uuid);
         }
     }
 
@@ -596,7 +641,7 @@ static gboolean
 failcount_clear_action_exists(node_t * node, resource_t * rsc)
 {
     gboolean rc = FALSE;
-    char *key = crm_concat(rsc->id, CRM_OP_CLEAR_FAILCOUNT, '_');
+    char *key = generate_op_key(rsc->id, CRM_OP_CLEAR_FAILCOUNT, 0);
     GListPtr list = find_actions_exact(rsc->actions, key, node);
 
     if (list) {
@@ -628,8 +673,15 @@ check_migration_threshold(resource_t *rsc, node_t *node,
         return;
     }
 
+    // If we're ignoring failures, also ignore the migration threshold
+    if (is_set(rsc->flags, pe_rsc_failure_ignored)) {
+        return;
+    }
+
     /* If there are no failures, there's no need to force away */
-    fail_count = get_failcount_all(node, rsc, NULL, data_set);
+    fail_count = pe_get_failcount(node, rsc, NULL,
+                                  pe_fc_effective|pe_fc_fillers, NULL,
+                                  data_set);
     if (fail_count <= 0) {
         return;
     }
@@ -704,7 +756,7 @@ common_apply_stickiness(resource_t * rsc, node_t * node, pe_working_set_t * data
     }
 }
 
-static void
+void
 complex_set_cmds(resource_t * rsc)
 {
     GListPtr gIter = rsc->children;
@@ -742,8 +794,7 @@ calculate_system_health(gpointer gKey, gpointer gValue, gpointer user_data)
         return;
     }
 
-    /* Does it start with #health? */
-    if (0 == strncmp(key, "#health", 7)) {
+    if (crm_starts_with(key, "#health")) {
         int score;
 
         /* Convert the value into an integer */
@@ -759,6 +810,7 @@ apply_system_health(pe_working_set_t * data_set)
 {
     GListPtr gIter = NULL;
     const char *health_strategy = pe_pref(data_set->config_hash, "node-health-strategy");
+    int base_health = 0;
 
     if (health_strategy == NULL || safe_str_eq(health_strategy, "none")) {
         /* Prevent any accidental health -> score translation */
@@ -788,7 +840,9 @@ apply_system_health(pe_working_set_t * data_set)
     } else if (safe_str_eq(health_strategy, "progressive")) {
         /* Same as the above, but use the r/y/g scores provided by the user
          * Defaults are provided by the pe_prefs table
+         * Also, custom health "base score" can be used
          */
+        base_health = crm_parse_int(pe_pref(data_set->config_hash, "node-health-base"), "0");
 
     } else if (safe_str_eq(health_strategy, "custom")) {
 
@@ -806,7 +860,7 @@ apply_system_health(pe_working_set_t * data_set)
     crm_info("Applying automated node health strategy: %s", health_strategy);
 
     for (gIter = data_set->nodes; gIter != NULL; gIter = gIter->next) {
-        int system_health = 0;
+        int system_health = base_health;
         node_t *node = (node_t *) gIter->data;
 
         /* Search through the node hash table for system health entries. */
@@ -828,7 +882,6 @@ apply_system_health(pe_working_set_t * data_set)
                 rsc2node_new(health_strategy, rsc, system_health, NULL, node, data_set);
             }
         }
-
     }
 
     return TRUE;
@@ -863,28 +916,20 @@ probe_resources(pe_working_set_t * data_set)
 {
     action_t *probe_node_complete = NULL;
 
-    GListPtr gIter = NULL;
-    GListPtr gIter2 = NULL;
-
-    for (gIter = data_set->nodes; gIter != NULL; gIter = gIter->next) {
+    for (GListPtr gIter = data_set->nodes; gIter != NULL; gIter = gIter->next) {
         node_t *node = (node_t *) gIter->data;
-        const char *probed = g_hash_table_lookup(node->details->attrs, CRM_OP_PROBED);
+        const char *probed = pe_node_attribute_raw(node, CRM_OP_PROBED);
 
         if (node->details->online == FALSE) {
+
+            if (is_baremetal_remote_node(node) && node->details->remote_rsc
+                && (get_remote_node_state(node) == remote_state_failed)) {
+
+                pe_fence_node(data_set, node, "the connection is unrecoverable");
+            }
             continue;
 
         } else if (node->details->unclean) {
-            continue;
-
-        } else if (is_remote_node(node) && node->details->shutdown) {
-            /* Don't try and probe a remote node we're shutting down.
-             * It causes constraint conflicts to try and run any sort of action
-             * other that 'stop' on resources living within a remote-node when
-             * it is being shutdown. */
-            continue;
-
-        } else if (is_container_remote_node(node)) {
-            /* TODO enable container node probes once ordered probing is implemented. */
             continue;
 
         } else if (node->details->rsc_discovery_enabled == FALSE) {
@@ -900,7 +945,7 @@ probe_resources(pe_working_set_t * data_set)
             continue;
         }
 
-        for (gIter2 = data_set->resources; gIter2 != NULL; gIter2 = gIter2->next) {
+        for (GListPtr gIter2 = data_set->resources; gIter2 != NULL; gIter2 = gIter2->next) {
             resource_t *rsc = (resource_t *) gIter2->data;
 
             rsc->cmds->create_probe(rsc, node, probe_node_complete, FALSE, data_set);
@@ -926,7 +971,7 @@ rsc_discover_filter(resource_t *rsc, node_t *node)
     }
 
     match = g_hash_table_lookup(rsc->allowed_nodes, node->details->id);
-    if (match && match->rsc_discover_mode != discover_exclusive) {
+    if (match && match->rsc_discover_mode != pe_discover_exclusive) {
         match->weight = -INFINITY;
     }
 }
@@ -935,7 +980,7 @@ rsc_discover_filter(resource_t *rsc, node_t *node)
  * Count how many valid nodes we have (so we know the maximum number of
  *  colors we can resolve).
  *
- * Apply node constraints (ie. filter the "allowed_nodes" part of resources
+ * Apply node constraints (i.e. filter the "allowed_nodes" part of resources)
  */
 gboolean
 stage2(pe_working_set_t * data_set)
@@ -1155,9 +1200,10 @@ allocate_resources(pe_working_set_t * data_set)
                 continue;
             }
             pe_rsc_trace(rsc, "Allocating: %s", rsc->id);
-            /* for remote node connection resources, always prefer the partial migration
-             * target during resource allocation if the rsc is in the middle of a
-             * migration */ 
+            /* For remote node connection resources, always prefer the partial
+             * migration target during resource allocation, if the rsc is in the
+             * middle of a migration.
+             */
             rsc->cmds->allocate(rsc, rsc->partial_migration_target, data_set);
         }
     }
@@ -1170,6 +1216,37 @@ allocate_resources(pe_working_set_t * data_set)
         }
         pe_rsc_trace(rsc, "Allocating: %s", rsc->id);
         rsc->cmds->allocate(rsc, NULL, data_set);
+    }
+}
+
+/* We always use pe_order_preserve with these convenience functions to exempt
+ * internally generated constraints from the prohibition of user constraints
+ * involving remote connection resources.
+ *
+ * The start ordering additionally uses pe_order_runnable_left so that the
+ * specified action is not runnable if the start is not runnable.
+ */
+
+static inline void
+order_start_then_action(resource_t *lh_rsc, action_t *rh_action,
+                        enum pe_ordering extra, pe_working_set_t *data_set)
+{
+    if (lh_rsc && rh_action && data_set) {
+        custom_action_order(lh_rsc, start_key(lh_rsc), NULL,
+                            rh_action->rsc, NULL, rh_action,
+                            pe_order_preserve | pe_order_runnable_left | extra,
+                            data_set);
+    }
+}
+
+static inline void
+order_action_then_stop(action_t *lh_action, resource_t *rh_rsc,
+                       enum pe_ordering extra, pe_working_set_t *data_set)
+{
+    if (lh_action && rh_rsc && data_set) {
+        custom_action_order(lh_action->rsc, NULL, lh_action,
+                            rh_rsc, stop_key(rh_rsc), NULL,
+                            pe_order_preserve | extra, data_set);
     }
 }
 
@@ -1190,20 +1267,27 @@ cleanup_orphans(resource_t * rsc, pe_working_set_t * data_set)
     for (gIter = data_set->nodes; gIter != NULL; gIter = gIter->next) {
         node_t *node = (node_t *) gIter->data;
 
-        if (node->details->online && get_failcount(node, rsc, NULL, data_set)) {
-            action_t *clear_op = NULL;
+        if (node->details->online
+            && pe_get_failcount(node, rsc, NULL, pe_fc_effective, NULL,
+                                data_set)) {
 
-            clear_op = custom_action(rsc, crm_concat(rsc->id, CRM_OP_CLEAR_FAILCOUNT, '_'),
-                                     CRM_OP_CLEAR_FAILCOUNT, node, FALSE, TRUE, data_set);
+            char *key = generate_op_key(rsc->id, CRM_OP_CLEAR_FAILCOUNT, 0);
+            action_t *clear_op = custom_action(rsc, key, CRM_OP_CLEAR_FAILCOUNT,
+                                               node, FALSE, TRUE, data_set);
 
             add_hash_param(clear_op->meta, XML_ATTR_TE_NOWAIT, XML_BOOLEAN_TRUE);
-            pe_rsc_info(rsc, "Clearing failcount (%d) for orphaned resource %s on %s (%s)",
-                        get_failcount(node, rsc, NULL, data_set), rsc->id, node->details->uname,
-                        clear_op->uuid);
 
-            custom_action_order(rsc, NULL, clear_op,
-                            rsc, generate_op_key(rsc->id, RSC_STOP, 0), NULL,
-                            pe_order_optional, data_set);
+            pe_rsc_info(rsc,
+                        "Clearing failure of %s on %s because it is orphaned "
+                        CRM_XS " %s",
+                        rsc->id, node->details->uname, clear_op->uuid);
+
+            /* We can't use order_action_then_stop() here because its
+             * pe_order_preserve breaks things
+             */
+            custom_action_order(clear_op->rsc, NULL, clear_op,
+                                rsc, stop_key(rsc), NULL,
+                                pe_order_optional, data_set);
         }
     }
 }
@@ -1337,6 +1421,79 @@ any_managed_resources(pe_working_set_t * data_set)
     return FALSE;
 }
 
+/*!
+ * \internal
+ * \brief Create pseudo-op for guest node fence, and order relative to it
+ *
+ * \param[in] node      Guest node to fence
+ * \param[in] done      STONITH_DONE operation
+ * \param[in] data_set  Working set of CIB state
+ */
+static void
+fence_guest(pe_node_t *node, pe_action_t *done, pe_working_set_t *data_set)
+{
+    resource_t *container = node->details->remote_rsc->container;
+    pe_action_t *stop = NULL;
+    pe_action_t *stonith_op = NULL;
+
+    /* The fence action is just a label; we don't do anything differently for
+     * off vs. reboot. We specify it explicitly, rather than let it default to
+     * cluster's default action, because we are not _initiating_ fencing -- we
+     * are creating a pseudo-event to describe fencing that is already occurring
+     * by other means (container recovery).
+     */
+    const char *fence_action = "off";
+
+    /* Check whether guest's container resource is has any explicit stop or
+     * start (the stop may be implied by fencing of the guest's host).
+     */
+    if (container) {
+        stop = find_first_action(container->actions, NULL, CRMD_ACTION_STOP, NULL);
+
+        if (find_first_action(container->actions, NULL, CRMD_ACTION_START, NULL)) {
+            fence_action = "reboot";
+        }
+    }
+
+    /* Create a fence pseudo-event, so we have an event to order actions
+     * against, and crmd can always detect it.
+     */
+    stonith_op = pe_fence_op(node, fence_action, FALSE, "guest is unclean", data_set);
+    update_action_flags(stonith_op, pe_action_pseudo | pe_action_runnable,
+                        __FUNCTION__, __LINE__);
+
+    /* We want to imply stops/demotes after the guest is stopped, not wait until
+     * it is restarted, so we always order pseudo-fencing after stop, not start
+     * (even though start might be closer to what is done for a real reboot).
+     */
+    if(stop && is_set(stop->flags, pe_action_pseudo)) {
+        pe_action_t *parent_stonith_op = pe_fence_op(stop->node, NULL, FALSE, NULL, data_set);
+        crm_info("Implying guest node %s is down (action %d) after %s fencing",
+                 node->details->uname, stonith_op->id, stop->node->details->uname);
+        order_actions(parent_stonith_op, stonith_op,
+                      pe_order_runnable_left|pe_order_implies_then);
+
+    } else if (stop) {
+        order_actions(stop, stonith_op,
+                      pe_order_runnable_left|pe_order_implies_then);
+        crm_info("Implying guest node %s is down (action %d) "
+                 "after container %s is stopped (action %d)",
+                 node->details->uname, stonith_op->id,
+                 container->id, stop->id);
+    } else {
+        crm_info("Implying guest node %s is down (action %d) ",
+                 node->details->uname, stonith_op->id);
+    }
+
+    /* @TODO: Order pseudo-fence after any (optional) fence of guest's host */
+
+    /* Order/imply other actions relative to pseudo-fence as with real fence */
+    stonith_constraints(node, stonith_op, data_set);
+    if(done) {
+        order_actions(stonith_op, done, pe_order_implies_then);
+    }
+}
+
 /*
  * Create dependencies for stonith and shutdown operations
  */
@@ -1354,8 +1511,18 @@ stage6(pe_working_set_t * data_set)
     GListPtr gIter;
     GListPtr stonith_ops = NULL;
 
-    crm_trace("Processing fencing and shutdown cases");
+    /* Remote ordering constraints need to happen prior to calculate
+     * fencing because it is one more place we will mark the node as
+     * dirty.
+     *
+     * A nice side-effect of doing it first is that we can remove a
+     * bunch of special logic from apply_*_ordering() because its
+     * already part of pe_fence_node()
+     */
+    crm_trace("Creating remote ordering constraints");
+    apply_remote_node_ordering(data_set);
 
+    crm_trace("Processing fencing and shutdown cases");
     if (any_managed_resources(data_set) == FALSE) {
         crm_notice("Delaying fencing operations until there are resources to manage");
         need_stonith = FALSE;
@@ -1365,24 +1532,12 @@ stage6(pe_working_set_t * data_set)
     for (gIter = data_set->nodes; gIter != NULL; gIter = gIter->next) {
         node_t *node = (node_t *) gIter->data;
 
-        /* remote-nodes associated with a container resource (such as a vm) are not fenced */
+        /* Guest nodes are "fenced" by recovering their container resource,
+         * so handle them separately.
+         */
         if (is_container_remote_node(node)) {
-            /* Guest */
-            if (need_stonith
-                && node->details->remote_requires_reset
-                && pe_can_fence(data_set, node)) {
-                resource_t *container = node->details->remote_rsc->container;
-                char *key = stop_key(container);
-                GListPtr stop_list = find_actions(container->actions, key, NULL);
-
-                crm_info("Implying node %s is down when container %s is stopped (%p)",
-                         node->details->uname, container->id, stop_list);
-                if(stop_list) {
-                    stonith_constraints(node, stop_list->data, data_set);
-                }
-
-                g_list_free(stop_list);
-                free(key);
+            if (node->details->remote_requires_reset && need_stonith) {
+                fence_guest(node, done, data_set);
             }
             continue;
         }
@@ -1392,9 +1547,8 @@ stage6(pe_working_set_t * data_set)
         if (node->details->unclean
             && need_stonith && pe_can_fence(data_set, node)) {
 
+            stonith_op = pe_fence_op(node, NULL, FALSE, "node is unclean", data_set);
             pe_warn("Scheduling Node %s for STONITH", node->details->uname);
-
-            stonith_op = pe_fence_op(node, NULL, FALSE, data_set);
 
             stonith_constraints(node, stonith_op, data_set);
 
@@ -1414,7 +1568,7 @@ stage6(pe_working_set_t * data_set)
             }
 
         } else if (node->details->online && node->details->shutdown &&
-                /* TODO define what a shutdown op means for a baremetal remote node.
+                /* TODO define what a shutdown op means for a remote node.
                  * For now we do not send shutdown operations for remote nodes, but
                  * if we can come up with a good use for this in the future, we will. */
                     is_remote_node(node) == FALSE) {
@@ -1590,7 +1744,7 @@ rsc_order_then(action_t * lh_action, resource_t * rsc, order_constraint_t * orde
             order_actions(lh_action, rh_action_iter, type);
 
         } else if (type & pe_order_implies_then) {
-            update_action_flags(rh_action_iter, pe_action_runnable | pe_action_clear);
+            update_action_flags(rh_action_iter, pe_action_runnable | pe_action_clear, __FUNCTION__, __LINE__);
             crm_warn("Unrunnable %s 0x%.6x", rh_action_iter->uuid, type);
         } else {
             crm_warn("neither %s 0x%.6x", rh_action_iter->uuid, type);
@@ -1669,32 +1823,345 @@ rsc_order_first(resource_t * lh_rsc, order_constraint_t * order, pe_working_set_
 extern gboolean update_action(action_t * action);
 extern void update_colo_start_chain(action_t * action);
 
+static int
+is_recurring_action(action_t *action) 
+{
+    const char *interval_s = g_hash_table_lookup(action->meta, XML_LRM_ATTR_INTERVAL);
+    int interval = crm_parse_int(interval_s, "0");
+    if(interval > 0) {
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void
+apply_container_ordering(action_t *action, pe_working_set_t *data_set)
+{
+    /* VMs are also classified as containers for these purposes... in
+     * that they both involve a 'thing' running on a real or remote
+     * cluster node.
+     *
+     * This allows us to be smarter about the type and extent of
+     * recovery actions required in various scenarios
+     */
+    resource_t *remote_rsc = NULL;
+    resource_t *container = NULL;
+    enum action_tasks task = text2task(action->task);
+
+    CRM_ASSERT(action->rsc);
+    CRM_ASSERT(action->node);
+    CRM_ASSERT(is_remote_node(action->node));
+
+    remote_rsc = action->node->details->remote_rsc;
+    CRM_ASSERT(remote_rsc);
+
+    container = remote_rsc->container;
+    CRM_ASSERT(container);
+
+    if(is_set(container->flags, pe_rsc_failed)) {
+        pe_fence_node(data_set, action->node, "container failed");
+    }
+
+    crm_trace("Order %s action %s relative to %s%s for %s%s",
+              action->task, action->uuid,
+              is_set(remote_rsc->flags, pe_rsc_failed)? "failed " : "",
+              remote_rsc->id,
+              is_set(container->flags, pe_rsc_failed)? "failed " : "",
+              container->id);
+
+    if (safe_str_eq(action->task, CRMD_ACTION_MIGRATE)
+        || safe_str_eq(action->task, CRMD_ACTION_MIGRATED)) {
+        /* Migration ops map to "no_action", but we need to apply the same
+         * ordering as for stop or demote (see get_router_node()).
+         */
+        task = stop_rsc;
+    }
+
+    switch (task) {
+        case start_rsc:
+        case action_promote:
+            /* Force resource recovery if the container is recovered */
+            order_start_then_action(container, action, pe_order_implies_then,
+                                    data_set);
+
+            /* Wait for the connection resource to be up too */
+            order_start_then_action(remote_rsc, action, pe_order_none,
+                                    data_set);
+            break;
+
+        case stop_rsc:
+        case action_demote:
+            if (is_set(container->flags, pe_rsc_failed)) {
+                /* When the container representing a guest node fails, any stop
+                 * or demote actions for resources running on the guest node
+                 * are implied by the container stopping. This is similar to
+                 * how fencing operations work for cluster nodes and remote
+                 * nodes.
+                 */
+            } else {
+                /* Ensure the operation happens before the connection is brought
+                 * down.
+                 *
+                 * If we really wanted to, we could order these after the
+                 * connection start, IFF the container's current role was
+                 * stopped (otherwise we re-introduce an ordering loop when the
+                 * connection is restarting).
+                 */
+                order_action_then_stop(action, remote_rsc, pe_order_none,
+                                       data_set);
+            }
+            break;
+
+        default:
+            /* Wait for the connection resource to be up */
+            if (is_recurring_action(action)) {
+                /* In case we ever get the recovery logic wrong, force
+                 * recurring monitors to be restarted, even if just
+                 * the connection was re-established
+                 */
+                if(task != no_action) {
+                    order_start_then_action(remote_rsc, action,
+                                            pe_order_implies_then, data_set);
+                }
+            } else {
+                order_start_then_action(remote_rsc, action, pe_order_none,
+                                        data_set);
+            }
+            break;
+    }
+}
+
+static enum remote_connection_state
+get_remote_node_state(pe_node_t *node) 
+{
+    resource_t *remote_rsc = NULL;
+    node_t *cluster_node = NULL;
+
+    CRM_ASSERT(node);
+
+    remote_rsc = node->details->remote_rsc;
+    CRM_ASSERT(remote_rsc);
+
+    if(remote_rsc->running_on) {
+        cluster_node = remote_rsc->running_on->data;
+    }
+
+
+    /* If the cluster node the remote connection resource resides on
+     * is unclean or went offline, we can't process any operations
+     * on that remote node until after it starts elsewhere.
+     */
+    if(remote_rsc->next_role == RSC_ROLE_STOPPED || remote_rsc->allocated_to == NULL) {
+        /* The connection resource is not going to run anywhere */
+
+        if (cluster_node && cluster_node->details->unclean) {
+            /* The remote connection is failed because its resource is on a
+             * failed node and can't be recovered elsewhere, so we must fence.
+             */
+            return remote_state_failed;
+        }
+
+        if (is_not_set(remote_rsc->flags, pe_rsc_failed)) {
+            /* Connection resource is cleanly stopped */
+            return remote_state_stopped;
+        }
+
+        /* Connection resource is failed */
+
+        if ((remote_rsc->next_role == RSC_ROLE_STOPPED)
+            && remote_rsc->remote_reconnect_interval
+            && node->details->remote_was_fenced) {
+
+            /* We won't know whether the connection is recoverable until the
+             * reconnect interval expires and we reattempt connection.
+             */
+            return remote_state_unknown;
+        }
+
+        /* The remote connection is in a failed state. If there are any
+         * resources known to be active on it (stop) or in an unknown state
+         * (probe), we must assume the worst and fence it.
+         */
+        return remote_state_failed;
+
+    } else if (cluster_node == NULL) {
+        /* Connection is recoverable but not currently running anywhere, see if we can recover it first */
+        return remote_state_unknown;
+
+    } else if(cluster_node->details->unclean == TRUE
+              || cluster_node->details->online == FALSE) {
+        /* Connection is running on a dead node, see if we can recover it first */
+        return remote_state_resting;
+
+    } else if (g_list_length(remote_rsc->running_on) > 1
+               && remote_rsc->partial_migration_source
+               && remote_rsc->partial_migration_target) {
+        /* We're in the middle of migrating a connection resource,
+         * wait until after the resource migrates before performing
+         * any actions.
+         */
+        return remote_state_resting;
+
+    }
+    return remote_state_alive;
+}
+
+static void
+apply_remote_ordering(action_t *action, pe_working_set_t *data_set)
+{
+    resource_t *remote_rsc = NULL;
+    node_t *cluster_node = NULL;
+    enum action_tasks task = text2task(action->task);
+    enum remote_connection_state state = get_remote_node_state(action->node);
+
+    enum pe_ordering order_opts = pe_order_none;
+
+    if (action->rsc == NULL) {
+        return;
+    }
+
+    CRM_ASSERT(action->node);
+    CRM_ASSERT(is_remote_node(action->node));
+
+    remote_rsc = action->node->details->remote_rsc;
+    CRM_ASSERT(remote_rsc);
+
+    if(remote_rsc->running_on) {
+        cluster_node = remote_rsc->running_on->data;
+    }
+
+    crm_trace("Order %s action %s relative to %s%s (state: %s)",
+              action->task, action->uuid,
+              is_set(remote_rsc->flags, pe_rsc_failed)? "failed " : "",
+              remote_rsc->id, state2text(state));
+
+    if (safe_str_eq(action->task, CRMD_ACTION_MIGRATE)
+        || safe_str_eq(action->task, CRMD_ACTION_MIGRATED)) {
+        /* Migration ops map to "no_action", but we need to apply the same
+         * ordering as for stop or demote (see get_router_node()).
+         */
+        task = stop_rsc;
+    }
+
+    switch (task) {
+        case start_rsc:
+        case action_promote:
+            order_opts = pe_order_none;
+
+            if (state == remote_state_failed) {
+                /* Force recovery, by making this action required */
+                order_opts |= pe_order_implies_then;
+            }
+
+            /* Ensure connection is up before running this action */
+            order_start_then_action(remote_rsc, action, order_opts, data_set);
+            break;
+
+        case stop_rsc:
+            if(state == remote_state_alive) {
+                order_action_then_stop(action, remote_rsc,
+                                       pe_order_implies_first, data_set);
+
+            } else if(state == remote_state_failed) {
+                /* We would only be here if the resource is
+                 * running on the remote node.  Since we have no
+                 * way to stop it, it is necessary to fence the
+                 * node.
+                 */
+                pe_fence_node(data_set, action->node, "resources are active and the connection is unrecoverable");
+                order_action_then_stop(action, remote_rsc,
+                                       pe_order_implies_first, data_set);
+
+            } else if(remote_rsc->next_role == RSC_ROLE_STOPPED) {
+                /* State must be remote_state_unknown or remote_state_stopped.
+                 * Since the connection is not coming back up in this
+                 * transition, stop this resource first.
+                 */
+                order_action_then_stop(action, remote_rsc,
+                                       pe_order_implies_first, data_set);
+
+            } else {
+                /* The connection is going to be started somewhere else, so
+                 * stop this resource after that completes.
+                 */
+                order_start_then_action(remote_rsc, action, pe_order_none, data_set);
+            }
+            break;
+
+        case action_demote:
+            /* Only order this demote relative to the connection start if the
+             * connection isn't being torn down. Otherwise, the demote would be
+             * blocked because the connection start would not be allowed.
+             */
+            if(state == remote_state_resting || state == remote_state_unknown) {
+                order_start_then_action(remote_rsc, action, pe_order_none,
+                                        data_set);
+            } /* Otherwise we can rely on the stop ordering */
+            break;
+
+        default:
+            /* Wait for the connection resource to be up */
+            if (is_recurring_action(action)) {
+                /* In case we ever get the recovery logic wrong, force
+                 * recurring monitors to be restarted, even if just
+                 * the connection was re-established
+                 */
+                order_start_then_action(remote_rsc, action,
+                                        pe_order_implies_then, data_set);
+
+            } else {
+                if(task == monitor_rsc && state == remote_state_failed) {
+                    /* We would only be here if we do not know the
+                     * state of the resource on the remote node.
+                     * Since we have no way to find out, it is
+                     * necessary to fence the node.
+                     */
+                    pe_fence_node(data_set, action->node, "resources are in an unknown state and the connection is unrecoverable");
+                }
+
+                if(cluster_node && state == remote_state_stopped) {
+                    /* The connection is currently up, but is going
+                     * down permanently.
+                     *
+                     * Make sure we check services are actually
+                     * stopped _before_ we let the connection get
+                     * closed
+                     */
+                    order_action_then_stop(action, remote_rsc,
+                                           pe_order_runnable_left, data_set);
+
+                } else {
+                    order_start_then_action(remote_rsc, action, pe_order_none,
+                                            data_set);
+                }
+            }
+            break;
+    }
+}
+
 static void
 apply_remote_node_ordering(pe_working_set_t *data_set)
 {
-    GListPtr gIter = data_set->actions;
-
     if (is_set(data_set->flags, pe_flag_have_remote_nodes) == FALSE) {
         return;
     }
-    for (; gIter != NULL; gIter = gIter->next) {
-        action_t *action = (action_t *) gIter->data;
-        resource_t *remote_rsc = NULL;
-        resource_t *container = NULL;
 
+    for (GListPtr gIter = data_set->actions; gIter != NULL; gIter = gIter->next) {
+        action_t *action = (action_t *) gIter->data;
+        resource_t *remote = NULL;
+
+        // We are only interested in resource actions
         if (action->rsc == NULL) {
             continue;
         }
 
-        /* Special case. */
-        if (action->rsc &&
-            action->rsc->is_remote_node &&
+        /* Special case: If we are clearing the failcount of an actual
+         * remote connection resource, then make sure this happens before
+         * any start of the resource in this transition.
+         */
+        if (action->rsc->is_remote_node &&
             safe_str_eq(action->task, CRM_OP_CLEAR_FAILCOUNT)) {
 
-            /* if we are clearing the failcount of an actual remote node connect
-             * resource, then make sure this happens before allowing the connection
-             * to start if we are planning on starting the connection during this
-             * transition */ 
             custom_action_order(action->rsc,
                 NULL,
                 action,
@@ -1704,136 +2171,50 @@ apply_remote_node_ordering(pe_working_set_t *data_set)
                 pe_order_optional,
                 data_set);
 
-                continue;
-        }
-
-        /* detect if the action occurs on a remote node. if so create
-         * ordering constraints that guarantee the action occurs while
-         * the remote node is active (after start, before stop...) things
-         * like that */ 
-        if (action->node == NULL ||
-            is_remote_node(action->node) == FALSE ||
-            action->node->details->remote_rsc == NULL ||
-            is_set(action->flags, pe_action_pseudo)) {
             continue;
         }
 
-        remote_rsc = action->node->details->remote_rsc;
-        container = remote_rsc->container;
+        // We are only interested in actions allocated to a node
+        if (action->node == NULL) {
+            continue;
+        }
 
-        if (safe_str_eq(action->task, "monitor") ||
-            safe_str_eq(action->task, "start") ||
-            safe_str_eq(action->task, "promote") ||
-            safe_str_eq(action->task, "notify") ||
-            safe_str_eq(action->task, CRM_OP_LRM_REFRESH) ||
-            safe_str_eq(action->task, CRM_OP_CLEAR_FAILCOUNT) ||
-            safe_str_eq(action->task, "delete")) {
+        if (is_remote_node(action->node) == FALSE) {
+            continue;
+        }
 
-            custom_action_order(remote_rsc,
-                generate_op_key(remote_rsc->id, RSC_START, 0),
-                NULL,
-                action->rsc,
-                NULL,
-                action,
-                pe_order_preserve | pe_order_implies_then | pe_order_runnable_left,
-                data_set);
+        /* We are only interested in real actions.
+         *
+         * @TODO This is probably wrong; pseudo-actions might be converted to
+         * real actions and vice versa later in update_actions() at the end of
+         * stage7().
+         */
+        if (is_set(action->flags, pe_action_pseudo)) {
+            continue;
+        }
 
-        } else if (safe_str_eq(action->task, "demote")) {
+        remote = action->node->details->remote_rsc;
+        if (remote == NULL) {
+            // Orphaned
+            continue;
+        }
 
-            /* If the connection is being torn down, we don't want
-             * to build a constraint between a resource's demotion and
-             * the connection resource starting... because the connection
-             * resource can not start. The connection might already be up,
-             * but the START action would not be allowed which in turn would
-             * block the demotion of any resournces living in the remote-node.
-             *
-             * In this case, only build the constraint between the demotion and
-             * the connection's stop action. This allows the connection and all the
-             * resources within the remote-node to be torn down properly. */
-            if (remote_rsc->next_role == RSC_ROLE_STOPPED) {
-                custom_action_order(action->rsc,
-                    NULL,
-                    action,
-                    remote_rsc,
-                    generate_op_key(remote_rsc->id, RSC_STOP, 0),
-                    NULL,
-                    pe_order_preserve | pe_order_implies_first,
-                    data_set);
-            }
+        /* The action occurs across a remote connection, so create
+         * ordering constraints that guarantee the action occurs while the node
+         * is active (after start, before stop ... things like that).
+         *
+         * This is somewhat brittle in that we need to make sure the results of
+         * this ordering are compatible with the result of get_router_node().
+         * It would probably be better to add XML_LRM_ATTR_ROUTER_NODE as part
+         * of this logic rather than action2xml().
+         */
+        if (remote->container) {
+            crm_trace("Container ordering for %s", action->uuid);
+            apply_container_ordering(action, data_set);
 
-            if(container && is_set(container->flags, pe_rsc_failed)) {
-                /* Just like a stop, the demote is implied by the
-                 * container having failed/stopped
-                 *
-                 * If we really wanted to we would order the demote
-                 * after the stop, IFF the containers current role was
-                 * stopped (otherwise we re-introduce an ordering
-                 * loop)
-                 */
-                pe_set_action_bit(action, pe_action_pseudo);
-            }
-
-        } else if (safe_str_eq(action->task, "stop") &&
-                   container &&
-                   is_set(container->flags, pe_rsc_failed)) {
-
-            /* when the container representing a remote node fails, the stop
-             * action for all the resources living in that container is implied
-             * by the container stopping.  This is similar to how fencing operations
-             * work for cluster nodes. */
-            pe_set_action_bit(action, pe_action_pseudo);
-            custom_action_order(container,
-                generate_op_key(container->id, RSC_STOP, 0),
-                NULL,
-                action->rsc,
-                NULL,
-                action,
-                pe_order_preserve | pe_order_implies_then | pe_order_runnable_left,
-                data_set);
-        } else if (safe_str_eq(action->task, "stop")) {
-            gboolean after_start = FALSE;
-
-            /* handle special case with baremetal remote where stop actions need to be
-             * ordered after the connection resource starts somewhere else. */
-            if (is_baremetal_remote_node(action->node)) {
-                node_t *cluster_node = remote_rsc->running_on ? remote_rsc->running_on->data : NULL;
-
-                /* if the current cluster node a baremetal connection resource
-                 * is residing on is unclean or went offline we can't process any
-                 * operations on that remote node until after it starts somewhere else. */
-                if (cluster_node == NULL ||
-                    cluster_node->details->unclean == TRUE ||
-                    cluster_node->details->online == FALSE) {
-                    after_start = TRUE;
-                } else if (g_list_length(remote_rsc->running_on) > 1 &&
-                           remote_rsc->partial_migration_source &&
-                            remote_rsc->partial_migration_target) {
-                    /* if we're caught in the middle of migrating a connection resource,
-                     * then we have to wait until after the resource migrates before performing
-                     * any actions. */
-                    after_start = TRUE;
-                }
-            }
-
-            if (after_start) {
-                custom_action_order(remote_rsc,
-                    generate_op_key(remote_rsc->id, RSC_START, 0),
-                    NULL,
-                    action->rsc,
-                    NULL,
-                    action,
-                    pe_order_preserve | pe_order_implies_then | pe_order_runnable_left,
-                    data_set);
-            } else {
-                custom_action_order(action->rsc,
-                    NULL,
-                    action,
-                    remote_rsc,
-                    generate_op_key(remote_rsc->id, RSC_STOP, 0),
-                    NULL,
-                    pe_order_preserve | pe_order_implies_first,
-                    data_set);
-            }
+        } else {
+            crm_trace("Remote ordering for %s", action->uuid);
+            apply_remote_ordering(action, data_set);
         }
     }
 }
@@ -1942,12 +2323,12 @@ order_probes(pe_working_set_t * data_set)
                 crm_trace("Same parent %s for %s", first_rsc->id, start->uuid);
                 continue;
 
-            } else if(FALSE && uber_parent(first_rsc)->variant < pe_clone) {
+            } else if(FALSE && pe_rsc_is_clone(uber_parent(first_rsc)) == FALSE) {
                 crm_trace("Not a clone %s for %s", first_rsc->id, start->uuid);
                 continue;
             }
 
-            crm_err("Appplying %s before %s %d", first->uuid, start->uuid, uber_parent(first_rsc)->variant);
+            crm_err("Applying %s before %s %d", first->uuid, start->uuid, uber_parent(first_rsc)->variant);
 
             for (pIter = probes; pIter != NULL; pIter = pIter->next) {
                 action_t *probe = (action_t *) pIter->data;
@@ -1965,7 +2346,6 @@ stage7(pe_working_set_t * data_set)
 {
     GListPtr gIter = NULL;
 
-    apply_remote_node_ordering(data_set);
     crm_trace("Applying ordering constraints");
 
     /* Don't ask me why, but apparently they need to be processed in
@@ -2009,683 +2389,19 @@ stage7(pe_working_set_t * data_set)
     order_probes(data_set);
 
     crm_trace("Updating %d actions", g_list_length(data_set->actions));
-
     for (gIter = data_set->actions; gIter != NULL; gIter = gIter->next) {
         action_t *action = (action_t *) gIter->data;
 
         update_action(action);
     }
 
-    crm_trace("Processing reloads");
-
+    LogNodeActions(data_set, FALSE);
     for (gIter = data_set->resources; gIter != NULL; gIter = gIter->next) {
         resource_t *rsc = (resource_t *) gIter->data;
 
         LogActions(rsc, data_set, FALSE);
     }
     return TRUE;
-}
-
-static gint
-sort_notify_entries(gconstpointer a, gconstpointer b)
-{
-    int tmp;
-    const notify_entry_t *entry_a = a;
-    const notify_entry_t *entry_b = b;
-
-    if (entry_a == NULL && entry_b == NULL) {
-        return 0;
-    }
-    if (entry_a == NULL) {
-        return 1;
-    }
-    if (entry_b == NULL) {
-        return -1;
-    }
-
-    if (entry_a->rsc == NULL && entry_b->rsc == NULL) {
-        return 0;
-    }
-    if (entry_a->rsc == NULL) {
-        return 1;
-    }
-    if (entry_b->rsc == NULL) {
-        return -1;
-    }
-
-    tmp = strcmp(entry_a->rsc->id, entry_b->rsc->id);
-    if (tmp != 0) {
-        return tmp;
-    }
-
-    if (entry_a->node == NULL && entry_b->node == NULL) {
-        return 0;
-    }
-    if (entry_a->node == NULL) {
-        return 1;
-    }
-    if (entry_b->node == NULL) {
-        return -1;
-    }
-
-    return strcmp(entry_a->node->details->id, entry_b->node->details->id);
-}
-
-static char *
-expand_node_list(GListPtr list)
-{
-    GListPtr gIter = NULL;
-    char *node_list = NULL;
-
-    if (list == NULL) {
-        return strdup(" ");
-    }
-
-    for (gIter = list; gIter != NULL; gIter = gIter->next) {
-        node_t *node = (node_t *) gIter->data;
-
-        if (node->details->uname) {
-            int existing_len = 0;
-            int len = 2 + strlen(node->details->uname);
-
-            if(node_list) {
-                existing_len = strlen(node_list);
-            }
-            crm_trace("Adding %s (%dc) at offset %d", node->details->uname, len - 2, existing_len);
-            node_list = realloc_safe(node_list, len + existing_len);
-            sprintf(node_list + existing_len, "%s%s", existing_len == 0 ? "":" ", node->details->uname);
-        }
-    }
-
-    return node_list;
-}
-
-static void
-expand_list(GListPtr list, char **rsc_list, char **node_list)
-{
-    GListPtr gIter = NULL;
-    const char *uname = NULL;
-    const char *rsc_id = NULL;
-    const char *last_rsc_id = NULL;
-
-    if (rsc_list) {
-        *rsc_list = NULL;
-    }
-
-    if (list == NULL) {
-        if (rsc_list) {
-            *rsc_list = strdup(" ");
-        }
-        if (node_list) {
-            *node_list = strdup(" ");
-        }
-        return;
-    }
-
-    if (node_list) {
-        *node_list = NULL;
-    }
-
-    for (gIter = list; gIter != NULL; gIter = gIter->next) {
-        notify_entry_t *entry = (notify_entry_t *) gIter->data;
-
-        CRM_LOG_ASSERT(entry != NULL);
-        CRM_LOG_ASSERT(entry && entry->rsc != NULL);
-
-        if(entry == NULL || entry->rsc == NULL) {
-            continue;
-        }
-
-        /* Uh, why? */
-        CRM_LOG_ASSERT(node_list == NULL || entry->node != NULL);
-        if(node_list != NULL && entry->node == NULL) {
-            continue;
-        }
-
-        uname = NULL;
-        rsc_id = entry->rsc->id;
-        CRM_ASSERT(rsc_id != NULL);
-
-        /* filter dups */
-        if (safe_str_eq(rsc_id, last_rsc_id)) {
-            continue;
-        }
-        last_rsc_id = rsc_id;
-
-        if (rsc_list != NULL) {
-            int existing_len = 0;
-            int len = 2 + strlen(rsc_id);       /* +1 space, +1 EOS */
-
-            if (rsc_list && *rsc_list) {
-                existing_len = strlen(*rsc_list);
-            }
-
-            crm_trace("Adding %s (%dc) at offset %d", rsc_id, len - 2, existing_len);
-            *rsc_list = realloc_safe(*rsc_list, len + existing_len);
-            sprintf(*rsc_list + existing_len, "%s%s", existing_len == 0 ? "":" ", rsc_id);
-        }
-
-        if (entry->node != NULL) {
-            uname = entry->node->details->uname;
-        }
-
-        if (node_list != NULL && uname) {
-            int existing_len = 0;
-            int len = 2 + strlen(uname);
-
-            if (node_list && *node_list) {
-                existing_len = strlen(*node_list);
-            }
-
-            crm_trace("Adding %s (%dc) at offset %d", uname, len - 2, existing_len);
-            *node_list = realloc_safe(*node_list, len + existing_len);
-            sprintf(*node_list + existing_len, "%s%s", existing_len == 0 ? "":" ", uname);
-        }
-    }
-
-}
-
-static void
-dup_attr(gpointer key, gpointer value, gpointer user_data)
-{
-    add_hash_param(user_data, key, value);
-}
-
-static action_t *
-pe_notify(resource_t * rsc, node_t * node, action_t * op, action_t * confirm,
-          notify_data_t * n_data, pe_working_set_t * data_set)
-{
-    char *key = NULL;
-    action_t *trigger = NULL;
-    const char *value = NULL;
-    const char *task = NULL;
-
-    if (op == NULL || confirm == NULL) {
-        pe_rsc_trace(rsc, "Op=%p confirm=%p", op, confirm);
-        return NULL;
-    }
-
-    CRM_CHECK(rsc != NULL, return NULL);
-    CRM_CHECK(node != NULL, return NULL);
-
-    if (node->details->online == FALSE) {
-        pe_rsc_trace(rsc, "Skipping notification for %s: node offline", rsc->id);
-        return NULL;
-    } else if (is_set(op->flags, pe_action_runnable) == FALSE) {
-        pe_rsc_trace(rsc, "Skipping notification for %s: not runnable", op->uuid);
-        return NULL;
-    }
-
-    value = g_hash_table_lookup(op->meta, "notify_type");
-    task = g_hash_table_lookup(op->meta, "notify_operation");
-
-    pe_rsc_trace(rsc, "Creating notify actions for %s: %s (%s-%s)", op->uuid, rsc->id, value, task);
-
-    key = generate_notify_key(rsc->id, value, task);
-    trigger = custom_action(rsc, key, op->task, node,
-                            is_set(op->flags, pe_action_optional), TRUE, data_set);
-    g_hash_table_foreach(op->meta, dup_attr, trigger->meta);
-    g_hash_table_foreach(n_data->keys, dup_attr, trigger->meta);
-
-    /* pseudo_notify before notify */
-    pe_rsc_trace(rsc, "Ordering %s before %s (%d->%d)", op->uuid, trigger->uuid, trigger->id,
-                 op->id);
-
-    order_actions(op, trigger, pe_order_optional);
-    order_actions(trigger, confirm, pe_order_optional);
-    return trigger;
-}
-
-static void
-pe_post_notify(resource_t * rsc, node_t * node, notify_data_t * n_data, pe_working_set_t * data_set)
-{
-    action_t *notify = NULL;
-
-    CRM_CHECK(rsc != NULL, return);
-
-    if (n_data->post == NULL) {
-        return;                 /* Nothing to do */
-    }
-
-    notify = pe_notify(rsc, node, n_data->post, n_data->post_done, n_data, data_set);
-
-    if (notify != NULL) {
-        notify->priority = INFINITY;
-    }
-
-    if (n_data->post_done) {
-        GListPtr gIter = rsc->actions;
-
-        for (; gIter != NULL; gIter = gIter->next) {
-            action_t *mon = (action_t *) gIter->data;
-            const char *interval = g_hash_table_lookup(mon->meta, "interval");
-
-            if (interval == NULL || safe_str_eq(interval, "0")) {
-                pe_rsc_trace(rsc, "Skipping %s: interval", mon->uuid);
-                continue;
-            } else if (safe_str_eq(mon->task, RSC_CANCEL)) {
-                pe_rsc_trace(rsc, "Skipping %s: cancel", mon->uuid);
-                continue;
-            }
-
-            order_actions(n_data->post_done, mon, pe_order_optional);
-        }
-    }
-}
-
-notify_data_t *
-create_notification_boundaries(resource_t * rsc, const char *action, action_t * start,
-                               action_t * end, pe_working_set_t * data_set)
-{
-    /* Create the pseudo ops that preceed and follow the actual notifications */
-
-    /*
-     * Creates two sequences (conditional on start and end being supplied):
-     *   pre_notify -> pre_notify_complete -> start, and
-     *   end -> post_notify -> post_notify_complete
-     *
-     * 'start' and 'end' may be the same event or ${X} and ${X}ed as per clones
-     */
-    char *key = NULL;
-    notify_data_t *n_data = NULL;
-
-    if (is_not_set(rsc->flags, pe_rsc_notify)) {
-        return NULL;
-    }
-
-    n_data = calloc(1, sizeof(notify_data_t));
-    n_data->action = action;
-    n_data->keys =
-        g_hash_table_new_full(crm_str_hash, g_str_equal, g_hash_destroy_str, g_hash_destroy_str);
-
-    if (start) {
-        /* create pre-event notification wrappers */
-        key = generate_notify_key(rsc->id, "pre", start->task);
-        n_data->pre =
-            custom_action(rsc, key, RSC_NOTIFY, NULL, is_set(start->flags, pe_action_optional),
-                          TRUE, data_set);
-
-        update_action_flags(n_data->pre, pe_action_pseudo);
-        update_action_flags(n_data->pre, pe_action_runnable);
-
-        add_hash_param(n_data->pre->meta, "notify_type", "pre");
-        add_hash_param(n_data->pre->meta, "notify_operation", n_data->action);
-
-        add_hash_param(n_data->pre->meta, "notify_key_type", "pre");
-        add_hash_param(n_data->pre->meta, "notify_key_operation", start->task);
-
-        /* create pre_notify_complete */
-        key = generate_notify_key(rsc->id, "confirmed-pre", start->task);
-        n_data->pre_done =
-            custom_action(rsc, key, RSC_NOTIFIED, NULL, is_set(start->flags, pe_action_optional),
-                          TRUE, data_set);
-
-        update_action_flags(n_data->pre_done, pe_action_pseudo);
-        update_action_flags(n_data->pre_done, pe_action_runnable);
-
-        add_hash_param(n_data->pre_done->meta, "notify_type", "pre");
-        add_hash_param(n_data->pre_done->meta, "notify_operation", n_data->action);
-
-        add_hash_param(n_data->pre_done->meta, "notify_key_type", "confirmed-pre");
-        add_hash_param(n_data->pre_done->meta, "notify_key_operation", start->task);
-
-        order_actions(n_data->pre_done, start, pe_order_optional);
-        order_actions(n_data->pre, n_data->pre_done, pe_order_optional);
-    }
-
-    if (end) {
-        /* create post-event notification wrappers */
-        key = generate_notify_key(rsc->id, "post", end->task);
-        n_data->post =
-            custom_action(rsc, key, RSC_NOTIFY, NULL, is_set(end->flags, pe_action_optional), TRUE,
-                          data_set);
-
-        n_data->post->priority = INFINITY;
-        update_action_flags(n_data->post, pe_action_pseudo);
-        if (is_set(end->flags, pe_action_runnable)) {
-            update_action_flags(n_data->post, pe_action_runnable);
-        } else {
-            update_action_flags(n_data->post, pe_action_runnable | pe_action_clear);
-        }
-
-        add_hash_param(n_data->post->meta, "notify_type", "post");
-        add_hash_param(n_data->post->meta, "notify_operation", n_data->action);
-
-        add_hash_param(n_data->post->meta, "notify_key_type", "post");
-        add_hash_param(n_data->post->meta, "notify_key_operation", end->task);
-
-        /* create post_notify_complete */
-        key = generate_notify_key(rsc->id, "confirmed-post", end->task);
-        n_data->post_done =
-            custom_action(rsc, key, RSC_NOTIFIED, NULL, is_set(end->flags, pe_action_optional),
-                          TRUE, data_set);
-
-        n_data->post_done->priority = INFINITY;
-        update_action_flags(n_data->post_done, pe_action_pseudo);
-        if (is_set(end->flags, pe_action_runnable)) {
-            update_action_flags(n_data->post_done, pe_action_runnable);
-        } else {
-            update_action_flags(n_data->post_done, pe_action_runnable | pe_action_clear);
-        }
-
-        add_hash_param(n_data->post_done->meta, "notify_type", "post");
-        add_hash_param(n_data->post_done->meta, "notify_operation", n_data->action);
-
-        add_hash_param(n_data->post_done->meta, "notify_key_type", "confirmed-post");
-        add_hash_param(n_data->post_done->meta, "notify_key_operation", end->task);
-
-        order_actions(end, n_data->post, pe_order_implies_then);
-        order_actions(n_data->post, n_data->post_done, pe_order_implies_then);
-    }
-
-    if (start && end) {
-        order_actions(n_data->pre_done, n_data->post, pe_order_optional);
-    }
-
-    if (safe_str_eq(action, RSC_STOP)) {
-        action_t *all_stopped = get_pseudo_op(ALL_STOPPED, data_set);
-
-        order_actions(n_data->post_done, all_stopped, pe_order_optional);
-    }
-
-    return n_data;
-}
-
-void
-collect_notification_data(resource_t * rsc, gboolean state, gboolean activity,
-                          notify_data_t * n_data)
-{
-
-    if(n_data->allowed_nodes == NULL) {
-        n_data->allowed_nodes = rsc->allowed_nodes;
-    }
-
-    if (rsc->children) {
-        GListPtr gIter = rsc->children;
-
-        for (; gIter != NULL; gIter = gIter->next) {
-            resource_t *child = (resource_t *) gIter->data;
-
-            collect_notification_data(child, state, activity, n_data);
-        }
-        return;
-    }
-
-    if (state) {
-        notify_entry_t *entry = NULL;
-
-        entry = calloc(1, sizeof(notify_entry_t));
-        entry->rsc = rsc;
-        if (rsc->running_on) {
-            /* we only take the first one */
-            entry->node = rsc->running_on->data;
-        }
-
-        pe_rsc_trace(rsc, "%s state: %s", rsc->id, role2text(rsc->role));
-
-        switch (rsc->role) {
-            case RSC_ROLE_STOPPED:
-                n_data->inactive = g_list_prepend(n_data->inactive, entry);
-                break;
-            case RSC_ROLE_STARTED:
-                n_data->active = g_list_prepend(n_data->active, entry);
-                break;
-            case RSC_ROLE_SLAVE:
-                n_data->slave = g_list_prepend(n_data->slave, entry);
-                break;
-            case RSC_ROLE_MASTER:
-                n_data->master = g_list_prepend(n_data->master, entry);
-                break;
-            default:
-                crm_err("Unsupported notify role");
-                free(entry);
-                break;
-        }
-    }
-
-    if (activity) {
-        notify_entry_t *entry = NULL;
-        enum action_tasks task;
-
-        GListPtr gIter = rsc->actions;
-
-        for (; gIter != NULL; gIter = gIter->next) {
-            action_t *op = (action_t *) gIter->data;
-
-            if (is_set(op->flags, pe_action_optional) == FALSE && op->node != NULL) {
-
-                entry = calloc(1, sizeof(notify_entry_t));
-                entry->node = op->node;
-                entry->rsc = rsc;
-
-                task = text2task(op->task);
-                switch (task) {
-                    case start_rsc:
-                        n_data->start = g_list_prepend(n_data->start, entry);
-                        break;
-                    case stop_rsc:
-                        n_data->stop = g_list_prepend(n_data->stop, entry);
-                        break;
-                    case action_promote:
-                        n_data->promote = g_list_prepend(n_data->promote, entry);
-                        break;
-                    case action_demote:
-                        n_data->demote = g_list_prepend(n_data->demote, entry);
-                        break;
-                    default:
-                        free(entry);
-                        break;
-                }
-            }
-        }
-    }
-}
-
-gboolean
-expand_notification_data(notify_data_t * n_data, pe_working_set_t * data_set)
-{
-    /* Expand the notification entries into a key=value hashtable
-     * This hashtable is later used in action2xml()
-     */
-    gboolean required = FALSE;
-    char *rsc_list = NULL;
-    char *node_list = NULL;
-    GListPtr nodes = NULL;
-
-    if (n_data->stop) {
-        n_data->stop = g_list_sort(n_data->stop, sort_notify_entries);
-    }
-    expand_list(n_data->stop, &rsc_list, &node_list);
-    if (rsc_list != NULL && safe_str_neq(" ", rsc_list)) {
-        if (safe_str_eq(n_data->action, RSC_STOP)) {
-            required = TRUE;
-        }
-    }
-    g_hash_table_insert(n_data->keys, strdup("notify_stop_resource"), rsc_list);
-    g_hash_table_insert(n_data->keys, strdup("notify_stop_uname"), node_list);
-
-    if (n_data->start) {
-        n_data->start = g_list_sort(n_data->start, sort_notify_entries);
-        if (rsc_list && safe_str_eq(n_data->action, RSC_START)) {
-            required = TRUE;
-        }
-    }
-    expand_list(n_data->start, &rsc_list, &node_list);
-    g_hash_table_insert(n_data->keys, strdup("notify_start_resource"), rsc_list);
-    g_hash_table_insert(n_data->keys, strdup("notify_start_uname"), node_list);
-
-    if (n_data->demote) {
-        n_data->demote = g_list_sort(n_data->demote, sort_notify_entries);
-        if (safe_str_eq(n_data->action, RSC_DEMOTE)) {
-            required = TRUE;
-        }
-    }
-
-    expand_list(n_data->demote, &rsc_list, &node_list);
-    g_hash_table_insert(n_data->keys, strdup("notify_demote_resource"), rsc_list);
-    g_hash_table_insert(n_data->keys, strdup("notify_demote_uname"), node_list);
-
-    if (n_data->promote) {
-        n_data->promote = g_list_sort(n_data->promote, sort_notify_entries);
-        if (safe_str_eq(n_data->action, RSC_PROMOTE)) {
-            required = TRUE;
-        }
-    }
-    expand_list(n_data->promote, &rsc_list, &node_list);
-    g_hash_table_insert(n_data->keys, strdup("notify_promote_resource"), rsc_list);
-    g_hash_table_insert(n_data->keys, strdup("notify_promote_uname"), node_list);
-
-    if (n_data->active) {
-        n_data->active = g_list_sort(n_data->active, sort_notify_entries);
-    }
-    expand_list(n_data->active, &rsc_list, &node_list);
-    g_hash_table_insert(n_data->keys, strdup("notify_active_resource"), rsc_list);
-    g_hash_table_insert(n_data->keys, strdup("notify_active_uname"), node_list);
-
-    if (n_data->slave) {
-        n_data->slave = g_list_sort(n_data->slave, sort_notify_entries);
-    }
-    expand_list(n_data->slave, &rsc_list, &node_list);
-    g_hash_table_insert(n_data->keys, strdup("notify_slave_resource"), rsc_list);
-    g_hash_table_insert(n_data->keys, strdup("notify_slave_uname"), node_list);
-
-    if (n_data->master) {
-        n_data->master = g_list_sort(n_data->master, sort_notify_entries);
-    }
-    expand_list(n_data->master, &rsc_list, &node_list);
-    g_hash_table_insert(n_data->keys, strdup("notify_master_resource"), rsc_list);
-    g_hash_table_insert(n_data->keys, strdup("notify_master_uname"), node_list);
-
-    if (n_data->inactive) {
-        n_data->inactive = g_list_sort(n_data->inactive, sort_notify_entries);
-    }
-    expand_list(n_data->inactive, &rsc_list, NULL);
-    g_hash_table_insert(n_data->keys, strdup("notify_inactive_resource"), rsc_list);
-
-    nodes = g_hash_table_get_values(n_data->allowed_nodes);
-    node_list = expand_node_list(nodes);
-    g_hash_table_insert(n_data->keys, strdup("notify_available_uname"), node_list);
-    g_list_free(nodes);
-
-    node_list = expand_node_list(data_set->nodes);
-    g_hash_table_insert(n_data->keys, strdup("notify_all_uname"), node_list);
-
-    if (required && n_data->pre) {
-        update_action_flags(n_data->pre, pe_action_optional | pe_action_clear);
-        update_action_flags(n_data->pre_done, pe_action_optional | pe_action_clear);
-    }
-
-    if (required && n_data->post) {
-        update_action_flags(n_data->post, pe_action_optional | pe_action_clear);
-        update_action_flags(n_data->post_done, pe_action_optional | pe_action_clear);
-    }
-    return required;
-}
-
-void
-create_notifications(resource_t * rsc, notify_data_t * n_data, pe_working_set_t * data_set)
-{
-    GListPtr gIter = NULL;
-    action_t *stop = NULL;
-    action_t *start = NULL;
-    enum action_tasks task = text2task(n_data->action);
-
-    if (rsc->children) {
-        gIter = rsc->children;
-        for (; gIter != NULL; gIter = gIter->next) {
-            resource_t *child = (resource_t *) gIter->data;
-
-            create_notifications(child, n_data, data_set);
-        }
-        return;
-    }
-
-    /* Copy notification details into standard ops */
-
-    gIter = rsc->actions;
-    for (; gIter != NULL; gIter = gIter->next) {
-        action_t *op = (action_t *) gIter->data;
-
-        if (is_set(op->flags, pe_action_optional) == FALSE && op->node != NULL) {
-            enum action_tasks t = text2task(op->task);
-
-            switch (t) {
-                case start_rsc:
-                case stop_rsc:
-                case action_promote:
-                case action_demote:
-                    g_hash_table_foreach(n_data->keys, dup_attr, op->meta);
-                    break;
-                default:
-                    break;
-            }
-        }
-    }
-
-    pe_rsc_trace(rsc, "Creating notificaitons for: %s.%s (%s->%s)",
-                 n_data->action, rsc->id, role2text(rsc->role), role2text(rsc->next_role));
-
-    stop = find_first_action(rsc->actions, NULL, RSC_STOP, NULL);
-    start = find_first_action(rsc->actions, NULL, RSC_START, NULL);
-
-    /* stop / demote */
-    if (rsc->role != RSC_ROLE_STOPPED) {
-        if (task == stop_rsc || task == action_demote) {
-            gIter = rsc->running_on;
-            for (; gIter != NULL; gIter = gIter->next) {
-                node_t *current_node = (node_t *) gIter->data;
-
-                /* if this stop action is a pseudo action as a result of the current
-                 * node being fenced, this stop action is implied by the fencing 
-                 * action. There's no reason to send the fenced node a stop notification */ 
-                if (stop &&
-                    is_set(stop->flags, pe_action_pseudo) &&
-                    current_node->details->unclean) {
-
-                    continue;
-                }
-
-                pe_notify(rsc, current_node, n_data->pre, n_data->pre_done, n_data, data_set);
-                if (task == action_demote || stop == NULL
-                    || is_set(stop->flags, pe_action_optional)) {
-                    pe_post_notify(rsc, current_node, n_data, data_set);
-                }
-            }
-        }
-    }
-
-    /* start / promote */
-    if (rsc->next_role != RSC_ROLE_STOPPED) {
-        if (rsc->allocated_to == NULL) {
-            pe_proc_err("Next role '%s' but %s is not allocated", role2text(rsc->next_role),
-                        rsc->id);
-
-        } else if (task == start_rsc || task == action_promote) {
-            if (task != start_rsc || start == NULL || is_set(start->flags, pe_action_optional)) {
-                pe_notify(rsc, rsc->allocated_to, n_data->pre, n_data->pre_done, n_data, data_set);
-            }
-            pe_post_notify(rsc, rsc->allocated_to, n_data, data_set);
-        }
-    }
-}
-
-void
-free_notification_data(notify_data_t * n_data)
-{
-    if (n_data == NULL) {
-        return;
-    }
-
-    g_list_free_full(n_data->stop, free);
-    g_list_free_full(n_data->start, free);
-    g_list_free_full(n_data->demote, free);
-    g_list_free_full(n_data->promote, free);
-    g_list_free_full(n_data->master, free);
-    g_list_free_full(n_data->slave, free);
-    g_list_free_full(n_data->active, free);
-    g_list_free_full(n_data->inactive, free);
-    g_hash_table_destroy(n_data->keys);
-    free(n_data);
 }
 
 int transition_id = -1;
@@ -2746,6 +2462,9 @@ stage8(pe_working_set_t * data_set)
 
     crm_log_xml_trace(data_set->graph, "created resource-driven action list");
 
+    /* pseudo action to distribute list of nodes with maintenance state update */
+    add_maintenance_update(data_set);
+
     /* catch any non-resource specific actions */
     crm_trace("processing non-resource actions");
 
@@ -2767,11 +2486,12 @@ stage8(pe_working_set_t * data_set)
              */
             if (is_set(data_set->flags, pe_flag_have_quorum)
                 || data_set->no_quorum_policy == no_quorum_ignore) {
-                crm_crit("Cannot %s node '%s' because of %s:%s%s",
+                crm_crit("Cannot %s node '%s' because of %s:%s%s (%s)",
                          action->node->details->unclean ? "fence" : "shut down",
                          action->node->details->uname, action->rsc->id,
                          is_not_set(action->rsc->flags, pe_rsc_managed) ? " unmanaged" : " blocked",
-                         is_set(action->rsc->flags, pe_rsc_failed) ? " failed" : "");
+                         is_set(action->rsc->flags, pe_rsc_failed) ? " failed" : "",
+                         action->uuid);
             }
         }
 
@@ -2782,6 +2502,53 @@ stage8(pe_working_set_t * data_set)
     crm_trace("Created transition graph %d.", transition_id);
 
     return TRUE;
+}
+
+void
+LogNodeActions(pe_working_set_t * data_set, gboolean terminal)
+{
+    GListPtr gIter = NULL;
+
+    for (gIter = data_set->actions; gIter != NULL; gIter = gIter->next) {
+        char *node_name = NULL;
+        char *task = NULL;
+        action_t *action = (action_t *) gIter->data;
+
+        if (action->rsc != NULL) {
+            continue;
+        } else if (is_set(action->flags, pe_action_optional)) {
+            continue;
+        }
+
+        if (is_container_remote_node(action->node)) {
+            node_name = crm_strdup_printf("%s (resource: %s)", action->node->details->uname, action->node->details->remote_rsc->container->id);
+        } else if(action->node) {
+            node_name = crm_strdup_printf("%s", action->node->details->uname);
+        }
+
+
+        if (safe_str_eq(action->task, CRM_OP_SHUTDOWN)) {
+            task = strdup("Shutdown");
+        } else if (safe_str_eq(action->task, CRM_OP_FENCE)) {
+            const char *op = g_hash_table_lookup(action->meta, "stonith_action");
+            task = crm_strdup_printf("Fence (%s)", op);
+        }
+
+        if(task == NULL) {
+            /* Nothing to report */
+        } else if(terminal && action->reason) {
+            printf(" * %s %s '%s'\n", task, node_name, action->reason);
+        } else if(terminal) {
+            printf(" * %s %s\n", task, node_name);
+        } else if(action->reason) {
+            crm_notice(" * %s %s '%s'\n", task, node_name, action->reason);
+        } else {
+            crm_notice(" * %s %s\n", task, node_name);
+        }
+
+        free(node_name);
+        free(task);
+    }
 }
 
 void

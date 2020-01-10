@@ -203,9 +203,9 @@ class CIB11(ConfigBase):
             st.add_op("start", "0", timeout="60s")
 
             # For remote node tests, a cluster node is stopped and brought back up
-            # as a remote node with the name "remote_OLDNAME". To allow fencing
+            # as a remote node with the name "remote-OLDNAME". To allow fencing
             # devices to fence these nodes, create a list of all possible node names.
-            all_node_names = [ prefix+n for n in self.CM.Env["nodes"] for prefix in ('', 'remote_') ]
+            all_node_names = [ prefix+n for n in self.CM.Env["nodes"] for prefix in ('', 'remote-') ]
 
             # Add all parameters specified by user
             entries = string.split(self.CM.Env["stonith-params"], ',')
@@ -234,7 +234,7 @@ class CIB11(ConfigBase):
                 stl = FencingTopology(self.Factory)
                 for node in self.CM.Env["nodes"]:
                     # Remote node tests will rename the node
-                    remote_node = "remote_" + node
+                    remote_node = "remote-" + node
 
                     # Randomly assign node to a fencing method
                     ftype = self.CM.Env.RandomGen.choice(["levels-and", "levels-or ", "broadcast "])
@@ -302,10 +302,10 @@ class CIB11(ConfigBase):
                 # Now commit the levels themselves
                 stl.commit()
 
-        o = Option(self.Factory, "stonith-enabled", self.CM.Env["DoFencing"])
+        o = Option(self.Factory)
+        o["stonith-enabled"] = self.CM.Env["DoFencing"]
         o["start-failure-is-fatal"] = "false"
         o["pe-input-series-max"] = "5000"
-        o["default-action-timeout"] = "90s"
         o["shutdown-escalation"] = "5min"
         o["batch-limit"] = "10"
         o["dc-deadtime"] = "5s"
@@ -315,6 +315,10 @@ class CIB11(ConfigBase):
         if self.CM.Env["DoBSC"] == 1:
             o["ident-string"] = "Linux-HA TEST configuration file - REMOVEME!!"
 
+        o.commit()
+
+        o = OpDefaults(self.Factory)
+        o["timeout"] = "90s"
         o.commit()
 
         # Commit the nodes section if we defined one
@@ -547,7 +551,6 @@ if __name__ == '__main__':
         "--stack", "corosync",
         "--test-ip-base", "fe80::1234:56:7890:1000",
         "--stonith", "rhcs",
-        "--stonith-args", "pcmk_arg_map=domain:uname"
     ]
     env = CTS.CtsLab(args)
     cm = CM_ais.crm_mcp(env)

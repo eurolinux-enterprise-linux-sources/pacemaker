@@ -112,7 +112,7 @@ test_exit(int rc)
              event->op_type ? event->op_type : "none",                  \
              services_ocf_exitcode_str(event->rc),                              \
              services_lrm_status_str(event->op_status));                \
-    crm_info("%s", event_buf_v0);;
+    crm_info("%s", event_buf_v0);
 
 static void
 test_shutdown(int nsig)
@@ -206,7 +206,7 @@ start_test(gpointer user_data)
     if (!options.no_connect) {
         if (!lrmd_conn->cmds->is_connected(lrmd_conn)) {
             try_connect();
-            /* async connect, this funciton will get called back into. */
+            /* async connect -- this function will get called back into */
             return 0;
         }
     }
@@ -345,20 +345,6 @@ start_test(gpointer user_data)
     return 0;
 }
 
-static resource_t *
-find_rsc_or_clone(const char *rsc, pe_working_set_t * data_set)
-{
-    resource_t *the_rsc = pe_find_resource(data_set->resources, rsc);
-
-    if (the_rsc == NULL) {
-        char *as_clone = crm_concat(rsc, "0", ':');
-
-        the_rsc = pe_find_resource(data_set->resources, as_clone);
-        free(as_clone);
-    }
-    return the_rsc;
-}
-
 static int
 generate_params(void)
 {
@@ -379,7 +365,7 @@ generate_params(void)
     cib_conn = cib_new();
     rc = cib_conn->cmds->signon(cib_conn, "lrmd_test", cib_query);
     if (rc != pcmk_ok) {
-        crm_err("Error signing on to the CIB service: %s\n", pcmk_strerror(rc));
+        crm_err("Error signing on to the CIB service: %s", pcmk_strerror(rc));
         rc = -1;
         goto param_gen_bail;
     }
@@ -406,7 +392,8 @@ generate_params(void)
 
     cluster_status(&data_set);
     if (options.rsc_id) {
-        rsc = find_rsc_or_clone(options.rsc_id, &data_set);
+        rsc = pe_find_resource_with_flags(data_set.resources, options.rsc_id,
+                                          pe_find_renamed|pe_find_any);
     }
 
     if (!rsc) {
@@ -415,9 +402,8 @@ generate_params(void)
         goto param_gen_bail;
     }
 
-    params = g_hash_table_new_full(crm_str_hash,
-                                   g_str_equal, g_hash_destroy_str, g_hash_destroy_str);
-    meta = g_hash_table_new_full(crm_str_hash, g_str_equal, g_hash_destroy_str, g_hash_destroy_str);
+    params = crm_str_table_new();
+    meta = crm_str_table_new();
 
     get_rsc_attributes(params, rsc, NULL, &data_set);
     get_meta_attributes(meta, rsc, NULL, &data_set);

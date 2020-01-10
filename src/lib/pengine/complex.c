@@ -22,6 +22,8 @@
 #include <crm/pengine/internal.h>
 #include <crm/msg_xml.h>
 
+#include <unpack.h>
+
 void populate_hash(xmlNode * nvpair_list, GHashTable * hash, const char **attrs, int attrs_length);
 
 resource_object_functions_t resource_class_functions[] = {
@@ -33,7 +35,8 @@ resource_object_functions_t resource_class_functions[] = {
      native_active,
      native_resource_state,
      native_location,
-     native_free},
+     native_free
+    },
     {
      group_unpack,
      native_find_rsc,
@@ -42,7 +45,8 @@ resource_object_functions_t resource_class_functions[] = {
      group_active,
      group_resource_state,
      native_location,
-     group_free},
+     group_free
+    },
     {
      clone_unpack,
      native_find_rsc,
@@ -51,7 +55,8 @@ resource_object_functions_t resource_class_functions[] = {
      clone_active,
      clone_resource_state,
      native_location,
-     clone_free},
+     clone_free
+    },
     {
      master_unpack,
      native_find_rsc,
@@ -60,7 +65,18 @@ resource_object_functions_t resource_class_functions[] = {
      clone_active,
      clone_resource_state,
      native_location,
-     clone_free}
+     clone_free
+    },
+    {
+     container_unpack,
+     native_find_rsc,
+     native_parameter,
+     container_print,
+     container_active,
+     container_resource_state,
+     native_location,
+     container_free
+    }
 };
 
 enum pe_obj_types
@@ -77,6 +93,9 @@ get_resource_type(const char *name)
 
     } else if (safe_str_eq(name, XML_CIB_TAG_MASTER)) {
         return pe_master;
+
+    } else if (safe_str_eq(name, XML_CIB_TAG_CONTAINER)) {
+        return pe_container;
     }
 
     return pe_unknown;
@@ -94,6 +113,8 @@ get_resource_typename(enum pe_obj_types type)
             return XML_CIB_TAG_INCARNATION;
         case pe_master:
             return XML_CIB_TAG_MASTER;
+        case pe_container:
+            return XML_CIB_TAG_CONTAINER;
         case pe_unknown:
             return "unknown";
     }
@@ -172,6 +193,32 @@ get_rsc_attributes(GHashTable * meta_hash, resource_t * rsc,
                                    node_hash, meta_hash, NULL, FALSE, data_set->now);
     }
 }
+
+#if ENABLE_VERSIONED_ATTRS
+void
+pe_get_versioned_attributes(xmlNode * meta_hash, resource_t * rsc,
+                            node_t * node, pe_working_set_t * data_set)
+{
+    GHashTable *node_hash = NULL;
+
+    if (node) {
+        node_hash = node->details->attrs;
+    }
+
+    pe_unpack_versioned_attributes(data_set->input, rsc->xml, XML_TAG_ATTR_SETS, node_hash,
+                                   meta_hash, data_set->now);
+
+    /* set anything else based on the parent */
+    if (rsc->parent != NULL) {
+        pe_get_versioned_attributes(meta_hash, rsc->parent, node, data_set);
+
+    } else {
+        /* and finally check the defaults */
+        pe_unpack_versioned_attributes(data_set->input, data_set->rsc_defaults, XML_TAG_ATTR_SETS,
+                                       node_hash, meta_hash, data_set->now);
+    }
+}
+#endif
 
 static char *
 template_op_key(xmlNode * op)
@@ -362,7 +409,7 @@ handle_rsc_isolation(resource_t *rsc)
      * at the clone level. this is really the only sane thing to do in this situation.
      * This allows someone to clone an isolated resource without having to shuffle
      * around the isolation attributes to the clone parent */
-    if (top == rsc->parent && top->variant >= pe_clone) {
+    if (top == rsc->parent && pe_rsc_is_clone(top)) {
         iso = top;
     }
 
@@ -370,10 +417,47 @@ handle_rsc_isolation(resource_t *rsc)
     set_bit(top->flags, pe_rsc_unique);
 
 set_rsc_opts:
+    pe_warn_once(pe_wo_isolation, "Support for 'isolation' resource meta-attribute"
+                                  " is deprecated and will be removed in a future release"
+                                  " (use bundle syntax instead)");
+
     clear_bit(rsc->flags, pe_rsc_allow_migrate);
     set_bit(rsc->flags, pe_rsc_unique);
-    if (top->variant >= pe_clone) {
+    if (pe_rsc_is_clone(top)) {
         add_hash_param(rsc->meta, XML_RSC_ATTR_UNIQUE, XML_BOOLEAN_TRUE);
+    }
+}
+
+static void
+check_deprecated_stonith(resource_t *rsc)
+{
+    GHashTableIter iter;
+    char *key;
+
+    g_hash_table_iter_init(&iter, rsc->parameters);
+    while (g_hash_table_iter_next(&iter, (gpointer *) &key, NULL)) {
+        if (crm_starts_with(key, "pcmk_")) {
+            char *cmp = key + 5; // the part after "pcmk_"
+
+            if (!strcmp(cmp, "poweroff_action")) {
+                pe_warn_once(pe_wo_poweroff,
+                             "Support for the 'pcmk_poweroff_action' stonith resource parameter"
+                             " is deprecated and will be removed in a future version"
+                             " (use 'pcmk_off_action' instead)");
+
+            } else if (!strcmp(cmp, "arg_map")) {
+                pe_warn_once(pe_wo_arg_map,
+                             "Support for the 'pcmk_arg_map' stonith resource parameter"
+                             " is deprecated and will be removed in a future version"
+                             " (use 'pcmk_host_argument' instead)");
+
+            } else if (crm_ends_with(cmp, "_cmd")) {
+                pe_warn_once(pe_wo_stonith_cmd,
+                             "Support for the 'pcmk_*_cmd' stonith resource parameters"
+                             " is deprecated and will be removed in a future version"
+                             " (use 'pcmk_*_action' instead)");
+            }
+        }
     }
 }
 
@@ -390,6 +474,7 @@ common_unpack(xmlNode * xml_obj, resource_t ** rsc,
     const char *id = crm_element_value(xml_obj, XML_ATTR_ID);
     int container_remote_node = 0;
     int baremetal_remote_node = 0;
+    bool has_versioned_params = FALSE;
 
     crm_log_xml_trace(xml_obj, "Processing resource input...");
 
@@ -434,11 +519,13 @@ common_unpack(xmlNode * xml_obj, resource_t ** rsc,
         return FALSE;
     }
 
-    (*rsc)->parameters =
-        g_hash_table_new_full(crm_str_hash, g_str_equal, g_hash_destroy_str, g_hash_destroy_str);
+    (*rsc)->parameters = crm_str_table_new();
 
-    (*rsc)->meta =
-        g_hash_table_new_full(crm_str_hash, g_str_equal, g_hash_destroy_str, g_hash_destroy_str);
+#if ENABLE_VERSIONED_ATTRS
+    (*rsc)->versioned_parameters = create_xml_node(NULL, XML_TAG_RSC_VER_ATTRS);
+#endif
+
+    (*rsc)->meta = crm_str_table_new();
 
     (*rsc)->allowed_nodes =
         g_hash_table_new_full(crm_str_hash, g_str_equal, NULL, g_hash_destroy_str);
@@ -459,6 +546,9 @@ common_unpack(xmlNode * xml_obj, resource_t ** rsc,
 
     get_meta_attributes((*rsc)->meta, *rsc, NULL, data_set);
     get_rsc_attributes((*rsc)->parameters, *rsc, NULL, data_set);
+#if ENABLE_VERSIONED_ATTRS
+    pe_get_versioned_attributes((*rsc)->versioned_parameters, *rsc, NULL, data_set);
+#endif
 
     (*rsc)->flags = 0;
     set_bit((*rsc)->flags, pe_rsc_runnable);
@@ -489,6 +579,7 @@ common_unpack(xmlNode * xml_obj, resource_t ** rsc,
     }
 
     if (xml_contains_remote_node((*rsc)->xml)) {
+        (*rsc)->is_remote_node = TRUE;
         if (g_hash_table_lookup((*rsc)->meta, XML_RSC_ATTR_CONTAINER)) {
             container_remote_node = 1;
         } else {
@@ -497,15 +588,21 @@ common_unpack(xmlNode * xml_obj, resource_t ** rsc,
     }
 
     value = g_hash_table_lookup((*rsc)->meta, XML_OP_ATTR_ALLOW_MIGRATE);
-    if (crm_is_true(value)) {
+#if ENABLE_VERSIONED_ATTRS
+    has_versioned_params = xml_has_children((*rsc)->versioned_parameters);
+#endif
+    if (crm_is_true(value) && has_versioned_params) {
+        pe_rsc_trace((*rsc), "Migration is disabled for resources with versioned parameters");
+    } else if (crm_is_true(value)) {
         set_bit((*rsc)->flags, pe_rsc_allow_migrate);
-    } else if (value == NULL && baremetal_remote_node) {
+    } else if ((value == NULL) && baremetal_remote_node && !has_versioned_params) {
         /* by default, we want baremetal remote-nodes to be able
          * to float around the cluster without having to stop all the
          * resources within the remote-node before moving. Allowing
          * migration support enables this feature. If this ever causes
          * problems, migration support can be explicitly turned off with
-         * allow-migrate=false. */
+         * allow-migrate=false.
+         * We don't support migration for versioned resources, though. */
         set_bit((*rsc)->flags, pe_rsc_allow_migrate);
     }
 
@@ -542,7 +639,7 @@ common_unpack(xmlNode * xml_obj, resource_t ** rsc,
 
     top = uber_parent(*rsc);
     value = g_hash_table_lookup((*rsc)->meta, XML_RSC_ATTR_UNIQUE);
-    if (crm_is_true(value) || top->variant < pe_clone) {
+    if (crm_is_true(value) || pe_rsc_is_clone(top) == FALSE) {
         set_bit((*rsc)->flags, pe_rsc_unique);
     }
 
@@ -583,18 +680,36 @@ common_unpack(xmlNode * xml_obj, resource_t ** rsc,
         /* Make a best-effort guess at a migration threshold for people with 0.6 configs
          * try with underscores and hyphens, from both the resource and global defaults section
          */
+        const char *legacy = NULL;
 
-        value = g_hash_table_lookup((*rsc)->meta, "resource-failure-stickiness");
-        if (value == NULL) {
-            value = g_hash_table_lookup((*rsc)->meta, "resource_failure_stickiness");
+        legacy = g_hash_table_lookup((*rsc)->meta,
+                                     "resource-failure-stickiness");
+        if (legacy == NULL) {
+            legacy = g_hash_table_lookup((*rsc)->meta,
+                                         "resource_failure_stickiness");
         }
-        if (value == NULL) {
-            value =
-                g_hash_table_lookup(data_set->config_hash, "default-resource-failure-stickiness");
+        if (legacy) {
+            value = legacy;
+            pe_warn_once(pe_wo_rsc_failstick,
+                         "Support for 'resource-failure-stickiness' resource meta-attribute"
+                         " is deprecated and will be removed in a future release"
+                         " (use 'migration-threshold' resource meta-attribute instead)");
         }
-        if (value == NULL) {
-            value =
-                g_hash_table_lookup(data_set->config_hash, "default_resource_failure_stickiness");
+
+        legacy = g_hash_table_lookup(data_set->config_hash,
+                                     "default-resource-failure-stickiness");
+        if (legacy == NULL) {
+            legacy = g_hash_table_lookup(data_set->config_hash,
+                                         "default_resource_failure_stickiness");
+        }
+        if (legacy) {
+            if (value == NULL) {
+                value = legacy;
+            }
+            pe_warn_once(pe_wo_default_rscfs,
+                         "Support for 'default-resource-failure-stickiness' cluster option"
+                         " is deprecated and will be removed in a future release"
+                         " (use 'migration-threshold' in rsc_defaults instead)");
         }
 
         if (value) {
@@ -620,9 +735,10 @@ common_unpack(xmlNode * xml_obj, resource_t ** rsc,
         }
     }
 
-    if (safe_str_eq(rclass, "stonith")) {
+    if (safe_str_eq(rclass, PCMK_RESOURCE_CLASS_STONITH)) {
         set_bit(data_set->flags, pe_flag_have_stonith_resource);
         set_bit((*rsc)->flags, pe_rsc_fence_device);
+        check_deprecated_stonith(*rsc);
     }
 
     value = g_hash_table_lookup((*rsc)->meta, XML_RSC_ATTR_REQUIRES);
@@ -668,6 +784,14 @@ common_unpack(xmlNode * xml_obj, resource_t ** rsc,
         if(is_set((*rsc)->flags, pe_rsc_fence_device)) {
             value = "quorum";
 
+        } else if (((*rsc)->variant == pe_native)
+                   && safe_str_eq(crm_element_value((*rsc)->xml, XML_AGENT_ATTR_CLASS),
+                                  PCMK_RESOURCE_CLASS_OCF)
+                   && safe_str_eq(crm_element_value((*rsc)->xml, XML_AGENT_ATTR_PROVIDER), "pacemaker")
+                   && safe_str_eq(crm_element_value((*rsc)->xml, XML_ATTR_TYPE), "remote")
+            ) {
+            value = "quorum";
+
         } else if (is_set(data_set->flags, pe_flag_enable_unfencing)) {
             value = "unfencing";
 
@@ -711,6 +835,7 @@ common_unpack(xmlNode * xml_obj, resource_t ** rsc,
     }
 
     if (is_set(data_set->flags, pe_flag_symmetric_cluster)) {
+        // This tag must stay exactly the same because it is tested elsewhere
         resource_location(*rsc, NULL, 0, "symmetric_default", data_set);
     } else if (container_remote_node) {
         /* remote resources tied to a container resource must always be allowed
@@ -722,8 +847,7 @@ common_unpack(xmlNode * xml_obj, resource_t ** rsc,
     pe_rsc_trace((*rsc), "\tAction notification: %s",
                  is_set((*rsc)->flags, pe_rsc_notify) ? "required" : "not required");
 
-    (*rsc)->utilization =
-        g_hash_table_new_full(crm_str_hash, g_str_equal, g_hash_destroy_str, g_hash_destroy_str);
+    (*rsc)->utilization = crm_str_table_new();
 
     unpack_instance_attributes(data_set->input, (*rsc)->xml, XML_TAG_UTILIZATION, NULL,
                                (*rsc)->utilization, NULL, FALSE, data_set->now);
@@ -785,7 +909,7 @@ uber_parent(resource_t * rsc)
     if (parent == NULL) {
         return NULL;
     }
-    while (parent->parent != NULL) {
+    while (parent->parent != NULL && parent->parent->variant != pe_container) {
         parent = parent->parent;
     }
     return parent;
@@ -808,6 +932,11 @@ common_free(resource_t * rsc)
     if (rsc->parameters != NULL) {
         g_hash_table_destroy(rsc->parameters);
     }
+#if ENABLE_VERSIONED_ATTRS
+    if (rsc->versioned_parameters != NULL) {
+        free_xml(rsc->versioned_parameters);
+    }
+#endif
     if (rsc->meta != NULL) {
         g_hash_table_destroy(rsc->meta);
     }

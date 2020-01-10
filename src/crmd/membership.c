@@ -128,8 +128,20 @@ crmd_node_update_complete(xmlNode * msg, int call_id, int rc, xmlNode * output, 
     }
 }
 
+/*!
+ * \internal
+ * \brief Create an XML node state tag with updates
+ *
+ * \param[in,out] node    Node whose state will be used for update
+ * \param[in]     flags   Bitmask of node_update_flags indicating what to update
+ * \param[in,out] parent  XML node to contain update (or NULL)
+ * \param[in]     source  Who requested the update (only used for logging)
+ *
+ * \return Pointer to created node state tag
+ */
 xmlNode *
-do_update_node_cib(crm_node_t * node, int flags, xmlNode * parent, const char *source)
+create_node_state_update(crm_node_t *node, int flags, xmlNode *parent,
+                         const char *source)
 {
     const char *value = NULL;
     xmlNode *node_state;
@@ -370,13 +382,13 @@ populate_cib_nodes(enum node_update_flags flags, const char *source)
 
         g_hash_table_iter_init(&iter, crm_peer_cache);
         while (g_hash_table_iter_next(&iter, NULL, (gpointer *) &node)) {
-            do_update_node_cib(node, flags, node_list, source);
+            create_node_state_update(node, flags, node_list, source);
         }
 
         if (crm_remote_peer_cache) {
             g_hash_table_iter_init(&iter, crm_remote_peer_cache);
             while (g_hash_table_iter_next(&iter, NULL, (gpointer *) &node)) {
-                do_update_node_cib(node, flags, node_list, source);
+                create_node_state_update(node, flags, node_list, source);
             }
         }
 
@@ -425,6 +437,26 @@ crm_update_quorum(gboolean quorum, gboolean force_update)
         crm_debug("Updating quorum status to %s (call=%d)", quorum ? "true" : "false", call_id);
         fsa_register_cib_callback(call_id, FALSE, NULL, cib_quorum_update_complete);
         free_xml(update);
+
+        /* Quorum changes usually cause a new transition via other activity:
+         * quorum gained via a node joining will abort via the node join,
+         * and quorum lost via a node leaving will usually abort via resource
+         * activity and/or fencing.
+         *
+         * However, it is possible that nothing else causes a transition (e.g.
+         * someone forces quorum via corosync-cmaptcl, or quorum is lost due to
+         * a node in standby shutting down cleanly), so here ensure a new
+         * transition is triggered.
+         */
+        if (quorum) {
+            /* If quorum was gained, abort after a short delay, in case multiple
+             * nodes are joining around the same time, so the one that brings us
+             * to quorum doesn't cause all the remaining ones to be fenced.
+             */
+            abort_after_delay(INFINITY, tg_restart, "Quorum gained", 5000);
+        } else {
+            abort_transition(INFINITY, tg_restart, "Quorum lost", NULL);
+        }
     }
     fsa_has_quorum = quorum;
 }

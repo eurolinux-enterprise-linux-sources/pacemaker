@@ -34,11 +34,17 @@ context in which the rule is being used.
 |Default
 |Description
 
+|id
+|
+|A unique name for the rule (required)
+ indexterm:[id,Constraint Rule]
+ indexterm:[Constraint,Rule,id]
+
 |role
-|+started+
+|+Started+
 |Limits the rule to apply only when the resource is in the specified
- role. Allowed values are +started+, +slave+, and +master+. A rule
- with +role="master"+ cannot determine the initial location of a
+ role. Allowed values are +Started+, +Slave+, and +Master+. A rule
+ with +role="Master"+ cannot determine the initial location of a
  clone instance and will only affect which of the active instances
  will be promoted.
  indexterm:[role,Constraint Rule]
@@ -73,27 +79,25 @@ context in which the rule is being used.
 indexterm:[Resource,Constraint,Attribute Expression]
 
 Expression objects are used to control a resource based on the
-attributes defined by a node or nodes.  In addition to any attributes
-added by the administrator, each node has a built-in node attribute
-called +#uname+ that can also be used.
+attributes defined by a node or nodes.
 
 .Properties of an Expression
-[width="95%",cols="1m,1,5<a",options="header",align="center"]
+[width="95%",cols="2m,1,5<a",options="header",align="center"]
 |=========================================================
 
 |Field
 |Default
 |Description
 
-|value
+|id
 |
-|User-supplied value for comparison
- indexterm:[value,Constraint Expression]
- indexterm:[Constraint,Attribute Expression,value]
+|A unique name for the expression (required)
+ indexterm:[id,Constraint Expression]
+ indexterm:[Constraint,Attribute Expression,id]
 
 |attribute
 |
-|The node attribute to test
+|The node attribute to test (required)
  indexterm:[attribute,Constraint Expression]
  indexterm:[Constraint,Attribute Expression,attribute]
 
@@ -106,7 +110,7 @@ called +#uname+ that can also be used.
 
 |operation
 |
-|The comparison to perform. Allowed values:
+|The comparison to perform (required). Allowed values:
 
 * +lt:+ True if the value of the node's +attribute+ is less than +value+
 * +gt:+ True if the value of the node's +attribute+ is greater than +value+
@@ -118,6 +122,72 @@ called +#uname+ that can also be used.
 * +not_defined:+ True if the node does not have the named attribute
  indexterm:[operation,Constraint Expression]
  indexterm:[Constraint,Attribute Expression,operation]
+
+|value
+|
+|User-supplied value for comparison (required)
+ indexterm:[value,Constraint Expression]
+ indexterm:[Constraint,Attribute Expression,value]
+
+|value-source
+|+literal+
+|How the +value+ is derived '(since 1.1.17)'. Allowed values:
+
+* +literal+: +value+ is a literal string to compare against
+* +param+: +value+ is the name of a resource parameter to compare against (only
+  valid in location constraints)
+* +meta+: +value+ is the name of a resource meta-attribute to compare against
+  (only valid in location constraints)
+ indexterm:[value,Constraint Expression]
+ indexterm:[Constraint,Attribute Expression,value]
+
+|=========================================================
+
+In addition to any attributes added by the administrator, the cluster defines
+special, built-in node attributes for each node that can also be used.
+
+.Built-in node attributes
+[width="95%",cols="1m,5<a",options="header",align="center"]
+|=========================================================
+
+|Name
+|Value
+
+|#uname
+|Node <<s-node-name,name>>
+
+|#id
+|Node ID
+
+|#kind
+|Node type. Possible values are +cluster+, +remote+, and +container+. Kind is
+ +remote+ for Pacemaker Remote nodes created with the +ocf:pacemaker:remote+
+ resource, and +container+ for Pacemaker Remote guest nodes and bundle nodes
+ '(since 1.1.13)'
+
+|#is_dc
+|"true" if this node is a Designated Controller (DC), "false" otherwise
+
+|#cluster-name
+|The value of the +cluster-name+ cluster property, if set
+
+|#site-name
+|The value of the +site-name+ cluster property, if set, otherwise identical to
+ +#cluster-name+
+
+|#role
+|The role the relevant multistate resource has on this node. Valid only within
+ a rule for a location constraint for a multistate resource.
+
+////
+// if uncommenting, put a pipe in front of first two lines
+#ra-version
+The installed version of the resource agent on the node, as defined
+ by the +version+ attribute of the +resource-agent+ tag in the agent's
+ metadata. Valid only within rules controlling resource options. This can be
+ useful during rolling upgrades of a backward-incompatible resource agent.
+ '(coming in x.x.x)'
+////
 
 |=========================================================
 
@@ -156,8 +226,8 @@ the context.
 
 * +gt:+ True if the current date/time is after +start+
 * +lt:+ True if the current date/time is before +end+
-* +in-range:+ True if the current date/time is after +start+ and before +end+
-* +date-spec:+ True if the current date/time matches a +date_spec+ object
+* +in_range:+ True if the current date/time is after +start+ and before +end+
+* +date_spec:+ True if the current date/time matches a +date_spec+ object
   (described below)
  indexterm:[operation,Constraint Expression]
  indexterm:[Constraint,Date/Time Expression,operation]
@@ -253,7 +323,7 @@ indexterm:[Duration]
 indexterm:[Resource,Constraint,Duration]
 
 Durations are used to calculate a value for +end+ when one is not
-supplied to +in-range+ operations. They contain the same fields as
+supplied to +in_range+ operations. They contain the same fields as
 +date_spec+ objects but without the limitations (e.g. you can have a
 duration of 19 months). As with +date_specs+, any field not supplied is
 ignored.
@@ -309,7 +379,7 @@ value (hour) still matches!
 ====
 [source,XML]
 -------
-<rule id="rule4" boolean_op="or">
+<rule id="rule4" boolean-op="or">
    <date_expression id="date_expr4-1" operation="date_spec">
     <date_spec hours="9-16" days="1-5"/>
    </date_expression>
@@ -324,8 +394,8 @@ value (hour) still matches!
 ====
 [source,XML]
 -------
-<rule id="rule5" boolean_op="and">
-   <rule id="rule5-nested1" boolean_op="or">
+<rule id="rule5" boolean-op="and">
+   <rule id="rule5-nested1" boolean-op="or">
     <date_expression id="date_expr5-1" operation="date_spec">
      <date_spec hours="9-16"/>
     </date_expression>
@@ -344,7 +414,7 @@ value (hour) still matches!
 ====
 [source,XML]
 -------
-<rule id="rule6" boolean_op="and">
+<rule id="rule6" boolean-op="and">
    <date_expression id="date_expr6-1" operation="date_spec">
     <date_spec weekdays="1"/>
    </date_expression>
@@ -365,7 +435,7 @@ You may wish to write +end="2005-03-31T23:59:59"+ to avoid confusion.
 =====
 [source,XML]
 -------
-<rule id="rule7" boolean_op="and">
+<rule id="rule7" boolean-op="and">
    <date_expression id="date_expr7" operation="date_spec">
     <date_spec weekdays="5" monthdays="13" moon="4"/>
    </date_expression>

@@ -14,7 +14,7 @@ Online: [ dvossel-laptop2 ]
 
 Transition Summary:
  * Start   vm	(dvossel-laptop2)
- * Move    FAKE	(Started dvossel-laptop2 -> 18builder)
+ * Move       FAKE          ( dvossel-laptop2 -> 18builder )  
  * Start   W:1	(18builder)
  * Start   X:1	(18builder)
  * Start   18builder	(dvossel-laptop2)
@@ -24,8 +24,9 @@ Executing cluster transition:
  * Resource action: FAKE            stop on dvossel-laptop2
  * Pseudo action:   W-master_start_0
  * Pseudo action:   X-master_start_0
- * Resource action: 18builder       start on dvossel-laptop2
+ * Resource action: 18builder       monitor on dvossel-laptop2
  * Pseudo action:   all_stopped
+ * Resource action: 18builder       start on dvossel-laptop2
  * Resource action: FAKE            start on 18builder
  * Resource action: W               start on 18builder
  * Pseudo action:   W-master_running_0

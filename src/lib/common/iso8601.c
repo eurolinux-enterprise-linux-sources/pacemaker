@@ -33,6 +33,7 @@
 #include <time.h>
 #include <ctype.h>
 #include <crm/common/iso8601.h>
+#include <crm/common/iso8601_internal.h>
 
 /*
  * Andrew's code was originally written for OSes whose "struct tm" contains:
@@ -401,6 +402,8 @@ crm_time_get_isoweek(crm_time_t * dt, uint * y, uint * w, uint * d)
     return TRUE;
 }
 
+#define DATE_MAX 128
+
 char *
 crm_time_as_string(crm_time_t * date_time, int flags)
 {
@@ -425,9 +428,9 @@ crm_time_as_string(crm_time_t * date_time, int flags)
     CRM_CHECK(dt != NULL, return NULL);
     if (flags & crm_time_log_duration) {
         uint h = 0, m = 0, s = 0;
-        int offset = 0, max = 128;
+        int offset = 0;
 
-        date_s = calloc(1, max+1);
+        date_s = calloc(1, DATE_MAX);
         crm_time_get_sec(dt->seconds, &h, &m, &s);
 
         if (date_s == NULL) {
@@ -435,45 +438,45 @@ crm_time_as_string(crm_time_t * date_time, int flags)
         }
 
         if(dt->years) {
-            offset += snprintf(date_s+offset, max-offset, "%4d year%s ", dt->years, dt->years>1?"s":"");
+            offset += snprintf(date_s+offset, DATE_MAX - offset, "%4d year%s ", dt->years, dt->years>1?"s":"");
         }
         if(dt->months) {
-            offset += snprintf(date_s+offset, max-offset, "%2d month%s ", dt->months, dt->months>1?"s":"");
+            offset += snprintf(date_s+offset, DATE_MAX - offset, "%2d month%s ", dt->months, dt->months>1?"s":"");
         }
         if(dt->days) {
-            offset += snprintf(date_s+offset, max-offset, "%2d day%s ", dt->days, dt->days>1?"s":"");
+            offset += snprintf(date_s+offset, DATE_MAX - offset, "%2d day%s ", dt->days, dt->days>1?"s":"");
         }
         if(dt->seconds) {
-            offset += snprintf(date_s+offset, max-offset, "%d seconds ( ", dt->seconds);
+            offset += snprintf(date_s+offset, DATE_MAX - offset, "%d seconds ( ", dt->seconds);
             if(h) {
-                offset += snprintf(date_s+offset, max-offset, "%d hour%s ", h, h>1?"s":"");
+                offset += snprintf(date_s+offset, DATE_MAX - offset, "%u hour%s ", h, h>1?"s":"");
             }
             if(m) {
-                offset += snprintf(date_s+offset, max-offset, "%d minute%s ", m, m>1?"s":"");
+                offset += snprintf(date_s+offset, DATE_MAX - offset, "%u minute%s ", m, m>1?"s":"");
             }
             if(s) {
-                offset += snprintf(date_s+offset, max-offset, "%d second%s ", s, s>1?"s":"");
+                offset += snprintf(date_s+offset, DATE_MAX - offset, "%u second%s ", s, s>1?"s":"");
             }
-            offset += snprintf(date_s+offset, max-offset, ")");
+            offset += snprintf(date_s+offset, DATE_MAX - offset, ")");
         }
         goto done;
     }
 
     if (flags & crm_time_log_date) {
-        date_s = calloc(1, 32);
+        date_s = calloc(1, 34);
         if (date_s == NULL) {
             goto done;
 
         } else if (flags & crm_time_seconds) {
             unsigned long long s = crm_time_get_seconds(date_time);
 
-            snprintf(date_s, 31, "%lld", s); /* Durations may not be +ve */
+            snprintf(date_s, 32, "%lld", s); /* Durations may not be +ve */
             goto done;
 
         } else if (flags & crm_time_epoch) {
             unsigned long long s = crm_time_get_seconds_since_epoch(date_time);
 
-            snprintf(date_s, 31, "%lld", s); /* Durations may not be +ve */
+            snprintf(date_s, 32, "%lld", s); /* Durations may not be +ve */
             goto done;
 
         } else if (flags & crm_time_weeks) {
@@ -481,7 +484,7 @@ crm_time_as_string(crm_time_t * date_time, int flags)
             uint y, w, d;
 
             if (crm_time_get_isoweek(dt, &y, &w, &d)) {
-                snprintf(date_s, 31, "%d-W%.2d-%d", y, w, d);
+                snprintf(date_s, 34, "%u-W%.2u-%u", y, w, d);
             }
 
         } else if (flags & crm_time_ordinal) {
@@ -489,7 +492,7 @@ crm_time_as_string(crm_time_t * date_time, int flags)
             uint y, d;
 
             if (crm_time_get_ordinal(dt, &y, &d)) {
-                snprintf(date_s, 31, "%d-%.3d", y, d);
+                snprintf(date_s, 22, "%u-%.3u", y, d);
             }
 
         } else {
@@ -497,7 +500,7 @@ crm_time_as_string(crm_time_t * date_time, int flags)
             uint y, m, d;
 
             if (crm_time_get_gregorian(dt, &y, &m, &d)) {
-                snprintf(date_s, 31, "%.4d-%.2d-%.2d", y, m, d);
+                snprintf(date_s, 33, "%.4u-%.2u-%.2u", y, m, d);
             }
         }
     }
@@ -505,26 +508,26 @@ crm_time_as_string(crm_time_t * date_time, int flags)
     if (flags & crm_time_log_timeofday) {
         uint h, m, s;
 
-        time_s = calloc(1, 32);
+        time_s = calloc(1, 33);
         if (time_s == NULL) {
             goto cleanup;
         }
 
         if (crm_time_get_timeofday(dt, &h, &m, &s)) {
-            snprintf(time_s, 31, "%.2d:%.2d:%.2d", h, m, s);
+            snprintf(time_s, 33, "%.2u:%.2u:%.2u", h, m, s);
         }
 
         if (dt->offset != 0) {
             crm_time_get_sec(dt->offset, &h, &m, &s);
         }
 
-        offset_s = calloc(1, 32);
+        offset_s = calloc(1, 31);
         if ((flags & crm_time_log_with_timezone) == 0 || dt->offset == 0) {
             crm_trace("flags %6x %6x", flags, crm_time_log_with_timezone);
             snprintf(offset_s, 31, "Z");
 
         } else {
-            snprintf(offset_s, 31, " %c%.2d:%.2d", dt->offset < 0 ? '-' : '+', h, m);
+            snprintf(offset_s, 24, " %c%.2u:%.2u", dt->offset < 0 ? '-' : '+', h, m);
         }
     }
 
@@ -1280,4 +1283,170 @@ void
 crm_time_add_years(crm_time_t * a_time, int extra)
 {
     a_time->years += extra;
+}
+
+static void
+ha_get_tm_time( struct tm *target, crm_time_t *source)
+{
+    *target = (struct tm) {
+        .tm_year = source->years - 1900,
+        .tm_mday = source->days,
+        .tm_sec = source->seconds % 60,
+        .tm_min = ( source->seconds / 60 ) % 60,
+        .tm_hour = source->seconds / 60 / 60,
+        .tm_isdst = -1, /* don't adjust */
+
+#if defined(HAVE_STRUCT_TM_TM_GMTOFF)
+        .tm_gmtoff = source->offset
+#endif
+    };
+    mktime(target);
+}
+
+crm_time_hr_t *
+crm_time_hr_convert(crm_time_hr_t *target, crm_time_t *dt)
+{
+    crm_time_hr_t *hr_dt = NULL;
+
+    if (dt) {
+        hr_dt = target?target:calloc(1, sizeof(crm_time_hr_t));
+        if (hr_dt) {
+            *hr_dt = (crm_time_hr_t) {
+                .years = dt->years,
+                .months = dt->months,
+                .days = dt->days,
+                .seconds = dt->seconds,
+                .offset = dt->offset,
+                .duration = dt->duration
+            };
+        }
+    }
+
+    return hr_dt;
+}
+
+void
+crm_time_set_hr_dt(crm_time_t *target, crm_time_hr_t *hr_dt)
+{
+    CRM_ASSERT((hr_dt) && (target));
+    *target = (crm_time_t) {
+        .years = hr_dt->years,
+        .months = hr_dt->months,
+        .days = hr_dt->days,
+        .seconds = hr_dt->seconds,
+        .offset = hr_dt->offset,
+        .duration = hr_dt->duration
+    };
+}
+
+crm_time_hr_t *
+crm_time_timeval_hr_convert(crm_time_hr_t *target, struct timeval *tv)
+{
+    crm_time_t dt;
+    crm_time_hr_t *ret;
+
+    crm_time_set_timet(&dt, &tv->tv_sec);
+    ret = crm_time_hr_convert(target, &dt);
+    if (ret) {
+        ret->useconds = tv->tv_usec;
+    }
+    return ret;
+}
+
+crm_time_hr_t *
+crm_time_hr_new(const char *date_time)
+{
+    crm_time_hr_t *hr_dt = NULL;
+    struct timeval tv_now;
+
+    if (!date_time) {
+        if (gettimeofday(&tv_now, NULL) == 0) {
+            hr_dt = crm_time_timeval_hr_convert(NULL, &tv_now);
+        }
+    } else {
+        crm_time_t *dt;
+
+        dt = parse_date(date_time);
+        hr_dt = crm_time_hr_convert(NULL, dt);
+        crm_time_free(dt);
+    }
+    return hr_dt;
+}
+
+void
+crm_time_hr_free(crm_time_hr_t * hr_dt)
+{
+    free(hr_dt);
+}
+
+char *
+crm_time_format_hr(const char *format, crm_time_hr_t * hr_dt)
+{
+    const char *mark_s;
+    int max = 128, scanned_pos = 0, printed_pos = 0, fmt_pos = 0,
+        date_len = 0, nano_digits = 0, fmt_len;
+    char nano_s[10], date_s[max+1], nanofmt_s[5] = "%", *tmp_fmt_s;
+    struct tm tm;
+    crm_time_t dt;
+
+    if (!format) {
+        return NULL;
+    }
+    crm_time_set_hr_dt(&dt, hr_dt);
+    ha_get_tm_time(&tm, &dt);
+    sprintf(nano_s, "%06d000", hr_dt->useconds);
+
+    while ((format[scanned_pos]) != '\0') {
+        fmt_len = 0;
+        mark_s = strchr(&format[scanned_pos], '%');
+        if (mark_s) {
+            fmt_pos = mark_s - format;
+            fmt_len = 1;
+            while ((format[fmt_pos+fmt_len] != '\0') &&
+                (format[fmt_pos+fmt_len] >= '0') &&
+                (format[fmt_pos+fmt_len] <= '9')) {
+                fmt_len++;
+            }
+            scanned_pos = fmt_pos + fmt_len + 1;
+            if (format[fmt_pos+fmt_len] == 'N') {
+                nano_digits = atoi(&format[fmt_pos+1]);
+                nano_digits = (nano_digits > 6)?6:nano_digits;
+                nano_digits = (nano_digits < 0)?0:nano_digits;
+                sprintf(&nanofmt_s[1], ".%ds", nano_digits);
+            } else {
+                if (format[scanned_pos] != '\0') {
+                    continue;
+                }
+                fmt_pos = scanned_pos; /* print till end */
+            }
+        } else {
+            scanned_pos = strlen(format);
+            fmt_pos = scanned_pos; /* print till end */
+        }
+        tmp_fmt_s = strndup(&format[printed_pos], fmt_pos - printed_pos);
+#ifdef GCC_FORMAT_NONLITERAL_CHECKING_ENABLED
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+#endif
+        date_len += strftime(&date_s[date_len], max-date_len, tmp_fmt_s, &tm);
+#ifdef GCC_FORMAT_NONLITERAL_CHECKING_ENABLED
+#pragma GCC diagnostic pop
+#endif
+        printed_pos = scanned_pos;
+        free(tmp_fmt_s);
+        if (nano_digits) {
+#ifdef GCC_FORMAT_NONLITERAL_CHECKING_ENABLED
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+#endif
+            date_len += snprintf(&date_s[date_len], max-date_len,
+                                 nanofmt_s, nano_s);
+#ifdef GCC_FORMAT_NONLITERAL_CHECKING_ENABLED
+#pragma GCC diagnostic pop
+#endif
+            nano_digits = 0;
+        }
+    }
+
+    return (date_len == 0)?NULL:strdup(date_s);
 }

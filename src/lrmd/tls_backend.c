@@ -188,38 +188,10 @@ lrmd_auth_timeout_cb(gpointer data)
     return FALSE;
 }
 
-/* Convert a struct sockaddr address to a string, IPv4 and IPv6: */
-
-static char *
-get_ip_str(const struct sockaddr_storage * sa, char * s, size_t maxlen)
-{
-    switch(((struct sockaddr *)sa)->sa_family) {
-        case AF_INET:
-            inet_ntop(AF_INET, &(((struct sockaddr_in *)sa)->sin_addr),
-                      s, maxlen);
-            break;
-
-        case AF_INET6:
-            inet_ntop(AF_INET6, &(((struct sockaddr_in6 *)sa)->sin6_addr),
-                      s, maxlen);
-            break;
-
-        default:
-            strncpy(s, "Unknown AF", maxlen);
-            return NULL;
-    }
-
-    return s;
-}
-
 static int
 lrmd_remote_listen(gpointer data)
 {
     int csock = 0;
-    int flag = 0;
-    unsigned laddr = 0;
-    struct sockaddr_storage addr;
-    char addr_str[INET6_ADDRSTRLEN];
     gnutls_session_t *session = NULL;
     crm_client_t *new_client = NULL;
 
@@ -228,28 +200,8 @@ lrmd_remote_listen(gpointer data)
         .destroy = lrmd_remote_client_destroy,
     };
 
-    /* accept the connection */
-    laddr = sizeof(addr);
-    memset(&addr, 0, sizeof(addr));
-    csock = accept(ssock, (struct sockaddr *)&addr, &laddr);
-
-    get_ip_str(&addr, addr_str, INET6_ADDRSTRLEN);
-    crm_info("New remote connection from %s", addr_str);
-
-    if (csock == -1) {
-        crm_err("accept socket failed");
-        return TRUE;
-    }
-
-    if ((flag = fcntl(csock, F_GETFL)) >= 0) {
-        if (fcntl(csock, F_SETFL, flag | O_NONBLOCK) < 0) {
-            crm_err("fcntl() write failed");
-            close(csock);
-            return TRUE;
-        }
-    } else {
-        crm_err("fcntl() read failed");
-        close(csock);
+    csock = crm_remote_accept(ssock);
+    if (csock < 0) {
         return TRUE;
     }
 
@@ -260,11 +212,10 @@ lrmd_remote_listen(gpointer data)
         return TRUE;
     }
 
-    new_client = calloc(1, sizeof(crm_client_t));
+    new_client = crm_client_alloc(NULL);
     new_client->remote = calloc(1, sizeof(crm_remote_t));
     new_client->kind = CRM_CLIENT_TLS;
     new_client->remote->tls_session = session;
-    new_client->id = crm_generate_uuid();
     new_client->remote->auth_timeout =
         g_timeout_add(LRMD_REMOTE_AUTH_TIMEOUT, lrmd_auth_timeout_cb, new_client);
     crm_notice("LRMD client connection established. %p id: %s", new_client, new_client->id);
@@ -272,8 +223,6 @@ lrmd_remote_listen(gpointer data)
     new_client->remote->source =
         mainloop_add_fd("lrmd-remote-client", G_PRIORITY_DEFAULT, csock, new_client,
                         &lrmd_remote_fd_cb);
-    g_hash_table_insert(client_connections, new_client->id, new_client);
-
     return TRUE;
 }
 
@@ -296,17 +245,9 @@ bind_and_listen(struct addrinfo *addr)
     int optval;
     int fd;
     int rc;
-    char buffer[256] = { 0, };
+    char buffer[INET6_ADDRSTRLEN] = { 0, };
 
-    if (addr->ai_family == AF_INET6) {
-        struct sockaddr_in6 *addr_in = (struct sockaddr_in6 *)(void*)addr->ai_addr;
-        inet_ntop(addr->ai_family, &addr_in->sin6_addr, buffer, DIMOF(buffer));
-
-    } else {
-        struct sockaddr_in *addr_in = (struct sockaddr_in *)(void*)addr->ai_addr;
-        inet_ntop(addr->ai_family, &addr_in->sin_addr, buffer, DIMOF(buffer));
-    }
-
+    crm_sockaddr2str(addr->ai_addr, buffer);
     crm_trace("Attempting to bind on address %s", buffer);
 
     fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
@@ -350,19 +291,21 @@ bind_and_listen(struct addrinfo *addr)
 }
 
 int
-lrmd_init_remote_tls_server(int port)
+lrmd_init_remote_tls_server()
 {
     int rc;
     int filter;
+    int port = crm_default_remote_port();
     struct addrinfo hints, *res = NULL, *iter;
-    char port_str[16];
+    char port_str[6]; // at most "65535"
+    gnutls_datum_t psk_key = { NULL, 0 };
 
     static struct mainloop_fd_callbacks remote_listen_fd_callbacks = {
         .dispatch = lrmd_remote_listen,
         .destroy = lrmd_remote_connection_destroy,
     };
 
-    crm_notice("Starting a tls listener on port %d.", port);
+    crm_notice("Starting TLS listener on port %d", port);
     crm_gnutls_global_init();
     gnutls_global_set_log_function(debug_log);
 
@@ -372,8 +315,21 @@ lrmd_init_remote_tls_server(int port)
     gnutls_psk_set_server_credentials_function(psk_cred_s, lrmd_tls_server_key_cb);
     gnutls_psk_set_server_dh_params(psk_cred_s, dh_params);
 
+    /* The key callback won't get called until the first client connection
+     * attempt. Do it once here, so we can warn the user at start-up if we can't
+     * read the key. We don't error out, though, because it's fine if the key is
+     * going to be added later.
+     */
+    rc = lrmd_tls_set_key(&psk_key);
+    if (rc != 0) {
+        crm_warn("A cluster connection will not be possible until the key is available");
+    }
+
     memset(&hints, 0, sizeof(struct addrinfo));
-    hints.ai_flags = AI_PASSIVE; /* Only return socket addresses with wildcard INADDR_ANY or IN6ADDR_ANY_INIT */
+    /* Bind to the wildcard address (INADDR_ANY or IN6ADDR_ANY_INIT).
+     * @TODO allow user to specify a specific address
+     */
+    hints.ai_flags = AI_PASSIVE;
     hints.ai_family = AF_UNSPEC; /* Return IPv6 or IPv4 */
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
@@ -381,7 +337,8 @@ lrmd_init_remote_tls_server(int port)
     snprintf(port_str, sizeof(port_str), "%d", port);
     rc = getaddrinfo(NULL, port_str, &hints, &res);
     if (rc) {
-        crm_err("getaddrinfo: %s", gai_strerror(rc));
+        crm_err("Unable to get IP address info for local node: %s",
+                gai_strerror(rc));
         return -1;
     }
 

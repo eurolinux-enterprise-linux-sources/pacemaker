@@ -7,8 +7,9 @@ Online: [ star world ]
      test2	(ocf::heartbeat:Xen):	Started star
 
 Transition Summary:
- * Migrate test1	(Started star -> world)
- * Migrate test2	(Started star -> world)
+ * Shutdown star
+ * Migrate    test1   ( star -> world )  
+ * Migrate    test2   ( star -> world )  
 
 Executing cluster transition:
  * Pseudo action:   gr1_stop_0

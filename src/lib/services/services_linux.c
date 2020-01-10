@@ -1,19 +1,8 @@
 /*
- * Copyright (C) 2010 Andrew Beekhof <andrew@beekhof.net>
+ * Copyright (C) 2010-2016 Andrew Beekhof <andrew@beekhof.net>
  *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
- *
- * This software is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ * This source code is licensed under the GNU Lesser General Public License
+ * version 2.1 or later (LGPLv2.1+) WITHOUT ANY WARRANTY.
  */
 
 #include <crm_internal.h>
@@ -28,7 +17,6 @@
 #include <errno.h>
 #include <unistd.h>
 #include <dirent.h>
-#include <fcntl.h>
 #include <string.h>
 #include <sys/time.h>
 #include <sys/resource.h>
@@ -46,23 +34,6 @@
 #if SUPPORT_CIBSECRETS
 #  include "crm/common/cib_secrets.h"
 #endif
-
-/* ops currently active (in-flight) */
-extern GList *inflight_ops;
-
-static inline void
-set_fd_opts(int fd, int opts)
-{
-    int flag;
-
-    if ((flag = fcntl(fd, F_GETFL)) >= 0) {
-        if (fcntl(fd, F_SETFL, flag | opts) < 0) {
-            crm_err("fcntl() write failed");
-        }
-    } else {
-        crm_err("fcntl() read failed");
-    }
-}
 
 static gboolean
 svc_read_output(int fd, svc_action_t * op, bool is_stderr)
@@ -188,10 +159,16 @@ set_ocf_env_with_prefix(gpointer key, gpointer value, gpointer user_data)
     set_ocf_env(buffer, value, user_data);
 }
 
+/*!
+ * \internal
+ * \brief Add environment variables suitable for an action
+ *
+ * \param[in] op  Action to use
+ */
 static void
-add_OCF_env_vars(svc_action_t * op)
+add_action_env_vars(const svc_action_t *op)
 {
-    if (!op->standard || strcasecmp("ocf", op->standard) != 0) {
+    if (safe_str_eq(op->standard, PCMK_RESOURCE_CLASS_OCF) == FALSE) {
         return;
     }
 
@@ -259,9 +236,7 @@ operation_finalize(svc_action_t * op)
 
     op->pid = 0;
 
-    inflight_ops = g_list_remove(inflight_ops, op);
-
-    handle_blocked_ops();
+    services_untrack_op(op);
 
     if (!recurring && op->synchronous == FALSE) {
         /*
@@ -354,13 +329,15 @@ services_handle_exec_error(svc_action_t * op, int error)
     int rc_not_installed, rc_insufficient_priv, rc_exec_error;
 
     /* Mimic the return codes for each standard as that's what we'll convert back from in get_uniform_rc() */
-    if (safe_str_eq(op->standard, "lsb") && safe_str_eq(op->action, "status")) {
+    if (safe_str_eq(op->standard, PCMK_RESOURCE_CLASS_LSB)
+        && safe_str_eq(op->action, "status")) {
+
         rc_not_installed = PCMK_LSB_STATUS_NOT_INSTALLED;
         rc_insufficient_priv = PCMK_LSB_STATUS_INSUFFICIENT_PRIV;
         rc_exec_error = PCMK_LSB_STATUS_UNKNOWN;
 
 #if SUPPORT_NAGIOS
-    } else if (safe_str_eq(op->standard, "nagios")) {
+    } else if (safe_str_eq(op->standard, PCMK_RESOURCE_CLASS_NAGIOS)) {
         rc_not_installed = NAGIOS_NOT_INSTALLED;
         rc_insufficient_priv = NAGIOS_INSUFFICIENT_PRIV;
         rc_exec_error = PCMK_OCF_EXEC_ERROR;
@@ -445,8 +422,21 @@ action_launch_child(svc_action_t *op)
         }
     }
 #endif
-    /* Setup environment correctly */
-    add_OCF_env_vars(op);
+
+    add_action_env_vars(op);
+
+    /* Become the desired user */
+    if (op->opaque->uid && (geteuid() == 0)) {
+        if (op->opaque->gid && (setgid(op->opaque->gid) < 0)) {
+            crm_perror(LOG_ERR, "setting group to %d", op->opaque->gid);
+            _exit(PCMK_OCF_NOT_CONFIGURED);
+        }
+        if (setuid(op->opaque->uid) < 0) {
+            crm_perror(LOG_ERR, "setting user to %d", op->opaque->uid);
+            _exit(PCMK_OCF_NOT_CONFIGURED);
+        }
+        /* We could do initgroups() here if we kept a copy of the username */
+    }
 
     /* execute the RA */
     execvp(op->opaque->exec, op->opaque->args);
@@ -528,15 +518,23 @@ action_synced_wait(svc_action_t * op, sigset_t *mask)
                 if (1) {
                     /* Clear out the sigchld pipe. */
                     char ch;
-                    while (read(sfd, &ch, 1) == 1);
+                    while (read(sfd, &ch, 1) == 1) /*omit*/;
 #endif
                     wait_rc = waitpid(op->pid, &status, WNOHANG);
 
-                    if (wait_rc < 0){
-                        crm_perror(LOG_ERR, "waitpid() for %d failed", op->pid);
-
-                    } else if (wait_rc > 0) {
+                    if (wait_rc > 0) {
                         break;
+
+                    } else if (wait_rc < 0){
+                        if (errno == ECHILD) {
+                                /* Here, don't dare to kill and bail out... */
+                                break;
+
+                        } else {
+                                /* ...otherwise pretend process still runs. */
+                                wait_rc = 0;
+                        }
+                        crm_perror(LOG_ERR, "waitpid() for %d failed", op->pid);
                     }
                 }
             }
@@ -558,9 +556,8 @@ action_synced_wait(svc_action_t * op, sigset_t *mask)
 
     crm_trace("Child done: %d", op->pid);
     if (wait_rc <= 0) {
-        int killrc = kill(op->pid, SIGKILL);
-
         op->rc = PCMK_OCF_UNKNOWN_ERROR;
+
         if (op->timeout > 0 && timeout <= 0) {
             op->status = PCMK_LRM_OP_TIMEOUT;
             crm_warn("%s:%d - timed out after %dms", op->id, op->pid, op->timeout);
@@ -569,16 +566,15 @@ action_synced_wait(svc_action_t * op, sigset_t *mask)
             op->status = PCMK_LRM_OP_ERROR;
         }
 
-        if (killrc && errno != ESRCH) {
-            crm_err("kill(%d, KILL) failed: %d", op->pid, errno);
+        /* If only child hasn't been successfully waited for, yet.
+           This is to limit killing wrong target a bit more. */
+        if (wait_rc == 0 && waitpid(op->pid, &status, WNOHANG) == 0) {
+            if (kill(op->pid, SIGKILL)) {
+                crm_err("kill(%d, KILL) failed: %d", op->pid, errno);
+            }
+            /* Safe to skip WNOHANG here as we sent non-ignorable signal. */
+            while (waitpid(op->pid, &status, 0) == (pid_t) -1 && errno == EINTR) /*omit*/;
         }
-        /*
-         * From sigprocmask(2):
-         * It is not possible to block SIGKILL or SIGSTOP.  Attempts to do so are silently ignored.
-         *
-         * This makes it safe to skip WNOHANG here
-         */
-        waitpid(op->pid, &status, 0);
 
     } else if (WIFEXITED(status)) {
         op->status = PCMK_LRM_OP_DONE;
@@ -611,10 +607,11 @@ action_synced_wait(svc_action_t * op, sigset_t *mask)
 /* For an asynchronous 'op', returns FALSE if 'op' should be free'd by the caller */
 /* For a synchronous 'op', returns FALSE if 'op' fails */
 gboolean
-services_os_action_execute(svc_action_t * op, gboolean synchronous)
+services_os_action_execute(svc_action_t * op)
 {
     int stdout_fd[2];
     int stderr_fd[2];
+    int rc;
     struct stat st;
     sigset_t *pmask;
 
@@ -643,29 +640,29 @@ services_os_action_execute(svc_action_t * op, gboolean synchronous)
 
     /* Fail fast */
     if(stat(op->opaque->exec, &st) != 0) {
-        int rc = errno;
+        rc = errno;
         crm_warn("Cannot execute '%s': %s (%d)", op->opaque->exec, pcmk_strerror(rc), rc);
         services_handle_exec_error(op, rc);
-        if (!synchronous) {
+        if (!op->synchronous) {
             return operation_finalize(op);
         }
         return FALSE;
     }
 
     if (pipe(stdout_fd) < 0) {
-        int rc = errno;
+        rc = errno;
 
         crm_err("pipe(stdout_fd) failed. '%s': %s (%d)", op->opaque->exec, pcmk_strerror(rc), rc);
 
         services_handle_exec_error(op, rc);
-        if (!synchronous) {
+        if (!op->synchronous) {
             return operation_finalize(op);
         }
         return FALSE;
     }
 
     if (pipe(stderr_fd) < 0) {
-        int rc = errno;
+        rc = errno;
 
         close(stdout_fd[0]);
         close(stdout_fd[1]);
@@ -673,13 +670,13 @@ services_os_action_execute(svc_action_t * op, gboolean synchronous)
         crm_err("pipe(stderr_fd) failed. '%s': %s (%d)", op->opaque->exec, pcmk_strerror(rc), rc);
 
         services_handle_exec_error(op, rc);
-        if (!synchronous) {
+        if (!op->synchronous) {
             return operation_finalize(op);
         }
         return FALSE;
     }
 
-    if (synchronous) {
+    if (op->synchronous) {
 #ifdef HAVE_SYS_SIGNALFD_H
         sigemptyset(&mask);
         sigaddset(&mask, SIGCHLD);
@@ -695,8 +692,16 @@ services_os_action_execute(svc_action_t * op, gboolean synchronous)
             crm_perror(LOG_ERR, "pipe() failed");
         }
 
-        set_fd_opts(sigchld_pipe[0], O_NONBLOCK);
-        set_fd_opts(sigchld_pipe[1], O_NONBLOCK);
+        rc = crm_set_nonblocking(sigchld_pipe[0]);
+        if (rc < 0) {
+            crm_warn("Could not set pipe input non-blocking: %s " CRM_XS " rc=%d",
+                     pcmk_strerror(rc), rc);
+        }
+        rc = crm_set_nonblocking(sigchld_pipe[1]);
+        if (rc < 0) {
+            crm_warn("Could not set pipe output non-blocking: %s " CRM_XS " rc=%d",
+                     pcmk_strerror(rc), rc);
+        }
 
         sa.sa_handler = sigchld_handler;
         sa.sa_flags = 0;
@@ -712,23 +717,22 @@ services_os_action_execute(svc_action_t * op, gboolean synchronous)
     op->pid = fork();
     switch (op->pid) {
         case -1:
-            {
-                int rc = errno;
+            rc = errno;
 
-                close(stdout_fd[0]);
-                close(stdout_fd[1]);
-                close(stderr_fd[0]);
-                close(stderr_fd[1]);
+            close(stdout_fd[0]);
+            close(stdout_fd[1]);
+            close(stderr_fd[0]);
+            close(stderr_fd[1]);
 
-                crm_err("Could not execute '%s': %s (%d)", op->opaque->exec, pcmk_strerror(rc), rc);
-                services_handle_exec_error(op, rc);
-                if (!synchronous) {
-                    return operation_finalize(op);
-                }
-
-                sigchld_cleanup();
-                return FALSE;
+            crm_err("Could not execute '%s': %s (%d)", op->opaque->exec, pcmk_strerror(rc), rc);
+            services_handle_exec_error(op, rc);
+            if (!op->synchronous) {
+                return operation_finalize(op);
             }
+
+            sigchld_cleanup();
+            return FALSE;
+
         case 0:                /* Child */
             close(stdout_fd[0]);
             close(stderr_fd[0]);
@@ -745,7 +749,7 @@ services_os_action_execute(svc_action_t * op, gboolean synchronous)
                 close(stderr_fd[1]);
             }
 
-            if (synchronous) {
+            if (op->synchronous) {
                 sigchld_cleanup();
             }
 
@@ -758,12 +762,22 @@ services_os_action_execute(svc_action_t * op, gboolean synchronous)
     close(stderr_fd[1]);
 
     op->opaque->stdout_fd = stdout_fd[0];
-    set_fd_opts(op->opaque->stdout_fd, O_NONBLOCK);
+    rc = crm_set_nonblocking(op->opaque->stdout_fd);
+    if (rc < 0) {
+        crm_warn("Could not set child output non-blocking: %s "
+                 CRM_XS " rc=%d",
+                 pcmk_strerror(rc), rc);
+    }
 
     op->opaque->stderr_fd = stderr_fd[0];
-    set_fd_opts(op->opaque->stderr_fd, O_NONBLOCK);
+    rc = crm_set_nonblocking(op->opaque->stderr_fd);
+    if (rc < 0) {
+        crm_warn("Could not set child error output non-blocking: %s "
+                 CRM_XS " rc=%d",
+                 pcmk_strerror(rc), rc);
+    }
 
-    if (synchronous) {
+    if (op->synchronous) {
         action_synced_wait(op, pmask);
         sigchld_cleanup();
     } else {

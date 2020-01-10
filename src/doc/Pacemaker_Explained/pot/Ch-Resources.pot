@@ -4,8 +4,8 @@
 msgid ""
 msgstr ""
 "Project-Id-Version: 0\n"
-"POT-Creation-Date: 2016-05-03 17:45-0500\n"
-"PO-Revision-Date: 2016-05-03 17:45-0500\n"
+"POT-Creation-Date: 2017-05-08 11:19-0500\n"
+"PO-Revision-Date: 2017-05-08 11:19-0500\n"
 "Last-Translator: Automatically generated\n"
 "Language-Team: None\n"
 "MIME-Version: 1.0\n"
@@ -478,7 +478,7 @@ msgstr ""
 
 #. Tag: para
 #, no-c-format
-msgid "started"
+msgid "Started"
 msgstr ""
 
 #. Tag: para
@@ -488,17 +488,22 @@ msgstr ""
 
 #. Tag: para
 #, no-c-format
-msgid "<literal>stopped:</literal> Force the resource to be stopped"
+msgid "<literal>Stopped:</literal> Force the resource to be stopped"
 msgstr ""
 
 #. Tag: para
 #, no-c-format
-msgid "<literal>started:</literal> Allow the resource to be started (In the case of <link linkend=\"s-resource-multistate\">multi-state</link> resources, they will not be promoted to master)"
+msgid "<literal>Started:</literal> Allow the resource to be started (and in the case of <link linkend=\"s-resource-multistate\">multi-state</link> resources, promoted to master if appropriate)"
 msgstr ""
 
 #. Tag: para
 #, no-c-format
-msgid "<literal>master:</literal> Allow the resource to be started and, if appropriate, promoted <indexterm> <primary>target-role</primary><secondary>Resource Option</secondary> </indexterm> <indexterm> <primary>Resource Option</primary> </indexterm> <indexterm> <primary>Resource</primary><secondary>Option</secondary><tertiary>target-role</tertiary> </indexterm> <indexterm> <primary>Option</primary><secondary>target-role</secondary> </indexterm> <indexterm> <primary>target-role</primary> </indexterm>"
+msgid "<literal>Slave:</literal> Allow the resource to be started, but only in Slave mode if the resource is <link linkend=\"s-resource-multistate\">multi-state</link>"
+msgstr ""
+
+#. Tag: para
+#, no-c-format
+msgid "<literal>Master:</literal> Equivalent to <literal>Started</literal> <indexterm> <primary>target-role</primary><secondary>Resource Option</secondary> </indexterm> <indexterm> <primary>Resource Option</primary> </indexterm> <indexterm> <primary>Resource</primary><secondary>Option</secondary><tertiary>target-role</tertiary> </indexterm> <indexterm> <primary>Option</primary><secondary>target-role</secondary> </indexterm> <indexterm> <primary>target-role</primary> </indexterm>"
 msgstr ""
 
 #. Tag: para
@@ -543,7 +548,7 @@ msgstr ""
 
 #. Tag: para
 #, no-c-format
-msgid "Conditions under which the resource can be started (<emphasis>Since 1.1.8</emphasis>) Allowed values:"
+msgid "Conditions under which the resource can be started <emphasis>(since 1.1.8)</emphasis> Allowed values:"
 msgstr ""
 
 #. Tag: para
@@ -563,7 +568,7 @@ msgstr ""
 
 #. Tag: para
 #, no-c-format
-msgid "<literal>unfencing:</literal> The cluster can only start this resource if a majority of the configured nodes are active <emphasis>and</emphasis> any failed or unknown nodes have been powered off <emphasis>and</emphasis> only on nodes that have been <emphasis>unfenced</emphasis>"
+msgid "<literal>unfencing:</literal> The cluster can only start this resource if a majority of the configured nodes are active <emphasis>and</emphasis> any failed or unknown nodes have been powered off <emphasis>and</emphasis> only on nodes that have been <emphasis>unfenced</emphasis> <emphasis>(since 1.1.9)</emphasis>"
 msgstr ""
 
 #. Tag: para
@@ -583,7 +588,7 @@ msgstr ""
 
 #. Tag: para
 #, no-c-format
-msgid "How many failures may occur for this resource on a node, before this node is marked ineligible to host this resource. A value of INFINITY indicates that this feature is disabled. <indexterm> <primary>migration-threshold</primary><secondary>Resource Option</secondary> </indexterm> <indexterm> <primary>Resource Option</primary> </indexterm> <indexterm> <primary>Resource</primary><secondary>Option</secondary><tertiary>migration-threshold</tertiary> </indexterm> <indexterm> <primary>Option</primary><secondary>migration-threshold</secondary> </indexterm> <indexterm> <primary>migration-threshold</primary> </indexterm>"
+msgid "How many failures may occur for this resource on a node, before this node is marked ineligible to host this resource. A value of 0 indicates that this feature is disabled (the node will never be marked ineligible); by constrast, the cluster treats INFINITY (the default) as a very large but finite number. This option has an effect only if the failed operation has on-fail=restart (the default), and additionally for failed start operations, if the cluster property start-failure-is-fatal is false. <indexterm> <primary>migration-threshold</primary><secondary>Resource Option</secondary> </indexterm> <indexterm> <primary>Resource Option</primary> </indexterm> <indexterm> <primary>Resource</primary><secondary>Option</secondary><tertiary>migration-threshold</tertiary> </indexterm> <indexterm> <primary>Option</primary><secondary>migration-threshold</secondary> </indexterm> <indexterm> <primary>migration-threshold</primary> </indexterm>"
 msgstr ""
 
 #. Tag: para
@@ -593,7 +598,7 @@ msgstr ""
 
 #. Tag: para
 #, no-c-format
-msgid "How many seconds to wait before acting as if the failure had not occurred, and potentially allowing the resource back to the node on which it failed. A value of 0 indicates that this feature is disabled. <indexterm> <primary>failure-timeout</primary><secondary>Resource Option</secondary> </indexterm> <indexterm> <primary>Resource Option</primary> </indexterm> <indexterm> <primary>Resource</primary><secondary>Option</secondary><tertiary>failure-timeout</tertiary> </indexterm> <indexterm> <primary>Option</primary><secondary>failure-timeout</secondary> </indexterm> <indexterm> <primary>failure-timeout</primary> </indexterm>"
+msgid "How many seconds to wait before acting as if the failure had not occurred, and potentially allowing the resource back to the node on which it failed. A value of 0 indicates that this feature is disabled. As with any time-based actions, this is not guaranteed to be checked more frequently than the value of <literal>cluster-recheck-interval</literal> (see <xref linkend=\"s-cluster-options\" />). <indexterm> <primary>failure-timeout</primary><secondary>Resource Option</secondary> </indexterm> <indexterm> <primary>Resource Option</primary> </indexterm> <indexterm> <primary>Resource</primary><secondary>Option</secondary><tertiary>failure-timeout</tertiary> </indexterm> <indexterm> <primary>Option</primary><secondary>failure-timeout</secondary> </indexterm> <indexterm> <primary>failure-timeout</primary> </indexterm>"
 msgstr ""
 
 #. Tag: para
@@ -633,12 +638,27 @@ msgstr ""
 
 #. Tag: para
 #, no-c-format
+msgid "<literal>allow-migrate</literal>"
+msgstr ""
+
+#. Tag: para
+#, no-c-format
+msgid "TRUE for ocf:pacemaker:remote resources, FALSE otherwise"
+msgstr ""
+
+#. Tag: para
+#, no-c-format
+msgid "Whether the cluster should try to \"live migrate\" this resource when it needs to be moved (see <xref linkend=\"s-migrating-resources\" />)"
+msgstr ""
+
+#. Tag: para
+#, no-c-format
 msgid "<literal>remote-node</literal>"
 msgstr ""
 
 #. Tag: para
 #, no-c-format
-msgid "The name of the remote-node this resource defines. This both enables the resource as a remote-node and defines the unique name used to identify the remote-node. If no other parameters are set, this value will also be assumed as the hostname to connect to at the port specified by <literal>remote-port</literal>. <literal>WARNING:</literal> This value cannot overlap with any resource or node IDs. If not specified, this feature is disabled."
+msgid "The name of the Pacemaker Remote guest node this resource is associated with, if any. If specified, this both enables the resource as a guest node and defines the unique name used to identify the guest node. The guest must be configured to run the Pacemaker Remote daemon when it is started. <literal>WARNING:</literal> This value cannot overlap with any resource or node IDs. <emphasis>(since 1.1.9)</emphasis>"
 msgstr ""
 
 #. Tag: para
@@ -653,7 +673,7 @@ msgstr ""
 
 #. Tag: para
 #, no-c-format
-msgid "Port to use for the guest connection to pacemaker_remote"
+msgid "If <literal>remote-node</literal> is specified, the port on the guest used for its Pacemaker Remote connection. The Pacemaker Remote daemon on the guest must be configured to listen on this port. <emphasis>(since 1.1.9)</emphasis>"
 msgstr ""
 
 #. Tag: para
@@ -668,12 +688,12 @@ msgstr ""
 
 #. Tag: para
 #, no-c-format
-msgid "The IP address or hostname to connect to if remote-node’s name is not the hostname of the guest."
+msgid "If <literal>remote-node</literal> is specified, the IP address or hostname used to connect to the guest via Pacemaker Remote. The Pacemaker Remote daemon on the guest must be configured to accept connections on this address. <emphasis>(since 1.1.9)</emphasis>"
 msgstr ""
 
 #. Tag: para
 #, no-c-format
-msgid "<literal><literal>remote-connect-timeout</literal></literal>"
+msgid "<literal>remote-connect-timeout</literal>"
 msgstr ""
 
 #. Tag: para
@@ -683,12 +703,7 @@ msgstr ""
 
 #. Tag: para
 #, no-c-format
-msgid "How long before a pending guest connection will time out."
-msgstr ""
-
-#. Tag: para
-#, no-c-format
-msgid "Support for remote nodes was added in pacemaker 1.1.10. If you are using an earlier version, options related to remote nodes will not be available."
+msgid "If <literal>remote-node</literal> is specified, how long before a pending guest connection will time out. <emphasis>(since 1.1.10)</emphasis>"
 msgstr ""
 
 #. Tag: para
@@ -1013,6 +1028,11 @@ msgstr ""
 
 #. Tag: para
 #, no-c-format
+msgid "FALSE"
+msgstr ""
+
+#. Tag: para
+#, no-c-format
 msgid "If <literal>true</literal>, the intention to perform the operation is recorded so that GUIs and CLI tools can indicate that an operation is in progress. This is best set as an <emphasis>operation default</emphasis> (see next section). Allowed values: <literal>true</literal>, <literal>false</literal>. <indexterm> <primary>enabled</primary><secondary>Action Property</secondary> </indexterm> <indexterm> <primary>Action Property</primary> </indexterm> <indexterm> <primary>Action</primary><secondary>Property</secondary><tertiary>enabled</tertiary> </indexterm> <indexterm> <primary>Property</primary><secondary>enabled</secondary> </indexterm> <indexterm> <primary>enabled</primary> </indexterm>"
 msgstr ""
 
@@ -1172,7 +1192,7 @@ msgid "&lt;primitive id=\"Public-IP\" class=\"ocf\" type=\"IPaddr\" provider=\"h
 "      &lt;op id=\"public-ip-health-300\" name=\"monitor\" interval=\"300\"&gt;\n"
 "         &lt;instance_attributes id=\"params-public-ip-depth-300\"&gt;\n"
 "            &lt;nvpair id=\"public-ip-depth-300\" name=\"OCF_CHECK_LEVEL\" value=\"20\"/&gt;\n"
-"       &lt;/instance_attributes&gt;\n"
+"         &lt;/instance_attributes&gt;\n"
 "     &lt;/op&gt;\n"
 "   &lt;/operations&gt;\n"
 "   &lt;instance_attributes id=\"params-public-ip\"&gt;\n"

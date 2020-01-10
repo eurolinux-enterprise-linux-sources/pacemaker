@@ -15,18 +15,16 @@
   <xi:include href="Ch-Rules.xml" xmlns:xi="http://www.w3.org/2001/XInclude"/>
   <xi:include href="Ch-Advanced-Options.xml" xmlns:xi="http://www.w3.org/2001/XInclude"/>
   <xi:include href="Ch-Advanced-Resources.xml" xmlns:xi="http://www.w3.org/2001/XInclude"/>
+  <xi:include href="Ch-Reusing-Configuration.xml" xmlns:xi="http://www.w3.org/2001/XInclude"/>
   <xi:include href="Ch-Utilization.xml" xmlns:xi="http://www.w3.org/2001/XInclude"/>
-  <xi:include href="Ch-Resource-Templates.xml" xmlns:xi="http://www.w3.org/2001/XInclude"/>
   <xi:include href="Ch-Stonith.xml" xmlns:xi="http://www.w3.org/2001/XInclude"/>
   <xi:include href="Ch-Status.xml" xmlns:xi="http://www.w3.org/2001/XInclude"/>
   <xi:include href="Ch-Multi-site-Clusters.xml" xmlns:xi="http://www.w3.org/2001/XInclude"/>
 
   <xi:include href="Ap-FAQ.xml" xmlns:xi="http://www.w3.org/2001/XInclude"/>
   <xi:include href="Ap-OCF.xml" xmlns:xi="http://www.w3.org/2001/XInclude"/>
-  <xi:include href="Ap-Changes.xml" xmlns:xi="http://www.w3.org/2001/XInclude"/>
   <xi:include href="Ap-Install.xml" xmlns:xi="http://www.w3.org/2001/XInclude"/>
   <xi:include href="Ap-Upgrade.xml" xmlns:xi="http://www.w3.org/2001/XInclude"/>
-  <xi:include href="Ap-Upgrade-Config.xml" xmlns:xi="http://www.w3.org/2001/XInclude"/>
   <xi:include href="Ap-LSB.xml" xmlns:xi="http://www.w3.org/2001/XInclude"/>
   <xi:include href="Ap-Samples.xml" xmlns:xi="http://www.w3.org/2001/XInclude"/>
   <appendix id="ap-further-reading">

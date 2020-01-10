@@ -71,11 +71,9 @@ cluster_status(pe_working_set_t * data_set)
         data_set->now = crm_time_new(NULL);
     }
 
-    if (data_set->dc_uuid == NULL
-        && data_set->input != NULL
-        && crm_element_value(data_set->input, XML_ATTR_DC_UUID) != NULL) {
-        /* this should always be present */
-        data_set->dc_uuid = crm_element_value_copy(data_set->input, XML_ATTR_DC_UUID);
+    if (data_set->dc_uuid == NULL) {
+        data_set->dc_uuid = crm_element_value_copy(data_set->input,
+                                                   XML_ATTR_DC_UUID);
     }
 
     clear_bit(data_set->flags, pe_flag_have_quorum);
@@ -236,7 +234,6 @@ set_working_set_defaults(pe_working_set_t * data_set)
     pe_dataset = data_set;
     memset(data_set, 0, sizeof(pe_working_set_t));
 
-    data_set->dc_uuid = NULL;
     data_set->order_id = 1;
     data_set->action_id = 1;
     data_set->no_quorum_policy = no_quorum_freeze;
@@ -251,13 +248,19 @@ set_working_set_defaults(pe_working_set_t * data_set)
 resource_t *
 pe_find_resource(GListPtr rsc_list, const char *id)
 {
+    return pe_find_resource_with_flags(rsc_list, id, pe_find_renamed);
+}
+
+resource_t *
+pe_find_resource_with_flags(GListPtr rsc_list, const char *id, enum pe_find flags)
+{
     GListPtr rIter = NULL;
 
     for (rIter = rsc_list; id && rIter; rIter = rIter->next) {
         resource_t *parent = rIter->data;
 
         resource_t *match =
-            parent->fns->find_rsc(parent, id, NULL, pe_find_renamed | pe_find_current);
+            parent->fns->find_rsc(parent, id, NULL, flags);
         if (match != NULL) {
             return match;
         }
@@ -274,7 +277,7 @@ pe_find_node_any(GListPtr nodes, const char *id, const char *uname)
     if (match) {
         return match;
     }
-    crm_trace("Looking up %s via it's uname instead", uname);
+    crm_trace("Looking up %s via its uname instead", uname);
     return pe_find_node(nodes, uname);
 }
 

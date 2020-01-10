@@ -95,7 +95,6 @@ cib_remove_node(uint32_t id, const char *name)
 
     crm_trace("Removing %s from the CIB", name);
 
-    /* TODO: Use 'id' instead */
     if(name == NULL && id == 0) {
         return -ENOTUNIQ;
     }
@@ -106,11 +105,8 @@ cib_remove_node(uint32_t id, const char *name)
     crm_xml_add(node, XML_ATTR_UNAME, name);
     crm_xml_add(node_state, XML_ATTR_UNAME, name);
     if(id) {
-        char buffer[64];
-        if(snprintf(buffer, 63, "%u", id) > 0) {
-            crm_xml_add(node, XML_ATTR_ID, buffer);
-            crm_xml_add(node_state, XML_ATTR_ID, buffer);
-        }
+        crm_xml_set_id(node, "%u", id);
+        crm_xml_add(node_state, XML_ATTR_ID, ID(node));
     }
 
     cib = cib_new();
@@ -154,9 +150,7 @@ int tools_remove_node_cache(const char *node, const char *target)
     }
 
     if(safe_str_eq(target, CRM_SYSTEM_CRMD)) {
-        admin_uuid = calloc(1, 11);
-        snprintf(admin_uuid, 10, "%d", getpid());
-        admin_uuid[10] = '\0';
+        admin_uuid = crm_getpid_s();
 
         hello = create_hello_message(admin_uuid, "crm_node", "0", "1");
         rc = crm_ipc_send(conn, hello, 0, 0, NULL);
@@ -201,10 +195,7 @@ int tools_remove_node_cache(const char *node, const char *target)
         cmd = create_request(CRM_OP_RM_NODE_CACHE,
                              NULL, NULL, target, crm_system_name, admin_uuid);
         if (n) {
-            char buffer[64];
-            if(snprintf(buffer, 63, "%u", n) > 0) {
-                crm_xml_add(cmd, XML_ATTR_ID, buffer);
-            }
+            crm_xml_set_id(cmd, "%u", n);
         }
         crm_xml_add(cmd, XML_ATTR_UNAME, name);
     }
@@ -382,7 +373,7 @@ read_local_hb_uuid(void)
     FILE *input = fopen(UUID_FILE, "r");
 
     if (input == NULL) {
-        crm_info("Could not open UUID file %s\n", UUID_FILE);
+        crm_info("Could not open UUID file %s", UUID_FILE);
         return FALSE;
     }
 
@@ -777,13 +768,13 @@ try_corosync(int command, enum cluster_type_e stack)
             /* Go direct to the Quorum API */
             rc = quorum_initialize(&q_handle, NULL, &quorum_type);
             if (rc != CS_OK) {
-                crm_err("Could not connect to the Quorum API: %d\n", rc);
+                crm_err("Could not connect to the Quorum API: %d", rc);
                 return FALSE;
             }
 
             rc = quorum_getquorate(q_handle, &quorate);
             if (rc != CS_OK) {
-                crm_err("Could not obtain the current Quorum API state: %d\n", rc);
+                crm_err("Could not obtain the current Quorum API state: %d", rc);
                 return FALSE;
             }
 
@@ -799,7 +790,7 @@ try_corosync(int command, enum cluster_type_e stack)
             /* Go direct to the CPG API */
             rc = cpg_initialize(&c_handle, NULL);
             if (rc != CS_OK) {
-                crm_err("Could not connect to the Cluster Process Group API: %d\n", rc);
+                crm_err("Could not connect to the Cluster Process Group API: %d", rc);
                 return FALSE;
             }
 
@@ -952,7 +943,11 @@ main(int argc, char **argv)
     }
 
     if (command == 'n') {
-        fprintf(stdout, "%s\n", get_local_node_name());
+        const char *name = getenv("OCF_RESKEY_" CRM_META "_" XML_LRM_ATTR_TARGET);
+        if(name == NULL) {
+            name = get_local_node_name();
+        }
+        fprintf(stdout, "%s\n", name);
         crm_exit(pcmk_ok);
 
     } else if (command == 'N') {

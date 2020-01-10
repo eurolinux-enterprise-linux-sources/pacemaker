@@ -45,8 +45,9 @@ crm_update_peer_join(const char *source, crm_node_t * node, enum crm_join_phase 
     enum crm_join_phase last = 0;
 
     if(node == NULL) {
-        crm_err("Could not update join because node not specified" CRM_XS
-                " join-%u source=%s phase=%d", source, current_join_id, phase);
+        crm_err("Could not update join because node not specified"
+                CRM_XS " join-%u source=%s phase=%s",
+                current_join_id, source, crm_join_phase_str(phase));
         return;
     }
 
@@ -58,23 +59,21 @@ crm_update_peer_join(const char *source, crm_node_t * node, enum crm_join_phase 
     last = node->join;
 
     if(phase == last) {
-        crm_trace("%s: Node %s[%u] - join-%u phase still %u",
-                  source, node->uname, node->id, current_join_id, last);
+        crm_trace("%s: Node %s[%u] - join-%u phase still %s",
+                  source, node->uname, node->id, current_join_id,
+                  crm_join_phase_str(last));
 
-    } else if (phase <= crm_join_none) {
+    } else if ((phase <= crm_join_none) || (phase == (last + 1))) {
         node->join = phase;
-        crm_info("%s: Node %s[%u] - join-%u phase %u -> %u",
-                 source, node->uname, node->id, current_join_id, last, phase);
+        crm_info("%s: Node %s[%u] - join-%u phase %s -> %s",
+                 source, node->uname, node->id, current_join_id,
+                 crm_join_phase_str(last), crm_join_phase_str(phase));
 
-    } else if(phase == last + 1) {
-        node->join = phase;
-        crm_info("%s: Node %s[%u] - join-%u phase %u -> %u",
-                 source, node->uname, node->id, current_join_id, last, phase);
     } else {
         crm_err("Could not update join for node %s because phase transition invalid "
-                CRM_XS " join-%u source=%s node_id=%u last=%u new=%u",
-                node->uname, current_join_id, source, node->id, last, phase);
-
+                CRM_XS " join-%u source=%s node_id=%u last=%s new=%s",
+                node->uname, current_join_id, source, node->id,
+                crm_join_phase_str(last), crm_join_phase_str(phase));
     }
 }
 
@@ -107,6 +106,30 @@ initialize_join(gboolean before)
     }
 }
 
+/*!
+ * \internal
+ * \brief Create a join message from the DC
+ *
+ * \param[in] join_op  Join operation name
+ * \param[in] host_to  Recipient of message
+ */
+static xmlNode *
+create_dc_message(const char *join_op, const char *host_to)
+{
+    xmlNode *msg = create_request(join_op, NULL, host_to, CRM_SYSTEM_CRMD,
+                                  CRM_SYSTEM_DC, NULL);
+
+    /* Identify which election this is a part of */
+    crm_xml_add_int(msg, F_CRM_JOIN_ID, current_join_id);
+
+    /* Add a field specifying whether the DC is shutting down. This keeps the
+     * joining node from fencing the old DC if it becomes the new DC.
+     */
+    crm_xml_add_boolean(msg, F_CRM_DC_LEAVING,
+                        is_set(fsa_input_register, R_SHUTDOWN));
+    return msg;
+}
+
 static void
 join_make_offer(gpointer key, gpointer value, gpointer user_data)
 {
@@ -132,7 +155,7 @@ join_make_offer(gpointer key, gpointer value, gpointer user_data)
     }
 
     if (member->uname == NULL) {
-        crm_err("No recipient for welcome message");
+        crm_info("No recipient for welcome message.(Node uuid:%s)", member->uuid);
         return;
     }
 
@@ -148,10 +171,8 @@ join_make_offer(gpointer key, gpointer value, gpointer user_data)
 
     crm_update_peer_join(__FUNCTION__, (crm_node_t*)member, crm_join_none);
 
-    offer = create_request(CRM_OP_JOIN_OFFER, NULL, member->uname,
-                           CRM_SYSTEM_CRMD, CRM_SYSTEM_DC, NULL);
+    offer = create_dc_message(CRM_OP_JOIN_OFFER, member->uname);
 
-    crm_xml_add_int(offer, F_CRM_JOIN_ID, current_join_id);
     /* send the welcome */
     crm_info("join-%d: Sending offer to %s", current_join_id, member->uname);
 
@@ -243,15 +264,17 @@ do_dc_join_offer_one(long long action,
     /* always offer to the DC (ourselves)
      * this ensures the correct value for max_generation_from
      */
-    member = crm_get_peer(0, fsa_our_uname);
-    join_make_offer(NULL, member, NULL);
+    if (strcmp(join_to, fsa_our_uname) != 0) {
+        member = crm_get_peer(0, fsa_our_uname);
+        join_make_offer(NULL, member, NULL);
+    }
 
     /* this was a genuine join request, cancel any existing
      * transition and invoke the PE
      */
     abort_transition(INFINITY, tg_restart, "Node join", NULL);
 
-    /* don't waste time by invoking the pe yet; */
+    /* don't waste time by invoking the PE yet; */
     crm_debug("Waiting on %d outstanding join acks for join-%d",
               crmd_join_phase_count(crm_join_welcomed), current_join_id);
 }
@@ -385,7 +408,7 @@ do_dc_join_finalize(long long action,
     /* This we can do straight away and avoid clients timing us out
      *  while we compute the latest CIB
      */
-    crm_debug("Finializing join-%d for %d clients",
+    crm_debug("Finalizing join-%d for %d clients",
               current_join_id, crmd_join_phase_count(crm_join_integrated));
 
     crmd_join_phase_log(LOG_INFO);
@@ -523,8 +546,26 @@ do_dc_join_ack(long long action,
      *   be started in due time
      */
     erase_status_tag(join_from, XML_CIB_TAG_LRM, cib_scope_local);
-    fsa_cib_update(XML_CIB_TAG_STATUS, join_ack->xml,
-                   cib_scope_local | cib_quorum_override | cib_can_create, call_id, NULL);
+
+    if (safe_str_eq(join_from, fsa_our_uname)) {
+        xmlNode *now_dc_lrmd_state = do_lrm_query(TRUE, fsa_our_uname);
+
+        if (now_dc_lrmd_state != NULL) {
+            crm_debug("LRM state is updated from do_lrm_query.(%s)", join_from);
+            fsa_cib_update(XML_CIB_TAG_STATUS, now_dc_lrmd_state,
+                cib_scope_local | cib_quorum_override | cib_can_create, call_id, NULL);
+            free_xml(now_dc_lrmd_state);
+        } else {
+            crm_warn("Could not get our LRM state. LRM state is updated from join_ack->xml.(%s)", join_from);
+            fsa_cib_update(XML_CIB_TAG_STATUS, join_ack->xml,
+                cib_scope_local | cib_quorum_override | cib_can_create, call_id, NULL);
+        }
+    } else {
+        crm_debug("LRM state is updated from join_ack->xml.(%s)", join_from);
+        fsa_cib_update(XML_CIB_TAG_STATUS, join_ack->xml,
+           cib_scope_local | cib_quorum_override | cib_can_create, call_id, NULL);
+    }
+
     fsa_register_cib_callback(call_id, FALSE, NULL, join_update_complete_callback);
     crm_debug("join-%d: Registered callback for LRM update %d", join_id, call_id);
 }
@@ -569,9 +610,7 @@ finalize_join_for(gpointer key, gpointer value, gpointer user_data)
     }
 
     /* send the ack/nack to the node */
-    acknak = create_request(CRM_OP_JOIN_ACKNAK, NULL, join_to,
-                            CRM_SYSTEM_CRMD, CRM_SYSTEM_DC, NULL);
-    crm_xml_add_int(acknak, F_CRM_JOIN_ID, current_join_id);
+    acknak = create_dc_message(CRM_OP_JOIN_ACKNAK, join_to);
 
     crm_debug("join-%d: ACK'ing join request from %s",
               current_join_id, join_to);
@@ -647,7 +686,13 @@ do_dc_join_final(long long action,
                  enum crmd_fsa_input current_input, fsa_data_t * msg_data)
 {
     crm_debug("Ensuring DC, quorum and node attributes are up-to-date");
+#if !HAVE_ATOMIC_ATTRD
+    /* Ask attrd to write all attributes to disk. This is not needed for
+     * atomic attrd because atomic attrd does a peer sync and write-out
+     * when winning an election.
+     */
     update_attrd(NULL, NULL, NULL, NULL, FALSE);
+#endif
     crm_update_quorum(crm_have_quorum, TRUE);
 }
 
@@ -673,27 +718,7 @@ void crmd_join_phase_log(int level)
 
     g_hash_table_iter_init(&iter, crm_peer_cache);
     while (g_hash_table_iter_next(&iter, NULL, (gpointer *) &peer)) {
-        const char *state = "unknown";
-        switch(peer->join) {
-            case crm_join_nack:
-                state = "nack";
-                break;
-            case crm_join_none:
-                state = "none";
-                break;
-            case crm_join_welcomed:
-                state = "welcomed";
-                break;
-            case crm_join_integrated:
-                state = "integrated";
-                break;
-            case crm_join_finalized:
-                state = "finalized";
-                break;
-            case crm_join_confirmed:
-                state = "confirmed";
-                break;
-        }
-        do_crm_log(level, "join-%d: %s=%s", current_join_id, peer->uname, state);
+        do_crm_log(level, "join-%d: %s=%s", current_join_id, peer->uname,
+                   crm_join_phase_str(peer->join));
     }
 }

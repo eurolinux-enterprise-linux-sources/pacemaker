@@ -1,19 +1,8 @@
 /*
- * Copyright (C) 2010 Andrew Beekhof <andrew@beekhof.net>
+ * Copyright (C) 2010-2016 Andrew Beekhof <andrew@beekhof.net>
  *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
- *
- * This software is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ * This source code is licensed under the GNU Lesser General Public License
+ * version 2.1 or later (LGPLv2.1+) WITHOUT ANY WARRANTY.
  */
 
 #include <crm_internal.h>
@@ -48,21 +37,35 @@
 /* TODO: Develop a rollover strategy */
 
 static int operations = 0;
-GHashTable *recurring_actions = NULL;
+static GHashTable *recurring_actions = NULL;
 
 /* ops waiting to run async because of conflicting active
- * pending ops*/
-GList *blocked_ops = NULL;
+ * pending ops */
+static GList *blocked_ops = NULL;
 
 /* ops currently active (in-flight) */
-GList *inflight_ops = NULL;
+static GList *inflight_ops = NULL;
+
+static void handle_blocked_ops(void);
 
 svc_action_t *
 services_action_create(const char *name, const char *action, int interval, int timeout)
 {
-    return resources_action_create(name, "lsb", NULL, name, action, interval, timeout, NULL, 0);
+    return resources_action_create(name, PCMK_RESOURCE_CLASS_LSB, NULL, name,
+                                   action, interval, timeout, NULL, 0);
 }
 
+/*!
+ * \brief Find first service class that can provide a specified agent
+ *
+ * \param[in] agent  Name of agent to search for
+ *
+ * \return Service class if found, NULL otherwise
+ *
+ * \note The priority is LSB, then systemd, then upstart. It would be preferable
+ *       to put systemd first, but LSB merely requires a file existence check,
+ *       while systemd requires contacting D-Bus.
+ */
 const char *
 resources_find_service_class(const char *agent)
 {
@@ -79,25 +82,84 @@ resources_find_service_class(const char *agent)
     rc = asprintf(&path, "%s/%s", LSB_ROOT_DIR, agent);
     if (rc > 0 && stat(path, &st) == 0) {
         free(path);
-        return "lsb";
+        return PCMK_RESOURCE_CLASS_LSB;
     }
     free(path);
 #endif
 
 #if SUPPORT_SYSTEMD
     if (systemd_unit_exists(agent)) {
-        return "systemd";
+        return PCMK_RESOURCE_CLASS_SYSTEMD;
     }
 #endif
 
 #if SUPPORT_UPSTART
     if (upstart_job_exists(agent)) {
-        return "upstart";
+        return PCMK_RESOURCE_CLASS_UPSTART;
     }
 #endif
     return NULL;
 }
 
+static inline void
+init_recurring_actions(void)
+{
+    if (recurring_actions == NULL) {
+        recurring_actions = g_hash_table_new_full(g_str_hash, g_str_equal, NULL,
+                                                  NULL);
+    }
+}
+
+/*!
+ * \internal
+ * \brief Check whether op is in-flight systemd or upstart op
+ *
+ * \param[in] op  Operation to check
+ *
+ * \return TRUE if op is in-flight systemd or upstart op
+ */
+static inline gboolean
+inflight_systemd_or_upstart(svc_action_t *op)
+{
+    return (safe_str_eq(op->standard, PCMK_RESOURCE_CLASS_SYSTEMD)
+            || safe_str_eq(op->standard, PCMK_RESOURCE_CLASS_UPSTART))
+            && (g_list_find(inflight_ops, op) != NULL);
+}
+
+/*!
+ * \internal
+ * \brief Expand "service" alias to an actual resource class
+ *
+ * \param[in] rsc       Resource name (for logging only)
+ * \param[in] standard  Resource class as configured
+ * \param[in] agent     Agent name to look for
+ *
+ * \return Newly allocated string with actual resource class
+ *
+ * \note The caller is responsible for calling free() on the result.
+ */
+static char *
+expand_resource_class(const char *rsc, const char *standard, const char *agent)
+{
+    char *expanded_class = NULL;
+
+    if (strcasecmp(standard, PCMK_RESOURCE_CLASS_SERVICE) == 0) {
+        const char *found_class = resources_find_service_class(agent);
+
+        if (found_class) {
+            crm_debug("Found %s agent %s for %s", found_class, agent, rsc);
+            expanded_class = strdup(found_class);
+        } else {
+            crm_info("Assuming resource class lsb for agent %s for %s",
+                     agent, rsc);
+            expanded_class = strdup(PCMK_RESOURCE_CLASS_LSB);
+        }
+    } else {
+        expanded_class = strdup(standard);
+    }
+    CRM_ASSERT(expanded_class);
+    return expanded_class;
+}
 
 svc_action_t *
 resources_action_create(const char *name, const char *standard, const char *provider,
@@ -112,36 +174,28 @@ resources_action_create(const char *name, const char *standard, const char *prov
      */
 
     if (crm_strlen_zero(name)) {
-        crm_err("A service or resource action must have a name.");
+        crm_err("Cannot create operation without resource name");
         goto return_error;
     }
 
     if (crm_strlen_zero(standard)) {
-        crm_err("A service action must have a valid standard.");
+        crm_err("Cannot create operation for %s without resource class", name);
         goto return_error;
     }
 
-    if (!strcasecmp(standard, "ocf") && crm_strlen_zero(provider)) {
-        crm_err("An OCF resource action must have a provider.");
+    if (crm_provider_required(standard) && crm_strlen_zero(provider)) {
+        crm_err("Cannot create OCF operation for %s without provider", name);
         goto return_error;
     }
 
     if (crm_strlen_zero(agent)) {
-        crm_err("A service or resource action must have an agent.");
+        crm_err("Cannot create operation for %s without agent name", name);
         goto return_error;
     }
 
     if (crm_strlen_zero(action)) {
-        crm_err("A service or resource action must specify an action.");
+        crm_err("Cannot create operation for %s without operation name", name);
         goto return_error;
-    }
-
-    if (safe_str_eq(action, "monitor") && (
-#if SUPPORT_HEARTBEAT
-        safe_str_eq(standard, "heartbeat") ||
-#endif
-        safe_str_eq(standard, "lsb") || safe_str_eq(standard, "service"))) {
-        action = "status";
     }
 
     /*
@@ -151,35 +205,24 @@ resources_action_create(const char *name, const char *standard, const char *prov
     op = calloc(1, sizeof(svc_action_t));
     op->opaque = calloc(1, sizeof(svc_action_private_t));
     op->rsc = strdup(name);
-    op->action = strdup(action);
     op->interval = interval;
     op->timeout = timeout;
-    op->standard = strdup(standard);
+    op->standard = expand_resource_class(name, standard, agent);
     op->agent = strdup(agent);
     op->sequence = ++operations;
     op->flags = flags;
+    op->id = generate_op_key(name, action, interval);
 
-    if (asprintf(&op->id, "%s_%s_%d", name, action, interval) == -1) {
-        goto return_error;
+    if (safe_str_eq(action, "monitor") && (
+#if SUPPORT_HEARTBEAT
+        safe_str_eq(op->standard, PCMK_RESOURCE_CLASS_HB) ||
+#endif
+        safe_str_eq(op->standard, PCMK_RESOURCE_CLASS_LSB))) {
+        action = "status";
     }
+    op->action = strdup(action);
 
-    if (strcasecmp(op->standard, "service") == 0) {
-        const char *expanded = resources_find_service_class(op->agent);
-
-        if(expanded) {
-            crm_debug("Found a %s agent for %s/%s", expanded, op->rsc, op->agent);
-            free(op->standard);
-            op->standard = strdup(expanded);
-
-        } else {
-            crm_info("Cannot determine the standard for %s (%s)", op->rsc, op->agent);
-            free(op->standard);
-            op->standard = strdup("lsb");
-        }
-        CRM_ASSERT(op->standard);
-    }
-
-    if (strcasecmp(op->standard, "ocf") == 0) {
+    if (crm_provider_required(op->standard)) {
         op->provider = strdup(provider);
         op->params = params;
         params = NULL;
@@ -191,7 +234,7 @@ resources_action_create(const char *name, const char *standard, const char *prov
         op->opaque->args[0] = strdup(op->opaque->exec);
         op->opaque->args[1] = strdup(action);
 
-    } else if (strcasecmp(op->standard, "lsb") == 0) {
+    } else if (strcasecmp(op->standard, PCMK_RESOURCE_CLASS_LSB) == 0) {
         if (op->agent[0] == '/') {
             /* if given an absolute path, use that instead
              * of tacking on the LSB_ROOT_DIR path to the front */
@@ -204,7 +247,7 @@ resources_action_create(const char *name, const char *standard, const char *prov
         op->opaque->args[1] = strdup(op->action);
         op->opaque->args[2] = NULL;
 #if SUPPORT_HEARTBEAT
-    } else if (strcasecmp(op->standard, "heartbeat") == 0) {
+    } else if (strcasecmp(op->standard, PCMK_RESOURCE_CLASS_HB) == 0) {
         int index;
         int param_num;
         char buf_tmp[20];
@@ -223,38 +266,34 @@ resources_action_create(const char *name, const char *standard, const char *prov
         /* The "heartbeat" agent class only has positional arguments,
          * which we keyed by their decimal position number. */
         param_num = 1;
-	for (index = 1; index <= MAX_ARGC - 3; index++ ) {
-            snprintf(buf_tmp, sizeof(buf_tmp), "%d", index);
-            value_tmp = g_hash_table_lookup(params, buf_tmp);
-            if (value_tmp == NULL) {
-                /* maybe: strdup("") ??
-                 * But the old lrmd did simply continue as well. */
-                continue;
+        if (params) {
+            for (index = 1; index <= MAX_ARGC - 3; index++ ) {
+                snprintf(buf_tmp, sizeof(buf_tmp), "%d", index);
+                value_tmp = g_hash_table_lookup(params, buf_tmp);
+                if (value_tmp == NULL) {
+                    /* maybe: strdup("") ??
+                     * But the old lrmd did simply continue as well. */
+                    continue;
+                }
+                op->opaque->args[param_num++] = strdup(value_tmp);
             }
-            op->opaque->args[param_num++] = strdup(value_tmp);
         }
 
-	/* Add operation code as the last argument, */
-	/* and the teminating NULL pointer */
+        /* Add operation code as the last argument, */
+        /* and the terminating NULL pointer */
         op->opaque->args[param_num++] = strdup(op->action);
         op->opaque->args[param_num] = NULL;
 #endif
 #if SUPPORT_SYSTEMD
-    } else if (strcasecmp(op->standard, "systemd") == 0) {
+    } else if (strcasecmp(op->standard, PCMK_RESOURCE_CLASS_SYSTEMD) == 0) {
         op->opaque->exec = strdup("systemd-dbus");
 #endif
 #if SUPPORT_UPSTART
-    } else if (strcasecmp(op->standard, "upstart") == 0) {
+    } else if (strcasecmp(op->standard, PCMK_RESOURCE_CLASS_UPSTART) == 0) {
         op->opaque->exec = strdup("upstart-dbus");
 #endif
-    } else if (strcasecmp(op->standard, "service") == 0) {
-        op->opaque->exec = strdup(SERVICE_SCRIPT);
-        op->opaque->args[0] = strdup(SERVICE_SCRIPT);
-        op->opaque->args[1] = strdup(agent);
-        op->opaque->args[2] = strdup(action);
-
 #if SUPPORT_NAGIOS
-    } else if (strcasecmp(op->standard, "nagios") == 0) {
+    } else if (strcasecmp(op->standard, PCMK_RESOURCE_CLASS_NAGIOS) == 0) {
         int index = 0;
 
         if (op->agent[0] == '/') {
@@ -304,7 +343,6 @@ resources_action_create(const char *name, const char *standard, const char *prov
         }
         op->opaque->args[index] = NULL;
 #endif
-
     } else {
         crm_err("Unknown resource standard: %s", op->standard);
         services_action_free(op);
@@ -349,8 +387,116 @@ services_action_create_generic(const char *exec, const char *args[])
     return op;
 }
 
+/*!
+ * \brief Create an alert agent action
+ *
+ * \param[in] id        Alert ID
+ * \param[in] exec      Path to alert agent executable
+ * \param[in] timeout   Action timeout
+ * \param[in] params    Parameters to use with action
+ * \param[in] sequence  Action sequence number
+ * \param[in] cb_data   Data to pass to callback function
+ *
+ * \return New action on success, NULL on error
+ * \note It is the caller's responsibility to free cb_data.
+ *       The caller should not free params explicitly.
+ */
+svc_action_t *
+services_alert_create(const char *id, const char *exec, int timeout,
+                      GHashTable *params, int sequence, void *cb_data)
+{
+    svc_action_t *action = services_action_create_generic(exec, NULL);
+
+    CRM_ASSERT(action);
+    action->timeout = timeout;
+    action->id = strdup(id);
+    action->params = params;
+    action->sequence = sequence;
+    action->cb_data = cb_data;
+    return action;
+}
+
+/*!
+ * \brief Set the user and group that an action will execute as
+ *
+ * \param[in,out] action  Action to modify
+ * \param[in]     user    Name of user to execute action as
+ * \param[in]     group   Name of group to execute action as
+ *
+ * \return pcmk_ok on success, -errno otherwise
+ *
+ * \note This will have no effect unless the process executing the action runs
+ *       as root, and the action is not a systemd or upstart action.
+ *       We could implement this for systemd by adding User= and Group= to
+ *       [Service] in the override file, but that seems more likely to cause
+ *       problems than be useful.
+ */
+int
+services_action_user(svc_action_t *op, const char *user)
+{
+    CRM_CHECK((op != NULL) && (user != NULL), return -EINVAL);
+    return crm_user_lookup(user, &(op->opaque->uid), &(op->opaque->gid));
+}
+
+static void
+set_alert_env(gpointer key, gpointer value, gpointer user_data)
+{
+    int rc;
+
+    if (value) {
+        rc = setenv(key, value, 1);
+    } else {
+        rc = unsetenv(key);
+    }
+
+    if (rc < 0) {
+        crm_perror(LOG_ERR, "setenv %s=%s",
+                  (char*)key, (value? (char*)value : ""));
+    } else {
+        crm_trace("setenv %s=%s", (char*)key, (value? (char*)value : ""));
+    }
+}
+
+static void
+unset_alert_env(gpointer key, gpointer value, gpointer user_data)
+{
+    if (unsetenv(key) < 0) {
+        crm_perror(LOG_ERR, "unset %s", (char*)key);
+    } else {
+        crm_trace("unset %s", (char*)key);
+    }
+}
+
+/*!
+ * \brief Execute an alert agent action
+ *
+ * \param[in] action  Action to execute
+ * \param[in] cb      Function to call when action completes
+ *
+ * \return TRUE if the library will free action, FALSE otherwise
+ *
+ * \note If this function returns FALSE, it is the caller's responsibility to
+ *       free the action with services_action_free().
+ */
+gboolean
+services_alert_async(svc_action_t *action, void (*cb)(svc_action_t *op))
+{
+    gboolean responsible;
+
+    action->synchronous = false;
+    action->opaque->callback = cb;
+    if (action->params) {
+        g_hash_table_foreach(action->params, set_alert_env, NULL);
+    }
+    responsible = services_os_action_execute(action);
+    if (action->params) {
+        g_hash_table_foreach(action->params, unset_alert_env, NULL);
+    }
+    return responsible;
+}
+
 #if SUPPORT_DBUS
-/*
+/*!
  * \internal
  * \brief Update operation's pending DBus call, unreferencing old one if needed
  *
@@ -422,6 +568,16 @@ services_action_free(svc_action_t * op)
         return;
     }
 
+    /* The operation should be removed from all tracking lists by this point.
+     * If it's not, we have a bug somewhere, so bail. That may lead to a
+     * memory leak, but it's better than a use-after-free segmentation fault.
+     */
+    CRM_CHECK(g_list_find(inflight_ops, op) == NULL, return);
+    CRM_CHECK(g_list_find(blocked_ops, op) == NULL, return);
+    CRM_CHECK((recurring_actions == NULL)
+              || (g_hash_table_lookup(recurring_actions, op->id) == NULL),
+              return);
+
     services_action_cleanup(op);
 
     if (op->opaque->repeat_timer) {
@@ -472,54 +628,85 @@ cancel_recurring_action(svc_action_t * op)
     return TRUE;
 }
 
+/*!
+ * \brief Cancel a recurring action
+ *
+ * \param[in] name      Name of resource that operation is for
+ * \param[in] action    Name of operation to cancel
+ * \param[in] interval  Interval of operation to cancel
+ *
+ * \return TRUE if action was successfully cancelled, FALSE otherwise
+ */
 gboolean
 services_action_cancel(const char *name, const char *action, int interval)
 {
+    gboolean cancelled = FALSE;
+    char *id = generate_op_key(name, action, interval);
     svc_action_t *op = NULL;
-    char id[512];
 
-    snprintf(id, sizeof(id), "%s_%s_%d", name, action, interval);
-
-    if (!(op = g_hash_table_lookup(recurring_actions, id))) {
-        return FALSE;
+    /* We can only cancel a recurring action */
+    init_recurring_actions();
+    op = g_hash_table_lookup(recurring_actions, id);
+    if (op == NULL) {
+        goto done;
     }
 
-    /* Always kill the recurring timer */
+    /* Tell operation_finalize() not to reschedule the operation */
+    op->cancel = TRUE;
+
+    /* Stop tracking it as a recurring operation, and stop its timer */
     cancel_recurring_action(op);
 
-    if (op->pid == 0) {
-        op->status = PCMK_LRM_OP_CANCELLED;
-        if (op->opaque->callback) {
-            op->opaque->callback(op);
+    /* If the op has a PID, it's an in-flight child process, so kill it.
+     *
+     * Whether the kill succeeds or fails, the main loop will send the op to
+     * operation_finished() (and thus operation_finalize()) when the process
+     * goes away.
+     */
+    if (op->pid != 0) {
+        crm_info("Terminating in-flight op %s (pid %d) early because it was cancelled",
+                 id, op->pid);
+        cancelled = mainloop_child_kill(op->pid);
+        if (cancelled == FALSE) {
+            crm_err("Termination of %s (pid %d) failed", id, op->pid);
         }
-
-        blocked_ops = g_list_remove(blocked_ops, op);
-        services_action_free(op);
-
-    } else {
-        crm_info("Cancelling in-flight op: performing early termination of %s (pid=%d)", id, op->pid);
-        op->cancel = 1;
-        if (mainloop_child_kill(op->pid) == FALSE) {
-            /* even though the early termination failed,
-             * the op will be marked as cancelled once it completes. */
-            crm_err("Termination of %s (pid=%d) failed", id, op->pid);
-            return FALSE;
-        }
+        goto done;
     }
 
-    return TRUE;
+    /* In-flight systemd and upstart ops don't have a pid. The relevant handlers
+     * will call operation_finalize() when the operation completes.
+     * @TODO: Can we request early termination, maybe using
+     * dbus_pending_call_cancel()?
+     */
+    if (inflight_systemd_or_upstart(op)) {
+        crm_info("Will cancel %s op %s when in-flight instance completes",
+                 op->standard, op->id);
+        cancelled = FALSE;
+        goto done;
+    }
+
+    /* Otherwise, operation is not in-flight, just report as cancelled */
+    op->status = PCMK_LRM_OP_CANCELLED;
+    if (op->opaque->callback) {
+        op->opaque->callback(op);
+    }
+
+    blocked_ops = g_list_remove(blocked_ops, op);
+    services_action_free(op);
+    cancelled = TRUE;
+
+done:
+    free(id);
+    return cancelled;
 }
 
 gboolean
 services_action_kick(const char *name, const char *action, int interval /* ms */)
 {
     svc_action_t * op = NULL;
-    char *id = NULL;
+    char *id = generate_op_key(name, action, interval);
 
-    if (asprintf(&id, "%s_%s_%d", name, action, interval) == -1) {
-        return FALSE;
-    }
-
+    init_recurring_actions();
     op = g_hash_table_lookup(recurring_actions, id);
     free(id);
 
@@ -527,7 +714,8 @@ services_action_kick(const char *name, const char *action, int interval /* ms */
         return FALSE;
     }
 
-    if (op->pid) {
+
+    if (op->pid || inflight_systemd_or_upstart(op)) {
         return TRUE;
     } else {
         if (op->opaque->repeat_timer) {
@@ -540,18 +728,18 @@ services_action_kick(const char *name, const char *action, int interval /* ms */
 
 }
 
-/* add new recurring operation, check for duplicates. 
- * - if duplicate found, return TRUE, immediately reschedule op.
- * - if no dup, return FALSE, inserve into recurring op list.*/
+/*!
+ * \internal
+ * \brief Add a new recurring operation, checking for duplicates
+ *
+ * \param[in] op               Operation to add
+ *
+ * \return TRUE if duplicate found (and reschedule), FALSE otherwise
+ */
 static gboolean
-handle_duplicate_recurring(svc_action_t * op, void (*action_callback) (svc_action_t *))
+handle_duplicate_recurring(svc_action_t * op)
 {
     svc_action_t * dup = NULL;
-
-    if (recurring_actions == NULL) {
-        recurring_actions = g_hash_table_new_full(g_str_hash, g_str_equal, NULL, NULL);
-        return FALSE;
-    }
 
     /* check for duplicates */
     dup = g_hash_table_lookup(recurring_actions, op->id);
@@ -571,7 +759,7 @@ handle_duplicate_recurring(svc_action_t * op, void (*action_callback) (svc_actio
             }
             recurring_action_timer(dup);
         }
-        /* free the dup.  */
+        /* free the duplicate */
         services_action_free(op);
         return TRUE;
     }
@@ -579,21 +767,25 @@ handle_duplicate_recurring(svc_action_t * op, void (*action_callback) (svc_actio
     return FALSE;
 }
 
-static gboolean
-action_async_helper(svc_action_t * op)
+inline static gboolean
+action_exec_helper(svc_action_t * op)
 {
-    if (op->standard && strcasecmp(op->standard, "upstart") == 0) {
+    /* Whether a/synchronous must be decided (op->synchronous) beforehand. */
+    if (op->standard
+        && (strcasecmp(op->standard, PCMK_RESOURCE_CLASS_UPSTART) == 0)) {
 #if SUPPORT_UPSTART
-        return upstart_job_exec(op, FALSE);
+        return upstart_job_exec(op);
 #endif
-    } else if (op->standard && strcasecmp(op->standard, "systemd") == 0) {
+    } else if (op->standard && strcasecmp(op->standard,
+                                          PCMK_RESOURCE_CLASS_SYSTEMD) == 0) {
 #if SUPPORT_SYSTEMD
         return systemd_unit_exec(op);
 #endif
     } else {
-        return services_os_action_execute(op, FALSE);
+        return services_os_action_execute(op);
     }
-    /* The 'op' has probably been freed if the execution functions return TRUE. */
+    /* The 'op' has probably been freed if the execution functions return TRUE
+       for the asynchronous 'op'. */
     /* Avoid using the 'op' in here. */
 
     return FALSE;
@@ -614,6 +806,23 @@ services_add_inflight_op(svc_action_t * op)
     }
 }
 
+/*!
+ * \internal
+ * \brief Stop tracking an operation that completed
+ *
+ * \param[in] op  Operation to stop tracking
+ */
+void
+services_untrack_op(svc_action_t *op)
+{
+    /* Op is no longer in-flight or blocked */
+    inflight_ops = g_list_remove(inflight_ops, op);
+    blocked_ops = g_list_remove(blocked_ops, op);
+
+    /* Op is no longer blocking other ops, so check if any need to run */
+    handle_blocked_ops();
+}
+
 gboolean
 services_action_async(svc_action_t * op, void (*action_callback) (svc_action_t *))
 {
@@ -623,7 +832,8 @@ services_action_async(svc_action_t * op, void (*action_callback) (svc_action_t *
     }
 
     if (op->interval > 0) {
-        if (handle_duplicate_recurring(op, action_callback) == TRUE) {
+        init_recurring_actions();
+        if (handle_duplicate_recurring(op) == TRUE) {
             /* entry rescheduled, dup freed */
             /* exit early */
             return TRUE;
@@ -636,7 +846,7 @@ services_action_async(svc_action_t * op, void (*action_callback) (svc_action_t *
         return TRUE;
     }
 
-    return action_async_helper(op);
+    return action_exec_helper(op);
 }
 
 
@@ -658,7 +868,7 @@ is_op_blocked(const char *rsc)
     return FALSE;
 }
 
-void
+static void
 handle_blocked_ops(void)
 {
     GList *executed_ops = NULL;
@@ -681,7 +891,7 @@ handle_blocked_ops(void)
             continue;
         }
         executed_ops = g_list_append(executed_ops, op);
-        res = action_async_helper(op);
+        res = action_exec_helper(op);
         if (res == FALSE) {
             op->status = PCMK_LRM_OP_ERROR;
             /* this can cause this function to be called recursively
@@ -699,6 +909,409 @@ handle_blocked_ops(void)
     processing_blocked_ops = FALSE;
 }
 
+#define lsb_metadata_template  \
+    "<?xml version='1.0'?>\n"                                           \
+    "<!DOCTYPE resource-agent SYSTEM 'ra-api-1.dtd'>\n"                 \
+    "<resource-agent name='%s' version='" PCMK_DEFAULT_AGENT_VERSION "'>\n" \
+    "  <version>1.0</version>\n"                                        \
+    "  <longdesc lang='en'>\n"                                          \
+    "%s"                                                                \
+    "  </longdesc>\n"                                                   \
+    "  <shortdesc lang='en'>%s</shortdesc>\n"                           \
+    "  <parameters>\n"                                                  \
+    "  </parameters>\n"                                                 \
+    "  <actions>\n"                                                     \
+    "    <action name='meta-data'    timeout='5' />\n"                  \
+    "    <action name='start'        timeout='15' />\n"                 \
+    "    <action name='stop'         timeout='15' />\n"                 \
+    "    <action name='status'       timeout='15' />\n"                 \
+    "    <action name='restart'      timeout='15' />\n"                 \
+    "    <action name='force-reload' timeout='15' />\n"                 \
+    "    <action name='monitor'      timeout='15' interval='15' />\n"   \
+    "  </actions>\n"                                                    \
+    "  <special tag='LSB'>\n"                                           \
+    "    <Provides>%s</Provides>\n"                                     \
+    "    <Required-Start>%s</Required-Start>\n"                         \
+    "    <Required-Stop>%s</Required-Stop>\n"                           \
+    "    <Should-Start>%s</Should-Start>\n"                             \
+    "    <Should-Stop>%s</Should-Stop>\n"                               \
+    "    <Default-Start>%s</Default-Start>\n"                           \
+    "    <Default-Stop>%s</Default-Stop>\n"                             \
+    "  </special>\n"                                                    \
+    "</resource-agent>\n"
+
+/* See "Comment Conventions for Init Scripts" in the LSB core specification at:
+ * http://refspecs.linuxfoundation.org/lsb.shtml
+ */
+#define LSB_INITSCRIPT_INFOBEGIN_TAG "### BEGIN INIT INFO"
+#define LSB_INITSCRIPT_INFOEND_TAG "### END INIT INFO"
+#define PROVIDES    "# Provides:"
+#define REQ_START   "# Required-Start:"
+#define REQ_STOP    "# Required-Stop:"
+#define SHLD_START  "# Should-Start:"
+#define SHLD_STOP   "# Should-Stop:"
+#define DFLT_START  "# Default-Start:"
+#define DFLT_STOP   "# Default-Stop:"
+#define SHORT_DSCR  "# Short-Description:"
+#define DESCRIPTION "# Description:"
+
+#define lsb_meta_helper_free_value(m)           \
+    do {                                        \
+        if ((m) != NULL) {                      \
+            xmlFree(m);                         \
+            (m) = NULL;                         \
+        }                                       \
+    } while(0)
+
+/*!
+ * \internal
+ * \brief Grab an LSB header value
+ *
+ * \param[in]     line    Line read from LSB init script
+ * \param[in,out] value   If not set, will be set to XML-safe copy of value
+ * \param[in]     prefix  Set value if line starts with this pattern
+ *
+ * \return TRUE if value was set, FALSE otherwise
+ */
+static inline gboolean
+lsb_meta_helper_get_value(const char *line, char **value, const char *prefix)
+{
+    if (!*value && crm_starts_with(line, prefix)) {
+        *value = (char *)xmlEncodeEntitiesReentrant(NULL, BAD_CAST line+strlen(prefix));
+        return TRUE;
+    }
+    return FALSE;
+}
+
+#define DESC_MAX 2048
+
+static int
+lsb_get_metadata(const char *type, char **output)
+{
+    char ra_pathname[PATH_MAX] = { 0, };
+    FILE *fp = NULL;
+    char buffer[1024] = { 0, };
+    char *provides = NULL;
+    char *req_start = NULL;
+    char *req_stop = NULL;
+    char *shld_start = NULL;
+    char *shld_stop = NULL;
+    char *dflt_start = NULL;
+    char *dflt_stop = NULL;
+    char *s_dscrpt = NULL;
+    char *xml_l_dscrpt = NULL;
+    int offset = 0;
+    bool in_header = FALSE;
+    char description[DESC_MAX] = { 0, };
+
+    if (type[0] == '/') {
+        snprintf(ra_pathname, sizeof(ra_pathname), "%s", type);
+    } else {
+        snprintf(ra_pathname, sizeof(ra_pathname), "%s/%s",
+                 LSB_ROOT_DIR, type);
+    }
+
+    crm_trace("Looking into %s", ra_pathname);
+    fp = fopen(ra_pathname, "r");
+    if (fp == NULL) {
+        return -errno;
+    }
+
+    /* Enter into the LSB-compliant comment block */
+    while (fgets(buffer, sizeof(buffer), fp)) {
+
+        // Ignore lines up to and including the block delimiter
+        if (crm_starts_with(buffer, LSB_INITSCRIPT_INFOBEGIN_TAG)) {
+            in_header = TRUE;
+            continue;
+        }
+        if (!in_header) {
+            continue;
+        }
+
+        /* Assume each of the following eight arguments contain one line */
+        if (lsb_meta_helper_get_value(buffer, &provides, PROVIDES)) {
+            continue;
+        }
+        if (lsb_meta_helper_get_value(buffer, &req_start, REQ_START)) {
+            continue;
+        }
+        if (lsb_meta_helper_get_value(buffer, &req_stop, REQ_STOP)) {
+            continue;
+        }
+        if (lsb_meta_helper_get_value(buffer, &shld_start, SHLD_START)) {
+            continue;
+        }
+        if (lsb_meta_helper_get_value(buffer, &shld_stop, SHLD_STOP)) {
+            continue;
+        }
+        if (lsb_meta_helper_get_value(buffer, &dflt_start, DFLT_START)) {
+            continue;
+        }
+        if (lsb_meta_helper_get_value(buffer, &dflt_stop, DFLT_STOP)) {
+            continue;
+        }
+        if (lsb_meta_helper_get_value(buffer, &s_dscrpt, SHORT_DSCR)) {
+            continue;
+        }
+
+        /* Long description may cross multiple lines */
+        if ((offset == 0) // haven't already found long description
+            && crm_starts_with(buffer, DESCRIPTION)) {
+            bool processed_line = TRUE;
+
+            // Get remainder of description line itself
+            offset += snprintf(description, DESC_MAX, "%s",
+                               buffer + strlen(DESCRIPTION));
+
+            // Read any continuation lines of the description
+            buffer[0] = '\0';
+            while (fgets(buffer, sizeof(buffer), fp)) {
+                if (crm_starts_with(buffer, "#  ")
+                    || crm_starts_with(buffer, "#\t")) {
+                    /* '#' followed by a tab or more than one space indicates a
+                     * continuation of the long description.
+                     */
+                    offset += snprintf(description + offset, DESC_MAX - offset,
+                                       "%s", buffer + 1);
+                } else {
+                    /* This line is not part of the long description,
+                     * so continue with normal processing.
+                     */
+                    processed_line = FALSE;
+                    break;
+                }
+            }
+
+            // Make long description safe to use in XML
+            xml_l_dscrpt = (char *)xmlEncodeEntitiesReentrant(NULL, BAD_CAST(description));
+
+            if (processed_line) {
+                // We grabbed the line into the long description
+                continue;
+            }
+        }
+
+        // Stop if we leave the header block
+        if (crm_starts_with(buffer, LSB_INITSCRIPT_INFOEND_TAG)) {
+            break;
+        }
+        if (buffer[0] != '#') {
+            break;
+        }
+    }
+    fclose(fp);
+
+    *output = crm_strdup_printf(lsb_metadata_template, type,
+                                (xml_l_dscrpt? xml_l_dscrpt : type),
+                                (s_dscrpt? s_dscrpt : type),
+                                (provides? provides : ""),
+                                (req_start? req_start : ""),
+                                (req_stop? req_stop : ""),
+                                (shld_start? shld_start : ""),
+                                (shld_stop? shld_stop : ""),
+                                (dflt_start? dflt_start : ""),
+                                (dflt_stop? dflt_stop : ""));
+
+    lsb_meta_helper_free_value(xml_l_dscrpt);
+    lsb_meta_helper_free_value(s_dscrpt);
+    lsb_meta_helper_free_value(provides);
+    lsb_meta_helper_free_value(req_start);
+    lsb_meta_helper_free_value(req_stop);
+    lsb_meta_helper_free_value(shld_start);
+    lsb_meta_helper_free_value(shld_stop);
+    lsb_meta_helper_free_value(dflt_start);
+    lsb_meta_helper_free_value(dflt_stop);
+
+    crm_trace("Created fake metadata: %llu",
+              (unsigned long long) strlen(*output));
+    return pcmk_ok;
+}
+
+#if SUPPORT_NAGIOS
+static int
+nagios_get_metadata(const char *type, char **output)
+{
+    int rc = pcmk_ok;
+    FILE *file_strm = NULL;
+    int start = 0, length = 0, read_len = 0;
+    char *metadata_file = crm_strdup_printf("%s/%s.xml",
+                                            NAGIOS_METADATA_DIR, type);
+
+    file_strm = fopen(metadata_file, "r");
+    if (file_strm == NULL) {
+        crm_err("Metadata file %s does not exist", metadata_file);
+        free(metadata_file);
+        return -EIO;
+    }
+
+    /* see how big the file is */
+    start = ftell(file_strm);
+    fseek(file_strm, 0L, SEEK_END);
+    length = ftell(file_strm);
+    fseek(file_strm, 0L, start);
+
+    CRM_ASSERT(length >= 0);
+    CRM_ASSERT(start == ftell(file_strm));
+
+    if (length <= 0) {
+        crm_info("%s was not valid", metadata_file);
+        free(*output);
+        *output = NULL;
+        rc = -EIO;
+
+    } else {
+        crm_trace("Reading %d bytes from file", length);
+        *output = calloc(1, (length + 1));
+        read_len = fread(*output, 1, length, file_strm);
+        if (read_len != length) {
+            crm_err("Calculated and read bytes differ: %d vs. %d",
+                    length, read_len);
+            free(*output);
+            *output = NULL;
+            rc = -EIO;
+        }
+    }
+
+    fclose(file_strm);
+    free(metadata_file);
+    return rc;
+}
+#endif
+
+#if SUPPORT_HEARTBEAT
+/* strictly speaking, support for class=heartbeat style scripts
+ * does not require "heartbeat support" to be enabled.
+ * But since those scripts are part of the "heartbeat" package usually,
+ * and are very unlikely to be present in any other deployment,
+ * I leave it inside this ifdef.
+ *
+ * Yes, I know, these are legacy and should die,
+ * or at least be rewritten to be a proper OCF style agent.
+ * But they exist, and custom scripts following these rules do, too.
+ *
+ * Taken from the old "glue" lrmd, see
+ * http://hg.linux-ha.org/glue/file/0a7add1d9996/lib/plugins/lrm/raexechb.c#l49
+ * http://hg.linux-ha.org/glue/file/0a7add1d9996/lib/plugins/lrm/raexechb.c#l393
+ */
+
+static const char hb_metadata_template[] =
+    "<?xml version='1.0'?>\n"
+    "<!DOCTYPE resource-agent SYSTEM 'ra-api-1.dtd'>\n"
+    "<resource-agent name='%s' version='" PCMK_DEFAULT_AGENT_VERSION "'>\n"
+    "<version>1.0</version>\n"
+    "<longdesc lang='en'>\n"
+    "%s"
+    "</longdesc>\n"
+    "<shortdesc lang='en'>%s</shortdesc>\n"
+    "<parameters>\n"
+    "<parameter name='1' unique='1' required='0'>\n"
+    "<longdesc lang='en'>\n"
+    "This argument will be passed as the first argument to the "
+    "heartbeat resource agent (assuming it supports one)\n"
+    "</longdesc>\n"
+    "<shortdesc lang='en'>argv[1]</shortdesc>\n"
+    "<content type='string' default=' ' />\n"
+    "</parameter>\n"
+    "<parameter name='2' unique='1' required='0'>\n"
+    "<longdesc lang='en'>\n"
+    "This argument will be passed as the second argument to the "
+    "heartbeat resource agent (assuming it supports one)\n"
+    "</longdesc>\n"
+    "<shortdesc lang='en'>argv[2]</shortdesc>\n"
+    "<content type='string' default=' ' />\n"
+    "</parameter>\n"
+    "<parameter name='3' unique='1' required='0'>\n"
+    "<longdesc lang='en'>\n"
+    "This argument will be passed as the third argument to the "
+    "heartbeat resource agent (assuming it supports one)\n"
+    "</longdesc>\n"
+    "<shortdesc lang='en'>argv[3]</shortdesc>\n"
+    "<content type='string' default=' ' />\n"
+    "</parameter>\n"
+    "<parameter name='4' unique='1' required='0'>\n"
+    "<longdesc lang='en'>\n"
+    "This argument will be passed as the fourth argument to the "
+    "heartbeat resource agent (assuming it supports one)\n"
+    "</longdesc>\n"
+    "<shortdesc lang='en'>argv[4]</shortdesc>\n"
+    "<content type='string' default=' ' />\n"
+    "</parameter>\n"
+    "<parameter name='5' unique='1' required='0'>\n"
+    "<longdesc lang='en'>\n"
+    "This argument will be passed as the fifth argument to the "
+    "heartbeat resource agent (assuming it supports one)\n"
+    "</longdesc>\n"
+    "<shortdesc lang='en'>argv[5]</shortdesc>\n"
+    "<content type='string' default=' ' />\n"
+    "</parameter>\n"
+    "</parameters>\n"
+    "<actions>\n"
+    "<action name='start'   timeout='15' />\n"
+    "<action name='stop'    timeout='15' />\n"
+    "<action name='status'  timeout='15' />\n"
+    "<action name='monitor' timeout='15' interval='15' start-delay='15' />\n"
+    "<action name='meta-data'  timeout='5' />\n"
+    "</actions>\n"
+    "<special tag='heartbeat'>\n"
+    "</special>\n"
+    "</resource-agent>\n";
+
+static int
+heartbeat_get_metadata(const char *type, char **output)
+{
+    *output = crm_strdup_printf(hb_metadata_template, type, type, type);
+    crm_trace("Created fake metadata: %llu",
+              (unsigned long long) strlen(*output));
+    return pcmk_ok;
+}
+#endif
+
+static gboolean
+action_get_metadata(svc_action_t *op)
+{
+    const char *class = op->standard;
+
+    if (op->agent == NULL) {
+        crm_err("meta-data requested without specifying agent");
+        return FALSE;
+    }
+
+    if (class == NULL) {
+        crm_err("meta-data requested for agent %s without specifying class",
+                op->agent);
+        return FALSE;
+    }
+
+    if (!strcmp(class, PCMK_RESOURCE_CLASS_SERVICE)) {
+        class = resources_find_service_class(op->agent);
+    }
+
+    if (class == NULL) {
+        crm_err("meta-data requested for %s, but could not determine class",
+                op->agent);
+        return FALSE;
+    }
+
+    if (safe_str_eq(class, PCMK_RESOURCE_CLASS_LSB)) {
+        return (lsb_get_metadata(op->agent, &op->stdout_data) >= 0);
+    }
+
+#if SUPPORT_NAGIOS
+    if (safe_str_eq(class, PCMK_RESOURCE_CLASS_NAGIOS)) {
+        return (nagios_get_metadata(op->agent, &op->stdout_data) >= 0);
+    }
+#endif
+
+#if SUPPORT_HEARTBEAT
+    if (safe_str_eq(class, PCMK_RESOURCE_CLASS_HB)) {
+        return (heartbeat_get_metadata(op->agent, &op->stdout_data) >= 0);
+    }
+#endif
+
+    return action_exec_helper(op);
+}
+
 gboolean
 services_action_sync(svc_action_t * op)
 {
@@ -710,18 +1323,21 @@ services_action_sync(svc_action_t * op)
     }
 
     op->synchronous = true;
-    if (op->standard && strcasecmp(op->standard, "upstart") == 0) {
-#if SUPPORT_UPSTART
-        rc = upstart_job_exec(op, TRUE);
-#endif
-    } else if (op->standard && strcasecmp(op->standard, "systemd") == 0) {
-#if SUPPORT_SYSTEMD
-        rc = systemd_unit_exec(op);
-#endif
+
+    if (safe_str_eq(op->action, "meta-data")) {
+        /* Synchronous meta-data operations are handled specially. Since most
+         * resource classes don't provide any meta-data, it has to be
+         * synthesized from available information about the agent.
+         *
+         * services_action_async() doesn't treat meta-data actions specially, so
+         * it will result in an error for classes that don't support the action.
+         */
+        rc = action_get_metadata(op);
     } else {
-        rc = services_os_action_execute(op, TRUE);
+        rc = action_exec_helper(op);
     }
-    crm_trace(" > %s_%s_%d: %s = %d", op->rsc, op->action, op->interval, op->opaque->exec, op->rc);
+    crm_trace(" > %s_%s_%d: %s = %d",
+              op->rsc, op->action, op->interval, op->opaque->exec, op->rc);
     if (op->stdout_data) {
         crm_trace(" >  stdout: %s", op->stdout_data);
     }
@@ -740,7 +1356,7 @@ get_directory_list(const char *root, gboolean files, gboolean executable)
 GList *
 services_list(void)
 {
-    return resources_list_agents("lsb", NULL);
+    return resources_list_agents(PCMK_RESOURCE_CLASS_LSB, NULL);
 }
 
 #if SUPPORT_HEARTBEAT
@@ -757,40 +1373,39 @@ resources_list_standards(void)
     GList *standards = NULL;
     GList *agents = NULL;
 
-    standards = g_list_append(standards, strdup("ocf"));
-    standards = g_list_append(standards, strdup("lsb"));
-    standards = g_list_append(standards, strdup("service"));
+    standards = g_list_append(standards, strdup(PCMK_RESOURCE_CLASS_OCF));
+    standards = g_list_append(standards, strdup(PCMK_RESOURCE_CLASS_LSB));
+    standards = g_list_append(standards, strdup(PCMK_RESOURCE_CLASS_SERVICE));
 
 #if SUPPORT_SYSTEMD
     agents = systemd_unit_listall();
-#else
-    agents = NULL;
-#endif
-
     if (agents) {
-        standards = g_list_append(standards, strdup("systemd"));
+        standards = g_list_append(standards,
+                                  strdup(PCMK_RESOURCE_CLASS_SYSTEMD));
         g_list_free_full(agents, free);
     }
+#endif
+
 #if SUPPORT_UPSTART
     agents = upstart_job_listall();
-#else
-    agents = NULL;
-#endif
-
     if (agents) {
-        standards = g_list_append(standards, strdup("upstart"));
+        standards = g_list_append(standards,
+                                  strdup(PCMK_RESOURCE_CLASS_UPSTART));
         g_list_free_full(agents, free);
     }
+#endif
+
 #if SUPPORT_NAGIOS
     agents = resources_os_list_nagios_agents();
     if (agents) {
-        standards = g_list_append(standards, strdup("nagios"));
+        standards = g_list_append(standards,
+                                  strdup(PCMK_RESOURCE_CLASS_NAGIOS));
         g_list_free_full(agents, free);
     }
 #endif
 
 #if SUPPORT_HEARTBEAT
-    standards = g_list_append(standards, strdup("heartbeat"));
+    standards = g_list_append(standards, strdup(PCMK_RESOURCE_CLASS_HB));
 #endif
 
     return standards;
@@ -799,7 +1414,7 @@ resources_list_standards(void)
 GList *
 resources_list_providers(const char *standard)
 {
-    if (strcasecmp(standard, "ocf") == 0) {
+    if (crm_provider_required(standard)) {
         return resources_os_list_ocf_providers();
     }
 
@@ -809,7 +1424,9 @@ resources_list_providers(const char *standard)
 GList *
 resources_list_agents(const char *standard, const char *provider)
 {
-    if (standard == NULL || strcasecmp(standard, "service") == 0) {
+    if ((standard == NULL)
+        || (strcasecmp(standard, PCMK_RESOURCE_CLASS_SERVICE) == 0)) {
+
         GList *tmp1;
         GList *tmp2;
         GList *result = resources_os_list_lsb_agents();
@@ -839,24 +1456,24 @@ resources_list_agents(const char *standard, const char *provider)
 
         return result;
 
-    } else if (strcasecmp(standard, "ocf") == 0) {
+    } else if (strcasecmp(standard, PCMK_RESOURCE_CLASS_OCF) == 0) {
         return resources_os_list_ocf_agents(provider);
-    } else if (strcasecmp(standard, "lsb") == 0) {
+    } else if (strcasecmp(standard, PCMK_RESOURCE_CLASS_LSB) == 0) {
         return resources_os_list_lsb_agents();
 #if SUPPORT_HEARTBEAT
-    } else if (strcasecmp(standard, "heartbeat") == 0) {
+    } else if (strcasecmp(standard, PCMK_RESOURCE_CLASS_HB) == 0) {
         return resources_os_list_hb_agents();
 #endif
 #if SUPPORT_SYSTEMD
-    } else if (strcasecmp(standard, "systemd") == 0) {
+    } else if (strcasecmp(standard, PCMK_RESOURCE_CLASS_SYSTEMD) == 0) {
         return systemd_unit_listall();
 #endif
 #if SUPPORT_UPSTART
-    } else if (strcasecmp(standard, "upstart") == 0) {
+    } else if (strcasecmp(standard, PCMK_RESOURCE_CLASS_UPSTART) == 0) {
         return upstart_job_listall();
 #endif
 #if SUPPORT_NAGIOS
-    } else if (strcasecmp(standard, "nagios") == 0) {
+    } else if (strcasecmp(standard, PCMK_RESOURCE_CLASS_NAGIOS) == 0) {
         return resources_os_list_nagios_agents();
 #endif
     }

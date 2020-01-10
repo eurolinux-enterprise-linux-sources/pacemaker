@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2013 Andrew Beekhof <andrew@beekhof.net>
+ * Copyright (C) 2013-2017 Andrew Beekhof <andrew@beekhof.net>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -16,20 +16,47 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
-cib_t *the_cib;
-GMainLoop *mloop;
-bool shutting_down;
+#include <attrd_common.h>
+
+typedef struct attribute_s {
+    char *uuid; /* TODO: Remove if at all possible */
+    char *id;
+    char *set;
+    GHashTable *values;
+    int update;
+    int timeout_ms;
+
+    /* TODO: refactor these three as a bitmask */
+    bool changed; /* whether attribute value has changed since last write */
+    bool unknown_peer_uuids; /* whether we know we're missing a peer uuid */
+    gboolean is_private; /* whether to keep this attribute out of the CIB */
+
+    mainloop_timer_t *timer;
+
+    char *user;
+
+} attribute_t;
+
+typedef struct attribute_value_s {
+        uint32_t nodeid;
+        gboolean is_remote;
+        char *nodename;
+        char *current;
+        char *requested;
+} attribute_value_t;
+
 crm_cluster_t *attrd_cluster;
 GHashTable *attributes;
 election_t *writer;
-int attrd_error;
 
 #define attrd_send_ack(client, id, flags) \
     crm_ipcs_send_ack((client), (id), (flags), "ack", __FUNCTION__, __LINE__)
 
-void write_attributes(bool all, bool peer_discovered);
+void write_attributes(bool all);
+void attrd_broadcast_protocol(void);
 void attrd_peer_message(crm_node_t *client, xmlNode *msg);
 void attrd_client_peer_remove(const char *client_name, xmlNode *xml);
+void attrd_client_clear_failure(xmlNode *xml);
 void attrd_client_update(xmlNode *xml);
 void attrd_client_refresh(void);
 void attrd_client_query(crm_client_t *client, uint32_t id, uint32_t flags, xmlNode *query);

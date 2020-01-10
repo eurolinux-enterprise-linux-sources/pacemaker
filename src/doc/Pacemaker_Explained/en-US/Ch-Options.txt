@@ -80,7 +80,7 @@ user with the "correct" ones.
 To change the ones that can be specified by the user,
 for example +admin_epoch+, one should use:
 ----
-# cibadmin --modify --crm_xml '<cib admin_epoch="42"/>'
+# cibadmin --modify --xml-text '<cib admin_epoch="42"/>'
 ----
 
 A complete set of CIB properties will look something like this:
@@ -149,13 +149,13 @@ What to do when the cluster does not have quorum.  Allowed values:
 * +stop:+ stop all resources in the affected cluster partition
 * +suicide:+ fence all nodes in the affected cluster partition
 
-| batch-limit | 30 |
+| batch-limit | 0 '(30 before version 1.1.11)' |
 indexterm:[batch-limit,Cluster Option]
 indexterm:[Cluster,Option,batch-limit]
-The number of jobs that the Transition Engine (TE) is allowed to execute in
-parallel. The TE is the logic in pacemaker's CRMd that executes the actions
-determined by the Policy Engine (PE). The "correct" value will depend on the
-speed and load of your network and cluster nodes.
+The maximum number of actions that the cluster may execute in parallel across
+all nodes. The "correct" value will depend on the speed and load of your
+network and cluster nodes. If zero, the cluster will impose a dynamically
+calculated limit only when any node has high load.
 
 | migration-limit | -1 |
 indexterm:[migration-limit,Cluster Option]
@@ -176,7 +176,9 @@ Should the cluster stop all resources?
 | stop-orphan-resources | TRUE |
 indexterm:[stop-orphan-resources,Cluster Option]
 indexterm:[Cluster,Option,stop-orphan-resources]
-Should deleted resources be stopped?
+ Should deleted resources be stopped? This value takes precedence over
+ +is-managed+ (i.e. even unmanaged resources will be stopped if deleted from
+ the configuration when this value is TRUE).
 
 | stop-orphan-actions | TRUE |
 indexterm:[stop-orphan-actions,Cluster Option]
@@ -187,9 +189,9 @@ Should deleted actions be cancelled?
 indexterm:[start-failure-is-fatal,Cluster Option]
 indexterm:[Cluster,Option,start-failure-is-fatal]
 Should a failure to start a resource on a particular node prevent further start
-attempts on that node? If FALSE, the cluster will decide whether to try
-starting on the same node again based on the resource's current failure count
-and +migration-threshold+ (see <<s-failure-migration>>).
+attempts on that node? If FALSE, the cluster will decide whether the same
+node is still eligible based on the resource's current failure count
+and +migration-threshold+ (see <<s-failure-handling>>).
 
 | enable-startup-probes | TRUE |
 indexterm:[enable-startup-probes,Cluster Option]
@@ -227,10 +229,17 @@ indexterm:[stonith-timeout,Cluster Option]
 indexterm:[Cluster,Option,stonith-timeout]
 How long to wait for STONITH actions (reboot, on, off) to complete
 
+| stonith-max-attempts | 10 |
+indexterm:[stonith-max-attempts,Cluster Option]
+indexterm:[Cluster,Option,stonith-max-attempts]
+How many times fencing can fail for a target before the cluster will no longer
+immediately re-attempt it. '(since 1.1.17)'
+
 | concurrent-fencing | FALSE |
 indexterm:[concurrent-fencing,Cluster Option]
 indexterm:[Cluster,Option,concurrent-fencing]
 Is the cluster allowed to initiate multiple fence actions concurrently?
+'(since 1.1.15)'
 
 | cluster-delay | 60s |
 indexterm:[cluster-delay,Cluster Option]
@@ -260,6 +269,15 @@ take effect, we can optionally poll the cluster's status for changes. A value
 of 0 disables polling. Positive values are an interval (in seconds unless other
 SI units are specified, e.g. 5min).
 
+| cluster-ipc-limit | 500 |
+indexterm:[cluster-ipc-limit,Cluster Option]
+indexterm:[Cluster,Option,cluster-ipc-limit]
+The maximum IPC message backlog before one cluster daemon will disconnect
+another. This is of use in large clusters, for which a good value is the number
+of resources in the cluster multiplied by the number of nodes. The default of
+500 is also the minimum. Raise this if you see "Evicting client" messages for
+cluster daemon PIDs in the logs.
+
 | pe-error-series-max | -1 |
 indexterm:[pe-error-series-max,Cluster Option]
 indexterm:[Cluster,Option,pe-error-series-max]
@@ -277,6 +295,44 @@ indexterm:[pe-input-series-max,Cluster Option]
 indexterm:[Cluster,Option,pe-input-series-max]
 The number of "normal" PE inputs to save. Used when reporting problems.
 A value of -1 means unlimited (report all).
+
+| placement-strategy | default |
+indexterm:[placement-strategy,Cluster Option]
+indexterm:[Cluster,Option,placement-strategy]
+ How the cluster should allocate resources to nodes (see <<s-utilization>>).
+ Allowed values are +default+, +utilization+, +balanced+, and +minimal+.
+ '(since 1.1.0)'
+
+| node-health-strategy | none |
+indexterm:[node-health-strategy,Cluster Option]
+indexterm:[Cluster,Option,node-health-strategy]
+ How the cluster should react to node health attributes (see <<s-node-health>>).
+ Allowed values are +none+, +migrate-on-red+, +only-green+, +progressive+, and
+ +custom+.
+
+| node-health-base | 0 |
+indexterm:[node-health-base,Cluster Option]
+indexterm:[Cluster,Option,node-health-base]
+ The base health score assigned to a node. Only used when
+ +node-health-strategy+ is +progressive+. '(since 1.1.16)'
+
+| node-health-green | 0 |
+indexterm:[node-health-green,Cluster Option]
+indexterm:[Cluster,Option,node-health-green]
+ The score to use for a node health attribute whose value is +green+.
+ Only used when +node-health-strategy+ is +progressive+ or +custom+.
+
+| node-health-yellow | 0 |
+indexterm:[node-health-yellow,Cluster Option]
+indexterm:[Cluster,Option,node-health-yellow]
+ The score to use for a node health attribute whose value is +yellow+.
+ Only used when +node-health-strategy+ is +progressive+ or +custom+.
+
+| node-health-red | 0 |
+indexterm:[node-health-red,Cluster Option]
+indexterm:[Cluster,Option,node-health-red]
+ The score to use for a node health attribute whose value is +red+.
+ Only used when +node-health-strategy+ is +progressive+ or +custom+.
 
 | remove-after-stop | FALSE |
 indexterm:[remove-after-stop,Cluster Option]

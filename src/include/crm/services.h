@@ -33,6 +33,7 @@ extern "C" {
 #  include <stdio.h>
 #  include <string.h>
 #  include <stdbool.h>
+#  include <sys/types.h>
 
 #  ifndef OCF_ROOT_DIR
 #    define OCF_ROOT_DIR "/usr/lib/ocf"
@@ -47,10 +48,20 @@ extern "C" {
 #    define SYSTEMCTL "/bin/systemctl"
 #  endif
 
+/* Deprecated and unused by Pacemaker, kept for API backward compatibility */
 #  ifndef SERVICE_SCRIPT
 #    define SERVICE_SCRIPT "/sbin/service"
 #  endif
 
+/* Known resource classes */
+#define PCMK_RESOURCE_CLASS_OCF     "ocf"
+#define PCMK_RESOURCE_CLASS_SERVICE "service"
+#define PCMK_RESOURCE_CLASS_LSB     "lsb"
+#define PCMK_RESOURCE_CLASS_SYSTEMD "systemd"
+#define PCMK_RESOURCE_CLASS_UPSTART "upstart"
+#define PCMK_RESOURCE_CLASS_HB      "heartbeat"
+#define PCMK_RESOURCE_CLASS_NAGIOS  "nagios"
+#define PCMK_RESOURCE_CLASS_STONITH "stonith"
 
 /* This is the string passed in the OCF_EXIT_REASON_PREFIX
  * environment variable. The stderr output that occurs
@@ -58,7 +69,9 @@ extern "C" {
  * reason for a completed operationt */
 #define PCMK_OCF_REASON_PREFIX "ocf-exit-reason:"
 
-/* *INDENT-OFF* */
+// Agent version to use if agent doesn't specify one
+#define PCMK_DEFAULT_AGENT_VERSION "0.1"
+
 enum lsb_exitcode {
     PCMK_LSB_OK                  = 0,
     PCMK_LSB_UNKNOWN_ERROR       = 1,
@@ -104,8 +117,8 @@ enum ocf_exitcode {
     /* 150-199	reserved for application use */
     PCMK_OCF_CONNECTION_DIED = 189, /* Operation failure implied by disconnection of the LRM API to a local or remote node */
 
-    PCMK_OCF_DEGRADED        = 190, /* Active reasource that is no longer 100% functional */
-    PCMK_OCF_DEGRADED_MASTER = 191, /* Promoted reasource that is no longer 100% functional */
+    PCMK_OCF_DEGRADED        = 190, /* Active resource that is no longer 100% functional */
+    PCMK_OCF_DEGRADED_MASTER = 191, /* Promoted resource that is no longer 100% functional */
 
     PCMK_OCF_EXEC_ERROR    = 192, /* Generic problem invoking the agent */
     PCMK_OCF_UNKNOWN       = 193, /* State of the service is unknown - used for recording in-flight operations */
@@ -145,45 +158,42 @@ enum svc_action_flags {
     SVC_ACTION_LEAVE_GROUP = 0x01,
 };
 
-/* *INDENT-ON* */
+typedef struct svc_action_private_s svc_action_private_t;
+typedef struct svc_action_s {
+    char *id;
+    char *rsc;
+    char *action;
+    int interval;
 
-    typedef struct svc_action_private_s svc_action_private_t;
-    typedef struct svc_action_s {
-        char *id;
-        char *rsc;
-        char *action;
-        int interval;
+    char *standard;
+    char *provider;
+    char *agent;
 
-        char *standard;
-        char *provider;
-        char *agent;
+    int timeout;
+    GHashTable *params; /* used by OCF agents and alert agents */
 
-        int timeout;
-        GHashTable *params;
+    int rc;
+    int pid;
+    int cancel;
+    int status;
+    int sequence;
+    int expected_rc;
+    int synchronous;
+    enum svc_action_flags flags;
 
-        int rc;
-        int pid;
-        int cancel;
-        int status;
-        int sequence;
-        int expected_rc;
-        int synchronous;
-        enum svc_action_flags flags;
+    char *stderr_data;
+    char *stdout_data;
 
-        char *stderr_data;
-        char *stdout_data;
-
-    /**
+    /*!
      * Data stored by the creator of the action.
      *
      * This may be used to hold data that is needed later on by a callback,
      * for example.
      */
-        void *cb_data;
+    void *cb_data;
 
-        svc_action_private_t *opaque;
-
-    } svc_action_t;
+    svc_action_private_t *opaque;
+} svc_action_t;
 
 /**
  * \brief Get a list of files or directories in a given path
@@ -266,12 +276,6 @@ enum svc_action_flags {
  */
     gboolean services_action_kick(const char *name, const char *action, int interval /* ms */);
 
-/**
- * Find the first class that can provide service::${agent}
- *
- * \param[in] agent which agent to search for
- * \return NULL, or the first class that provides the named agent
- */
     const char *resources_find_service_class(const char *agent);
 
 /**
@@ -290,8 +294,8 @@ enum svc_action_flags {
     svc_action_t *services_action_create_generic(const char *exec, const char *args[]);
 
     void services_action_cleanup(svc_action_t * op);
-
     void services_action_free(svc_action_t * op);
+    int services_action_user(svc_action_t *op, const char *user);
 
     gboolean services_action_sync(svc_action_t * op);
 
@@ -307,6 +311,13 @@ enum svc_action_flags {
     gboolean services_action_async(svc_action_t * op, void (*action_callback) (svc_action_t *));
 
     gboolean services_action_cancel(const char *name, const char *action, int interval);
+
+/* functions for alert agents */
+svc_action_t *services_alert_create(const char *id, const char *exec,
+                                   int timeout, GHashTable *params,
+                                   int sequence, void *cb_data);
+gboolean services_alert_async(svc_action_t *action,
+                              void (*cb)(svc_action_t *op));
 
     static inline const char *services_lrm_status_str(enum op_status status) {
         switch (status) {

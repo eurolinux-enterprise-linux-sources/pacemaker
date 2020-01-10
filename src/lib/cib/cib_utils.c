@@ -274,7 +274,7 @@ cib_acl_enabled(xmlNode *xml, const char *user)
 #if ENABLE_ACL
     if(pcmk_acl_required(user)) {
         const char *value = NULL;
-        GHashTable *options = g_hash_table_new_full(crm_str_hash, g_str_equal, g_hash_destroy_str, g_hash_destroy_str);
+        GHashTable *options = crm_str_table_new();
 
         cib_read_config(options, xml);
         value = cib_pref(options, "enable-acl");
@@ -282,7 +282,7 @@ cib_acl_enabled(xmlNode *xml, const char *user)
         g_hash_table_destroy(options);
     }
 
-    crm_debug("CIB ACL is %s", rc ? "enabled" : "disabled");
+    crm_trace("CIB ACL is %s", rc ? "enabled" : "disabled");
 #endif
     return rc;
 }
@@ -502,7 +502,7 @@ cib_perform_op(const char *op, int call_options, cib_op_t * fn, gboolean is_quer
     if (safe_str_eq(section, XML_CIB_TAG_STATUS)) {
         /* Throttle the amount of costly validation we perform due to status updates
          * a) we don't really care whats in the status section
-         * b) we don't validate any of it's contents at the moment anyway
+         * b) we don't validate any of its contents at the moment anyway
          */
         check_dtd = FALSE;
     }
@@ -699,10 +699,26 @@ cib_native_notify(gpointer data, gpointer user_data)
 }
 
 pe_cluster_option cib_opts[] = {
-    /* name, old-name, validate, default, description */
-    {"enable-acl", NULL, "boolean", NULL, "false", &check_boolean,
-     "Enable CIB ACL", NULL}
-    ,
+    /*
+     * name, legacy name,
+     * type, allowed values, default, validator,
+     * short description,
+     * long description
+     */
+    {
+        "enable-acl", NULL,
+        "boolean", NULL, "false", &check_boolean,
+        "Enable CIB ACL",
+        NULL
+    },
+    {
+        "cluster-ipc-limit", NULL,
+        "integer", NULL, "500", &check_positive_number,
+        "Maximum IPC message backlog before disconnecting a cluster daemon",
+        "Raise this if log has \"Evicting client\" messages for cluster daemon"
+            " PIDs (a good value is the number of resources in the cluster"
+            " multiplied by the number of nodes)"
+    },
 };
 
 void
@@ -743,7 +759,7 @@ cib_read_config(GHashTable * options, xmlNode * current_cib)
     config = get_object_root(XML_CIB_TAG_CRMCONFIG, current_cib);
     if (config) {
         unpack_instance_attributes(current_cib, config, XML_CIB_TAG_PROPSET, NULL, options,
-                                   CIB_OPTIONS_FIRST, FALSE, now);
+                                   CIB_OPTIONS_FIRST, TRUE, now);
     }
 
     verify_cib_options(options);
@@ -794,23 +810,24 @@ cib_apply_patch_event(xmlNode * event, xmlNode * input, xmlNode ** output, int l
     return rc;
 }
 
+/* v2 and v2 patch formats */
+#define XPATH_CONFIG_CHANGE \
+    "//" XML_CIB_TAG_CRMCONFIG " | " \
+    "//" XML_DIFF_CHANGE "[contains(@" XML_DIFF_PATH ",'/" XML_CIB_TAG_CRMCONFIG "/')]"
+
 gboolean
-cib_internal_config_changed(xmlNode * diff)
+cib_internal_config_changed(xmlNode *diff)
 {
     gboolean changed = FALSE;
-    xmlXPathObject *xpathObj = NULL;
 
-    if (diff == NULL) {
-        return FALSE;
+    if (diff) {
+        xmlXPathObject *xpathObj = xpath_search(diff, XPATH_CONFIG_CHANGE);
+
+        if (numXpathResults(xpathObj) > 0) {
+            changed = TRUE;
+        }
+        freeXpathObject(xpathObj);
     }
-
-    xpathObj = xpath_search(diff, "//" XML_CIB_TAG_CRMCONFIG);
-    if (numXpathResults(xpathObj) > 0) {
-        changed = TRUE;
-    }
-
-    freeXpathObject(xpathObj);
-
     return changed;
 }
 

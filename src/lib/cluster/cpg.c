@@ -315,8 +315,7 @@ pcmk_message_common_cs(cpg_handle_t handle, uint32_t nodeid, uint32_t pid, void 
         goto badmsg;
 
     } else if (safe_str_eq("identify", data)) {
-        int pid = getpid();
-        char *pid_s = crm_itoa(pid);
+        char *pid_s = crm_getpid_s();
 
         send_cluster_text(crm_class_cluster, pid_s, TRUE, NULL, crm_msg_ais);
         free(pid_s);
@@ -466,7 +465,7 @@ cluster_connect_cpg(crm_cluster_t *cluster)
 
     cs_repeat(retries, 30, rc = cpg_initialize(&handle, &cpg_callbacks));
     if (rc != CS_OK) {
-        crm_err("Could not connect to the Cluster Process Group API: %d\n", rc);
+        crm_err("Could not connect to the Cluster Process Group API: %d", rc);
         goto bail;
     }
 
@@ -487,7 +486,7 @@ cluster_connect_cpg(crm_cluster_t *cluster)
 
     rc = cpg_fd_get(handle, &fd);
     if (rc != CS_OK) {
-        crm_err("Could not obtain the CPG API connection: %d\n", rc);
+        crm_err("Could not obtain the CPG API connection: %d", rc);
         goto bail;
     }
 
@@ -638,7 +637,7 @@ send_cluster_text(int class, const char *data,
     free(target);
 
 #if SUPPORT_PLUGIN
-    /* The plugin is the only time we dont use CPG messaging */
+    /* The plugin is the only time we don't use CPG messaging */
     if(get_cluster_type() == pcmk_cluster_classic_ais) {
         return send_plugin_text(class, iov);
     }

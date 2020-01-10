@@ -83,11 +83,11 @@ rsc2node_new(const char *id, resource_t * rsc,
 
 
         if (discover_mode == NULL || safe_str_eq(discover_mode, "always")) {
-            new_con->discover_mode = discover_always;
+            new_con->discover_mode = pe_discover_always;
         } else if (safe_str_eq(discover_mode, "never")) {
-            new_con->discover_mode = discover_never;
+            new_con->discover_mode = pe_discover_never;
         } else if (safe_str_eq(discover_mode, "exclusive")) {
-            new_con->discover_mode = discover_exclusive;
+            new_con->discover_mode = pe_discover_exclusive;
             rsc->exclusive_discover = TRUE;
         } else {
             pe_err("Invalid %s value %s in location constraint", XML_LOCATION_ATTR_DISCOVERY, discover_mode);
@@ -96,7 +96,7 @@ rsc2node_new(const char *id, resource_t * rsc,
         if (foo_node != NULL) {
             node_t *copy = node_copy(foo_node);
 
-            copy->weight = merge_weights(node_weight, foo_node->weight);
+            copy->weight = node_weight;
             new_con->node_list_rh = g_list_prepend(NULL, copy);
         }
 
@@ -184,20 +184,26 @@ sort_node_weight(gconstpointer a, gconstpointer b, gpointer data)
 
     if (safe_str_eq(pe_dataset->placement_strategy, "balanced")) {
         result = compare_capacity(node1, node2);
-        if (result != 0) {
-            return result;
+        if (result < 0) {
+            crm_trace("%s > %s : capacity (%d)",
+                      node1->details->uname, node2->details->uname, result);
+            return -1;
+        } else if (result > 0) {
+            crm_trace("%s < %s : capacity (%d)",
+                      node1->details->uname, node2->details->uname, result);
+            return 1;
         }
     }
 
     /* now try to balance resources across the cluster */
     if (node1->details->num_resources < node2->details->num_resources) {
-        crm_trace("%s (%d) < %s (%d) : resources",
+        crm_trace("%s (%d) > %s (%d) : resources",
                   node1->details->uname, node1->details->num_resources,
                   node2->details->uname, node2->details->num_resources);
         return -1;
 
     } else if (node1->details->num_resources > node2->details->num_resources) {
-        crm_trace("%s (%d) > %s (%d) : resources",
+        crm_trace("%s (%d) < %s (%d) : resources",
                   node1->details->uname, node1->details->num_resources,
                   node2->details->uname, node2->details->num_resources);
         return 1;
@@ -209,7 +215,7 @@ sort_node_weight(gconstpointer a, gconstpointer b, gpointer data)
                   node2->details->uname, node2->details->num_resources);
         return -1;
     } else if (active && active->details == node2->details) {
-        crm_trace("%s (%d) > %s (%d) : active",
+        crm_trace("%s (%d) < %s (%d) : active",
                   node1->details->uname, node1->details->num_resources,
                   node2->details->uname, node2->details->num_resources);
         return 1;
@@ -242,13 +248,24 @@ native_assign_node(resource_t * rsc, GListPtr nodes, node_t * chosen, gboolean f
 {
     CRM_ASSERT(rsc->variant == pe_native);
 
-    if (force == FALSE
-        && chosen != NULL && (can_run_resources(chosen) == FALSE || chosen->weight < 0)) {
-        crm_debug("All nodes for resource %s are unavailable"
-                  ", unclean or shutting down (%s: %d, %d)",
-                  rsc->id, chosen->details->uname, can_run_resources(chosen), chosen->weight);
-        rsc->next_role = RSC_ROLE_STOPPED;
-        chosen = NULL;
+    if (force == FALSE && chosen != NULL) {
+        bool unset = FALSE;
+
+        if(chosen->weight < 0) {
+            unset = TRUE;
+
+            // Allow the graph to assume that the remote resource will come up
+        } else if(can_run_resources(chosen) == FALSE && !is_container_remote_node(chosen)) {
+            unset = TRUE;
+        }
+
+        if(unset) {
+            crm_debug("All nodes for resource %s are unavailable"
+                      ", unclean or shutting down (%s: %d, %d)",
+                      rsc->id, chosen->details->uname, can_run_resources(chosen), chosen->weight);
+            rsc->next_role = RSC_ROLE_STOPPED;
+            chosen = NULL;
+        }
     }
 
     /* todo: update the old node for each resource to reflect its
@@ -271,10 +288,11 @@ native_assign_node(resource_t * rsc, GListPtr nodes, node_t * chosen, gboolean f
 
             crm_debug("Processing %s", op->uuid);
             if(safe_str_eq(RSC_STOP, op->task)) {
-                update_action_flags(op, pe_action_optional | pe_action_clear);
+                update_action_flags(op, pe_action_optional | pe_action_clear, __FUNCTION__, __LINE__);
 
             } else if(safe_str_eq(RSC_START, op->task)) {
-                update_action_flags(op, pe_action_runnable | pe_action_clear);
+                update_action_flags(op, pe_action_runnable | pe_action_clear, __FUNCTION__, __LINE__);
+                /* set_bit(rsc->flags, pe_rsc_block); */
 
             } else if(interval && safe_str_neq(interval, "0")) {
                 if(safe_str_eq(rc_inactive, g_hash_table_lookup(op->meta, XML_ATTR_TE_TARGET_RC))) {
@@ -282,7 +300,7 @@ native_assign_node(resource_t * rsc, GListPtr nodes, node_t * chosen, gboolean f
 
                 } else {
                     /* Normal monitor operation, cancel it */
-                    update_action_flags(op, pe_action_runnable | pe_action_clear);
+                    update_action_flags(op, pe_action_runnable | pe_action_clear, __FUNCTION__, __LINE__);
                 }
             }
         }
@@ -409,4 +427,16 @@ can_run_any(GHashTable * nodes)
     }
 
     return FALSE;
+}
+
+pe_action_t *
+create_pseudo_resource_op(resource_t * rsc, const char *task, bool optional, bool runnable, pe_working_set_t *data_set)
+{
+    pe_action_t *action = custom_action(rsc, generate_op_key(rsc->id, task, 0), task, NULL, optional, TRUE, data_set);
+    update_action_flags(action, pe_action_pseudo, __FUNCTION__, __LINE__);
+    update_action_flags(action, pe_action_runnable, __FUNCTION__, __LINE__);
+    if(runnable) {
+        update_action_flags(action, pe_action_runnable, __FUNCTION__, __LINE__);
+    }
+    return action;
 }

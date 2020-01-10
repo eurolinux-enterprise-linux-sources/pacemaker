@@ -67,6 +67,8 @@ typedef struct device_properties_s {
     int custom_action_timeout[st_phase_max];
     /* Action-specific maximum random delay for each phase */
     int delay_max[st_phase_max];
+    /* Action-specific base delay for each phase */
+    int delay_base[st_phase_max];
 } device_properties_t;
 
 typedef struct st_query_result_s {
@@ -256,7 +258,7 @@ free_remote_op(gpointer data)
     free(op);
 }
 
-/*
+/*!
  * \internal
  * \brief Return an operation's originally requested action (before any remap)
  *
@@ -270,7 +272,7 @@ op_requested_action(const remote_fencing_op_t *op)
     return ((op->phase > st_phase_requested)? "reboot" : op->action);
 }
 
-/*
+/*!
  * \internal
  * \brief Remap a "reboot" operation to the "off" phase
  *
@@ -635,7 +637,7 @@ topology_is_empty(stonith_topology_t *tp)
     return TRUE;
 }
 
-/*
+/*!
  * \internal
  * \brief Add a device to an operation's automatic unfencing list
  *
@@ -653,7 +655,7 @@ add_required_device(remote_fencing_op_t *op, const char *device)
     }
 }
 
-/*
+/*!
  * \internal
  * \brief Remove a device from the automatic unfencing list
  *
@@ -687,7 +689,7 @@ set_op_device_list(remote_fencing_op_t * op, GListPtr devices)
     op->devices = op->devices_list;
 }
 
-/*
+/*!
  * \internal
  * \brief Check whether a node matches a topology target
  *
@@ -720,7 +722,7 @@ topology_matches(const stonith_topology_t *tp, const char *node)
              * matching names of nodes to be targeted.
              */
 
-            if (regcomp(&r_patt, tp->target_pattern, REG_EXTENDED)) {
+            if (regcomp(&r_patt, tp->target_pattern, REG_EXTENDED|REG_NOSUB)) {
                 crm_info("Bad regex '%s' for fencing level", tp->target);
             } else {
                 int status = regexec(&r_patt, node, 0, NULL, 0);
@@ -944,13 +946,14 @@ stonith_get_peer_name(unsigned int nodeid)
 
 /*!
  * \internal
- * \brief Create a new remote stonith op
- * \param client, he local stonith client id that initaited the operation
- * \param request, The request from the client that started the operation
- * \param peer, Is this operation owned by another stonith peer? Operations
- *        owned by other peers are stored on all the stonith nodes, but only the
- *        owner executes the operation.  All the nodes get the results to the operation
- *        once the owner finishes executing it.
+ * \brief Create a new remote stonith operation
+ *
+ * \param[in] client   ID of local stonith client that initiated the operation
+ * \param[in] request  The request from the client that started the operation
+ * \param[in] peer     TRUE if this operation is owned by another stonith peer
+ *                     (an operation owned by one peer is stored on all peers,
+ *                     but only the owner executes it; all nodes get the results
+ *                     once the owner finishes execution)
  */
 void *
 create_remote_stonith_op(const char *client, xmlNode * request, gboolean peer)
@@ -1377,7 +1380,7 @@ report_timeout_period(remote_fencing_op_t * op, int op_timeout)
     }
 }
 
-/*
+/*!
  * \internal
  * \brief Advance an operation to the next device in its topology
  *
@@ -1557,13 +1560,13 @@ call_remote_stonith(remote_fencing_op_t * op, st_query_result_t * peer)
         }
 
         if (op->state == st_query) {
-           crm_info("None of the %d peers have devices capable of fencing (%s) %s for %s (%d)",
+           crm_info("No peers (out of %d) have devices capable of fencing (%s) %s for %s (%d)",
                    op->replies, op->action, op->target, op->client_name,
                    op->state);
 
             rc = -ENODEV;
         } else {
-           crm_info("None of the %d peers are capable of fencing (%s) %s for %s (%d)",
+           crm_info("No peers (out of %d) are capable of fencing (%s) %s for %s (%d)",
                    op->replies, op->action, op->target, op->client_name,
                    op->state);
         }
@@ -1644,7 +1647,7 @@ all_topology_devices_found(remote_fencing_op_t * op)
     return TRUE;
 }
 
-/*
+/*!
  * \internal
  * \brief Parse action-specific device properties from XML
  *
@@ -1675,6 +1678,13 @@ parse_action_specific(xmlNode *xml, const char *peer, const char *device,
                   peer, device, props->delay_max[phase], action);
     }
 
+    props->delay_base[phase] = 0;
+    crm_element_value_int(xml, F_STONITH_DELAY_BASE, &props->delay_base[phase]);
+    if (props->delay_base[phase]) {
+        crm_trace("Peer %s with device %s returned base delay %d for %s",
+                  peer, device, props->delay_base[phase], action);
+    }
+
     /* Handle devices with automatic unfencing */
     if (safe_str_eq(action, "on")) {
         int required = 0;
@@ -1697,7 +1707,7 @@ parse_action_specific(xmlNode *xml, const char *peer, const char *device,
     }
 }
 
-/*
+/*!
  * \internal
  * \brief Parse one device's properties from peer's XML query reply
  *
@@ -1744,7 +1754,7 @@ add_device_properties(xmlNode *xml, remote_fencing_op_t *op,
     }
 }
 
-/*
+/*!
  * \internal
  * \brief Parse a peer's XML query reply and add it to operation's results
  *
@@ -1763,7 +1773,7 @@ add_result(remote_fencing_op_t *op, const char *host, int ndevices, xmlNode *xml
 
     CRM_CHECK(result != NULL, return NULL);
     result->host = strdup(host);
-    result->devices = g_hash_table_new_full(crm_str_hash, g_str_equal, free, free);
+    result->devices = crm_str_table_new();
 
     /* Each child element describes one capable device available to the peer */
     for (child = __xml_first_child(xml); child != NULL; child = __xml_next(child)) {
@@ -1783,7 +1793,7 @@ add_result(remote_fencing_op_t *op, const char *host, int ndevices, xmlNode *xml
     return result;
 }
 
-/*
+/*!
  * \internal
  * \brief Handle a peer's reply to our fencing query
  *
@@ -1882,7 +1892,7 @@ process_remote_stonith_query(xmlNode * msg)
     return pcmk_ok;
 }
 
-/*
+/*!
  * \internal
  * \brief Handle a peer's reply to a fencing request
  *

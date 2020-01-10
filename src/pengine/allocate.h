@@ -25,11 +25,6 @@
 #  include <crm/pengine/internal.h>
 #  include <pengine.h>
 
-typedef struct notify_entry_s {
-    resource_t *rsc;
-    node_t *node;
-} notify_entry_t;
-
 struct resource_alloc_functions_s {
     GHashTable *(*merge_weights) (resource_t *, const char *, GHashTable *, const char *, float,
                                   enum pe_weights);
@@ -57,6 +52,9 @@ extern GHashTable *rsc_merge_weights(resource_t * rsc, const char *rhs, GHashTab
 extern GHashTable *clone_merge_weights(resource_t * rsc, const char *rhs, GHashTable * nodes,
                                        const char *attr, float factor, enum pe_weights flags);
 
+extern GHashTable *container_merge_weights(resource_t * rsc, const char *rhs, GHashTable * nodes,
+                                       const char *attr, float factor, enum pe_weights flags);
+
 extern GHashTable *master_merge_weights(resource_t * rsc, const char *rhs, GHashTable * nodes,
                                         const char *attr, float factor, enum pe_weights flags);
 
@@ -80,8 +78,6 @@ extern enum pe_action_flags native_action_flags(action_t * action, node_t * node
 extern void native_rsc_location(resource_t * rsc, rsc_to_node_t * constraint);
 extern void native_expand(resource_t * rsc, pe_working_set_t * data_set);
 extern void native_dump(resource_t * rsc, const char *pre_text, gboolean details);
-extern void create_notify_element(resource_t * rsc, action_t * op,
-                                  notify_data_t * n_data, pe_working_set_t * data_set);
 extern gboolean native_create_probe(resource_t * rsc, node_t * node, action_t * complete,
                                     gboolean force, pe_working_set_t * data_set);
 extern void native_append_meta(resource_t * rsc, xmlNode * xml);
@@ -98,6 +94,21 @@ extern enum pe_action_flags group_action_flags(action_t * action, node_t * node)
 extern void group_rsc_location(resource_t * rsc, rsc_to_node_t * constraint);
 extern void group_expand(resource_t * rsc, pe_working_set_t * data_set);
 extern void group_append_meta(resource_t * rsc, xmlNode * xml);
+
+extern int container_num_allowed_nodes(resource_t * rsc);
+extern node_t *container_color(resource_t * rsc, node_t * preferred, pe_working_set_t * data_set);
+extern void container_create_actions(resource_t * rsc, pe_working_set_t * data_set);
+extern void container_internal_constraints(resource_t * rsc, pe_working_set_t * data_set);
+extern void container_rsc_colocation_lh(resource_t * lh_rsc, resource_t * rh_rsc,
+                                    rsc_colocation_t * constraint);
+extern void container_rsc_colocation_rh(resource_t * lh_rsc, resource_t * rh_rsc,
+                                    rsc_colocation_t * constraint);
+extern void container_rsc_location(resource_t * rsc, rsc_to_node_t * constraint);
+extern enum pe_action_flags container_action_flags(action_t * action, node_t * node);
+extern void container_expand(resource_t * rsc, pe_working_set_t * data_set);
+extern gboolean container_create_probe(resource_t * rsc, node_t * node, action_t * complete,
+                                   gboolean force, pe_working_set_t * data_set);
+extern void container_append_meta(resource_t * rsc, xmlNode * xml);
 
 extern int clone_num_allowed_nodes(resource_t * rsc);
 extern node_t *clone_color(resource_t * rsc, node_t * preferred, pe_working_set_t * data_set);
@@ -141,20 +152,12 @@ extern gboolean unpack_location(xmlNode * xml_obj, pe_working_set_t * data_set);
 
 extern gboolean unpack_rsc_ticket(xmlNode * xml_obj, pe_working_set_t * data_set);
 
-extern void LogActions(resource_t * rsc, pe_working_set_t * data_set, gboolean terminal);
+void LogNodeActions(pe_working_set_t * data_set, gboolean terminal);
+void LogActions(resource_t * rsc, pe_working_set_t * data_set, gboolean terminal);
+void container_LogActions(resource_t * rsc, pe_working_set_t * data_set, gboolean terminal);
 
 extern void cleanup_alloc_calculations(pe_working_set_t * data_set);
 
-extern notify_data_t *create_notification_boundaries(resource_t * rsc, const char *action,
-                                                     action_t * start, action_t * end,
-                                                     pe_working_set_t * data_set);
-
-extern void collect_notification_data(resource_t * rsc, gboolean state, gboolean activity,
-                                      notify_data_t * n_data);
-extern gboolean expand_notification_data(notify_data_t * n_data, pe_working_set_t * data_set);
-extern void create_notifications(resource_t * rsc, notify_data_t * n_data,
-                                 pe_working_set_t * data_set);
-extern void free_notification_data(notify_data_t * n_data);
 extern void rsc_stonith_ordering(resource_t * rsc, action_t * stonith_op,
                                  pe_working_set_t * data_set);
 
@@ -165,11 +168,16 @@ extern enum pe_graph_flags native_update_actions(action_t * first, action_t * th
 extern enum pe_graph_flags group_update_actions(action_t * first, action_t * then, node_t * node,
                                                 enum pe_action_flags flags,
                                                 enum pe_action_flags filter, enum pe_ordering type);
-extern enum pe_graph_flags clone_update_actions(action_t * first, action_t * then, node_t * node,
-                                                enum pe_action_flags flags,
-                                                enum pe_action_flags filter, enum pe_ordering type);
+extern enum pe_graph_flags container_update_actions(action_t * first, action_t * then, node_t * node,
+                                                    enum pe_action_flags flags,
+                                                    enum pe_action_flags filter, enum pe_ordering type);
 
-gboolean update_action_flags(action_t * action, enum pe_action_flags flags);
+gboolean update_action_flags(action_t * action, enum pe_action_flags flags, const char *source, int line);
 gboolean update_action(action_t * action);
+void complex_set_cmds(resource_t * rsc);
+
+void master_promotion_constraints(resource_t * rsc, pe_working_set_t * data_set);
+void clone_create_pseudo_actions(
+    resource_t * rsc, GListPtr children, notify_data_t **start_notify, notify_data_t **stop_notify,  pe_working_set_t * data_set);
 
 #endif

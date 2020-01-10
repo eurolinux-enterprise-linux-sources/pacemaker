@@ -18,18 +18,10 @@
 
 #include <crm_internal.h>
 
-#include <sys/param.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <signal.h>
-
 #include <crm/crm.h>
 #include <crm/cib.h>
-#include <crm/attrd.h>
-
 #include <crm/msg_xml.h>
 #include <crm/common/xml.h>
-
 #include <crm/cluster.h>
 
 #include <crmd_fsa.h>
@@ -170,7 +162,7 @@ gboolean
 is_timer_started(fsa_timer_t * timer)
 {
     if (timer->period_ms > 0) {
-        if (transition_timer->source_id == 0) {
+        if (timer->source_id == 0) {
             return FALSE;
         } else {
             return TRUE;
@@ -1001,127 +993,22 @@ erase_xpath_callback(xmlNode * msg, int call_id, int rc, xmlNode * output, void 
                         "Deletion of \"%s\": %s (rc=%d)", xpath, pcmk_strerror(rc), rc);
 }
 
+#define XPATH_STATUS_TAG "//node_state[@uname='%s']/%s"
+
 void
 erase_status_tag(const char *uname, const char *tag, int options)
 {
-    int rc = pcmk_ok;
-    char xpath[STATUS_PATH_MAX];
-    int cib_opts = cib_quorum_override | cib_xpath | options;
-
     if (fsa_cib_conn && uname) {
-        snprintf(xpath, STATUS_PATH_MAX, "//node_state[@uname='%s']/%s", uname, tag);
-        crm_info("Deleting xpath: %s", xpath);
-        rc = fsa_cib_conn->cmds->delete(fsa_cib_conn, xpath, NULL, cib_opts);
-        fsa_register_cib_callback(rc, FALSE, strdup(xpath), erase_xpath_callback);
+        int call_id;
+        char *xpath = crm_strdup_printf(XPATH_STATUS_TAG, uname, tag);
+
+        crm_info("Deleting %s status entries for %s " CRM_XS " xpath=%s",
+                 tag, uname, xpath);
+        call_id = fsa_cib_conn->cmds->delete(fsa_cib_conn, xpath, NULL,
+                                             cib_quorum_override | cib_xpath | options);
+        fsa_register_cib_callback(call_id, FALSE, xpath, erase_xpath_callback);
+        // CIB library handles freeing xpath
     }
-}
-
-crm_ipc_t *attrd_ipc = NULL;
-
-#if !HAVE_ATOMIC_ATTRD
-static int
-update_without_attrd(const char * host_uuid, const char * name, const char * value,
-                     const char * user_name, gboolean is_remote_node, char command)
-{
-    int call_opt = cib_none;
-
-    if (fsa_cib_conn == NULL) {
-        return -1;
-    }
-
-    call_opt = crmd_cib_smart_opt();
-
-    if (command == 'C') {
-        erase_status_tag(host_uuid, XML_TAG_TRANSIENT_NODEATTRS, call_opt);
-        return pcmk_ok;
-    }
-
-    crm_trace("updating status for host_uuid %s, %s=%s", host_uuid, name ? name : "<null>", value ? value : "<null>");
-    if (value) {
-        return update_attr_delegate(fsa_cib_conn, call_opt, XML_CIB_TAG_STATUS, host_uuid, NULL, NULL,
-                                    NULL, name, value, FALSE, user_name, is_remote_node ? "remote" : NULL);
-    } else {
-        return delete_attr_delegate(fsa_cib_conn, call_opt, XML_CIB_TAG_STATUS, host_uuid, NULL, NULL,
-                                    NULL, name, NULL, FALSE, user_name);
-    }
-}
-#endif
-
-static void
-update_attrd_helper(const char *host, const char *name, const char *value, const char *user_name, gboolean is_remote_node, char command)
-{
-    gboolean rc;
-    int max = 5;
-
-#if !HAVE_ATOMIC_ATTRD
-    /* Talk directly to cib for remote nodes if it's legacy attrd */
-    if (is_remote_node) {
-        /* host is required for updating a remote node */
-        CRM_CHECK(host != NULL, return;);
-        /* remote node uname and uuid are equal */
-        if (update_without_attrd(host, name, value, user_name, is_remote_node, command) < pcmk_ok) {
-            crm_err("Could not update attribute %s for remote-node %s", name, host);
-        }
-        return;
-    }
-#endif
-
-    if (attrd_ipc == NULL) {
-        attrd_ipc = crm_ipc_new(T_ATTRD, 0);
-    }
-
-    do {
-        if (crm_ipc_connected(attrd_ipc) == FALSE) {
-            crm_ipc_close(attrd_ipc);
-            crm_info("Connecting to attribute manager ... %d retries remaining", max);
-            if (crm_ipc_connect(attrd_ipc) == FALSE) {
-                crm_perror(LOG_INFO, "Connection to attribute manager failed");
-            }
-        }
-
-        rc = attrd_update_delegate(attrd_ipc, command, host, name, value, XML_CIB_TAG_STATUS, NULL,
-                                   NULL, user_name, is_remote_node?attrd_opt_remote:attrd_opt_none);
-        if (rc == pcmk_ok) {
-            break;
-
-        } else if (rc != -EAGAIN && rc != -EALREADY) {
-            crm_info("Disconnecting from attribute manager: %s (%d)", pcmk_strerror(rc), rc);
-            crm_ipc_close(attrd_ipc);
-        }
-
-        sleep(5 - max);
-
-    } while (max--);
-
-    if (rc != pcmk_ok) {
-        if (name) {
-            crm_err("Could not send attrd %s update%s: %s (%d)",
-                    name, is_set(fsa_input_register, R_SHUTDOWN) ? " at shutdown" : "",
-                    pcmk_strerror(rc), rc);
-
-        } else {
-            crm_err("Could not send attrd refresh%s: %s (%d)",
-                    is_set(fsa_input_register, R_SHUTDOWN) ? " at shutdown" : "",
-                    pcmk_strerror(rc), rc);
-        }
-
-        if (is_set(fsa_input_register, R_SHUTDOWN)) {
-            register_fsa_input(C_FSA_INTERNAL, I_FAIL, NULL);
-        }
-    }
-}
-
-void
-update_attrd(const char *host, const char *name, const char *value, const char *user_name, gboolean is_remote_node)
-{
-    update_attrd_helper(host, name, value, user_name, is_remote_node, 'U');
-}
-
-void
-update_attrd_remote_node_removed(const char *host, const char *user_name)
-{
-    crm_trace("telling attrd to clear attributes for remote host %s", host);
-    update_attrd_helper(host, NULL, NULL, user_name, TRUE, 'C');
 }
 
 void crmd_peer_down(crm_node_t *peer, bool full) 
@@ -1132,4 +1019,38 @@ void crmd_peer_down(crm_node_t *peer, bool full)
     }
     crm_update_peer_join(__FUNCTION__, peer, crm_join_none);
     crm_update_peer_expected(__FUNCTION__, peer, CRMD_JOINSTATE_DOWN);
+}
+
+#define MIN_CIB_OP_TIMEOUT (30)
+
+unsigned int
+cib_op_timeout()
+{
+    static int env_timeout = -1;
+    unsigned int calculated_timeout = 0;
+
+    if (env_timeout == -1) {
+        const char *env = getenv("PCMK_cib_timeout");
+
+        if (env) {
+            env_timeout = crm_parse_int(env, "0");
+        }
+        env_timeout = QB_MAX(env_timeout, MIN_CIB_OP_TIMEOUT);
+        crm_trace("Minimum CIB op timeout: %us (environment: %s)",
+                  env_timeout, (env? env : "none"));
+    }
+
+    calculated_timeout = 1 + crm_active_peers();
+    if (crm_remote_peer_cache) {
+        calculated_timeout += g_hash_table_size(crm_remote_peer_cache);
+    }
+    calculated_timeout *= 10;
+
+    calculated_timeout = QB_MAX(calculated_timeout, env_timeout);
+    crm_trace("Calculated timeout: %us", calculated_timeout);
+
+    if (fsa_cib_conn) {
+        fsa_cib_conn->call_timeout = calculated_timeout;
+    }
+    return calculated_timeout;
 }

@@ -6,7 +6,7 @@ num_errors=0
 num_passed=0
 GREP_OPTIONS=
 verbose=0
-tests="dates tools acls"
+tests="dates tools acls validity"
 
 function test_assert() {
     target=$1; shift
@@ -155,6 +155,18 @@ function test_tools() {
     cmd="cibadmin -Q -o nodes | grep node1-ram"
     test_assert 0
 
+    desc="Set a transient (fail-count) node attribute"
+    cmd="crm_attribute -n fail-count-foo -v 3 -N node1 -t status"
+    test_assert 0
+
+    desc="Query a fail count"
+    cmd="crm_failcount --query -r foo -N node1"
+    test_assert 0
+
+    desc="Delete a transient (fail-count) node attribute"
+    cmd="crm_attribute -n fail-count-foo -D -N node1 -t status"
+    test_assert 0
+
     desc="Digest calculation"
     cmd="cibadmin -Q | cibadmin -5 -p 2>&1 > /dev/null"
     test_assert 0
@@ -204,15 +216,11 @@ function test_tools() {
     cmd="crm_resource -L"
     test_assert 0
 
-    desc="Set a resource's fail-count"
-    cmd="crm_failcount -r dummy -v 10 -N node1"
-    test_assert 0
-
     desc="Require a destination when migrating a resource that is stopped"
     cmd="crm_resource -r dummy -M"
     test_assert 22
 
-    desc="Don't support migration to non-existant locations"
+    desc="Don't support migration to non-existent locations"
     cmd="crm_resource -r dummy -M -N i.dont.exist"
     test_assert 6
 
@@ -606,7 +614,7 @@ function test_acls() {
     $VALGRIND_CMD crm_shadow --batch --force --create-empty $shadow --validate-with pacemaker-1.3 2>&1
     export CIB_shadow=$shadow
 
-    cat<<EOF>/tmp/$$.acls.xml
+    cat <<EOF >/tmp/$$.acls.xml
     <acls>
       <acl_user id="l33t-haxor">
         <deny id="crook-nothing" xpath="/cib"/>
@@ -669,19 +677,96 @@ EOF
     test_acl_loop
 }
 
+function test_validity() {
+
+    export CIB_shadow_dir=$test_home
+    $VALGRIND_CMD crm_shadow --batch --force --create-empty $shadow --validate-with pacemaker-1.2 2>&1
+    export CIB_shadow=$shadow
+    export PCMK_trace_functions=update_validation,cli_config_update
+    export PCMK_stderr=1
+
+    cibadmin -C -o resources --xml-text '<primitive id="dummy1" class="ocf" provider="pacemaker" type="Dummy"/>'
+    cibadmin -C -o resources --xml-text '<primitive id="dummy2" class="ocf" provider="pacemaker" type="Dummy"/>'
+    cibadmin -C -o constraints --xml-text '<rsc_order id="ord_1-2" first="dummy1" first-action="start" then="dummy2"/>'
+    cibadmin -Q > /tmp/$$.good-1.2.xml
+
+
+    desc="Try to make resulting CIB invalid (enum violation)"
+    cmd="cibadmin -M -o constraints --xml-text '<rsc_order id=\"ord_1-2\" first=\"dummy1\" first-action=\"break\" then=\"dummy2\"/>'"
+    test_assert 203
+
+    sed 's|"start"|"break"|' /tmp/$$.good-1.2.xml > /tmp/$$.bad-1.2.xml
+    desc="Run crm_simulate with invalid CIB (enum violation)"
+    cmd="crm_simulate -x /tmp/$$.bad-1.2.xml -S"
+    test_assert 126 0
+
+
+    desc="Try to make resulting CIB invalid (unrecognized validate-with)"
+    cmd="cibadmin -M --xml-text '<cib validate-with=\"pacemaker-9999.0\"/>'"
+    test_assert 203
+
+    sed 's|"pacemaker-1.2"|"pacemaker-9999.0"|' /tmp/$$.good-1.2.xml > /tmp/$$.bad-1.2.xml
+    desc="Run crm_simulate with invalid CIB (unrecognized validate-with)"
+    cmd="crm_simulate -x /tmp/$$.bad-1.2.xml -S"
+    test_assert 126 0
+
+
+    desc="Try to make resulting CIB invalid, but possibly recoverable (valid with X.Y+1)"
+    cmd="cibadmin -C -o configuration --xml-text '<tags/>'"
+    test_assert 203
+
+    sed 's|</configuration>|<tags/>\0|' /tmp/$$.good-1.2.xml > /tmp/$$.bad-1.2.xml
+    desc="Run crm_simulate with invalid, but possibly recoverable CIB (valid with X.Y+1)"
+    cmd="crm_simulate -x /tmp/$$.bad-1.2.xml -S"
+    test_assert 0 0
+
+
+    sed 's|\s\s*validate-with="[^"]*"||' /tmp/$$.good-1.2.xml > /tmp/$$.bad-1.2.xml
+    desc="Make resulting CIB valid, although without validate-with attribute"
+    cmd="cibadmin -R --xml-file /tmp/$$.bad-1.2.xml"
+    test_assert 0
+
+    desc="Run crm_simulate with valid CIB, but without validate-with attribute"
+    cmd="crm_simulate -x /tmp/$$.bad-1.2.xml -S"
+    test_assert 0 0
+
+
+    # this will just disable validation and accept the config, outputting
+    # validation errors
+    sed -e 's|\s\s*validate-with="[^"]*"||' \
+        -e 's|\(\s\s*epoch="[^"]*\)"|\10"|' -e 's|"start"|"break"|' \
+        /tmp/$$.good-1.2.xml > /tmp/$$.bad-1.2.xml
+    desc="Make resulting CIB invalid, and without validate-with attribute"
+    cmd="cibadmin -R --xml-file /tmp/$$.bad-1.2.xml"
+    test_assert 0
+
+    desc="Run crm_simulate with invalid CIB, also without validate-with attribute"
+    cmd="crm_simulate -x /tmp/$$.bad-1.2.xml -S"
+    test_assert 0 0
+
+
+    rm -f /tmp/$$.good-1.2.xml /tmp/$$.bad-1.2.xml
+}
+
 for t in $tests; do
     echo "Testing $t"
     test_$t > $test_home/regression.$t.out
 
     sed -i -e 's/cib-last-written.*>/>/'\
-	-e 's/ last-run=\"[0-9]*\"//'	\
-	-e 's/crm_feature_set="[^"]*" //'\
-	-e 's/validate-with="[^"]*" //'\
-	-e 's/Created new pacemaker-.* configuration/Created new pacemaker configuration/'\
+        -e 's/ last-run=\"[0-9]*\"//'\
+        -e 's/crm_feature_set="[^"]*" //'\
+        -e 's/validate-with="[^"]*" //'\
+        -e 's/Created new pacemaker-.* configuration/Created new pacemaker configuration/'\
         -e 's/.*__xml_acl_check/__xml_acl_check/g'\
-	-e 's/.*__xml_acl_post_process/__xml_acl_post_process/g'\
-	-e 's/.*error: unpack_resources:/error: unpack_resources:/g'\
-	-e 's/ last-rc-change=\"[0-9]*\"//' $test_home/regression.$t.out
+        -e 's/.*__xml_acl_post_process/__xml_acl_post_process/g'\
+        -e 's/.*error: unpack_resources:/error: unpack_resources:/g'\
+        -e 's/ last-rc-change=\"[0-9]*\"//'\
+        -e 's|^/tmp/[0-9][0-9]*\.||'\
+        -e 's/^Entity: line [0-9][0-9]*: //'\
+        -e 's/schemas\.c:\([0-9][0-9]*\)/schemas.c:NNN/' \
+        -e 's/constraints\.:\([0-9][0-9]*\)/constraints.:NNN/' \
+        -e 's/\(validation ([0-9][0-9]* of \)[0-9][0-9]*\().*\)/\1X\2/' \
+	$test_home/regression.$t.out
 
     if [ $do_save = 1 ]; then
 	cp $test_home/regression.$t.out $test_home/regression.$t.exp
@@ -719,5 +804,9 @@ elif [ $failed = 1 ]; then
     exit 2
 else
     echo $num_passed tests passed
+    for t in $tests; do
+        rm -f "$test_home/regression.$t.out"
+    done
+    crm_shadow --force --delete $shadow >/dev/null 2>&1
     exit 0
 fi

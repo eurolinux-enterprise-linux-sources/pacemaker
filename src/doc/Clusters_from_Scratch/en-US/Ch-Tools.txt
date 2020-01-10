@@ -16,7 +16,7 @@ configuring a cluster, and pack them into one simple-to-use command
 line tool.
 
 They even allow you to queue up several changes at once and commit
-them atomically.
+them all at once.
 
 Two popular command-line shells are `pcs` and
 `crmsh`.  This edition of Clusters from Scratch is based on `pcs`.
@@ -26,13 +26,6 @@ Two popular command-line shells are `pcs` and
 The two shells share many concepts but the scope, layout and syntax
 does differ, so make sure you read the version of this guide that
 corresponds to the software installed on your system.
-===========
-
-[IMPORTANT]
-===========
-Since `pcs` has the ability to manage all aspects of the cluster (both
-corosync and pacemaker), it requires a specific cluster stack to be in
-use: corosync 2.0 or later with votequorum plus Pacemaker 1.1.8 or later.
 ===========
 
 == Explore pcs ==

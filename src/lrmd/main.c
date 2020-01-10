@@ -21,6 +21,10 @@
 
 #include <glib.h>
 #include <unistd.h>
+#include <signal.h>
+
+#include <sys/types.h>
+#include <sys/wait.h>
 
 #include <crm/crm.h>
 #include <crm/msg_xml.h>
@@ -219,7 +223,7 @@ int
 lrmd_server_send_reply(crm_client_t * client, uint32_t id, xmlNode * reply)
 {
 
-    crm_trace("sending reply to client (%s) with msg id %d", client->id, id);
+    crm_trace("Sending reply (%d) to client (%s)", id, client->id);
     switch (client->kind) {
         case CRM_CLIENT_IPC:
             return crm_ipcs_send(client, id, reply, FALSE);
@@ -228,34 +232,35 @@ lrmd_server_send_reply(crm_client_t * client, uint32_t id, xmlNode * reply)
             return lrmd_tls_send_msg(client->remote, reply, id, "reply");
 #endif
         default:
-            crm_err("Unknown lrmd client type %d", client->kind);
+            crm_err("Could not send reply: unknown client type %d",
+                    client->kind);
     }
-    return -1;
+    return -ENOTCONN;
 }
 
 int
 lrmd_server_send_notify(crm_client_t * client, xmlNode * msg)
 {
-    crm_trace("sending notify to client (%s)", client->id);
+    crm_trace("Sending notification to client (%s)", client->id);
     switch (client->kind) {
         case CRM_CLIENT_IPC:
             if (client->ipcs == NULL) {
-                crm_trace("Asked to send event to disconnected local client");
-                return -1;
+                crm_trace("Could not notify local client: disconnected");
+                return -ENOTCONN;
             }
             return crm_ipcs_send(client, 0, msg, crm_ipc_server_event);
 #ifdef ENABLE_PCMK_REMOTE
         case CRM_CLIENT_TLS:
             if (client->remote == NULL) {
-                crm_trace("Asked to send event to disconnected remote client");
-                return -1;
+                crm_trace("Could not notify remote client: disconnected");
+                return -ENOTCONN;
             }
             return lrmd_tls_send_msg(client->remote, msg, 0, "notify");
 #endif
         default:
-            crm_err("Unknown lrmd client type %d", client->kind);
+            crm_err("Could not notify client: unknown type %d", client->kind);
     }
-    return -1;
+    return -ENOTCONN;
 }
 
 /*!
@@ -270,7 +275,8 @@ lrmd_server_send_notify(crm_client_t * client, xmlNode * msg)
 static gboolean
 lrmd_exit(gpointer data)
 {
-    crm_info("Terminating with  %d clients", crm_hash_table_size(client_connections));
+    crm_info("Terminating with %d clients",
+             crm_hash_table_size(client_connections));
 
     if (stonith_api) {
         stonith_api->cmds->remove_notification(stonith_api, T_STONITH_NOTIFY_DISCONNECT);
@@ -288,6 +294,11 @@ lrmd_exit(gpointer data)
 
     crm_client_cleanup();
     g_hash_table_destroy(rsc_list);
+
+    if (mainloop) {
+        lrmd_drain_alerts(g_main_loop_get_context(mainloop));
+    }
+
     crm_exit(pcmk_ok);
     return FALSE;
 }
@@ -357,11 +368,144 @@ void handle_shutdown_ack()
         crm_info("Received shutdown ack");
         if (shutdown_ack_timer > 0) {
             g_source_remove(shutdown_ack_timer);
+            shutdown_ack_timer = 0;
         }
         return;
     }
 #endif
     crm_debug("Ignoring unexpected shutdown ack");
+}
+
+/*!
+ * \internal
+ * \brief Make short exit timer fire immediately
+ */
+void handle_shutdown_nack()
+{
+#ifdef ENABLE_PCMK_REMOTE
+    if (shutting_down) {
+        crm_info("Received shutdown nack");
+        if (shutdown_ack_timer > 0) {
+            g_source_remove(shutdown_ack_timer);
+            shutdown_ack_timer = g_timeout_add(0, lrmd_exit, NULL);
+        }
+        return;
+    }
+#endif
+    crm_debug("Ignoring unexpected shutdown nack");
+}
+
+
+static pid_t main_pid = 0;
+static void
+sigdone(void)
+{
+    exit(0);
+}
+
+static void
+sigreap(void)
+{
+    pid_t pid = 0;
+    int status;
+    do {
+        /*
+         * Opinions seem to differ as to what to put here:
+         *  -1, any child process
+         *  0,  any child process whose process group ID is equal to that of the calling process
+         */
+        pid = waitpid(-1, &status, WNOHANG);
+        if(pid == main_pid) {
+            /* Exit when pacemaker-remote exits and use the same return code */
+            if (WIFEXITED(status)) {
+                exit(WEXITSTATUS(status));
+            }
+            exit(1);
+        }
+
+    } while (pid > 0);
+}
+
+static struct {
+	int sig;
+	void (*handler)(void);
+} sigmap[] = {
+	{ SIGCHLD, sigreap },
+	{ SIGINT,  sigdone },
+};
+
+static void spawn_pidone(int argc, char **argv, char **envp)
+{
+    sigset_t set;
+
+    if (getpid() != 1) {
+        return;
+    }
+
+    sigfillset(&set);
+    sigprocmask(SIG_BLOCK, &set, 0);
+
+    main_pid = fork();
+    switch (main_pid) {
+	case 0:
+            sigprocmask(SIG_UNBLOCK, &set, NULL);
+            setsid();
+            setpgid(0, 0);
+
+            /* Child remains as pacemaker_remoted */
+            return;
+	case -1:
+            perror("fork");
+    }
+
+    /* Parent becomes the reaper of zombie processes */
+    /* Safe to initialize logging now if needed */
+
+#ifdef HAVE___PROGNAME
+    /* Differentiate ourselves in the 'ps' output */
+    {
+        char *p;
+        int i, maxlen;
+        char *LastArgv = NULL;
+        const char *name = "pcmk-init";
+
+	for(i = 0; i < argc; i++) {
+		if(!i || (LastArgv + 1 == argv[i]))
+			LastArgv = argv[i] + strlen(argv[i]);
+	}
+
+	for(i = 0; envp[i] != NULL; i++) {
+		if((LastArgv + 1) == envp[i]) {
+			LastArgv = envp[i] + strlen(envp[i]);
+		}
+	}
+
+        maxlen = (LastArgv - argv[0]) - 2;
+
+        i = strlen(name);
+        /* We can overwrite individual argv[] arguments */
+        snprintf(argv[0], maxlen, "%s", name);
+
+        /* Now zero out everything else */
+        p = &argv[0][i];
+        while(p < LastArgv)
+            *p++ = '\0';
+        argv[1] = NULL;
+    }
+#endif /* HAVE___PROGNAME */
+
+    while (1) {
+	int sig;
+	size_t i;
+
+        sigwait(&set, &sig);
+        for (i = 0; i < DIMOF(sigmap); i++) {
+            if (sigmap[i].sig == sig) {
+                sigmap[i].handler();
+                break;
+            }
+        }
+    }
 }
 
 /* *INDENT-OFF* */
@@ -372,6 +516,9 @@ static struct crm_option long_options[] = {
     {"verbose", 0, 0,    'V', "\tIncrease debug output"},
 
     {"logfile", 1, 0,    'l', "\tSend logs to the additional named logfile"},
+#ifdef ENABLE_PCMK_REMOTE
+    {"port", 1, 0,       'p', "\tPort to listen on"},
+#endif
 
     /* For compatibility with the original lrmd */
     {"dummy",  0, 0, 'r', NULL, 1},
@@ -380,12 +527,15 @@ static struct crm_option long_options[] = {
 /* *INDENT-ON* */
 
 int
-main(int argc, char **argv)
+main(int argc, char **argv, char **envp)
 {
     int flag = 0;
     int index = 0;
+    int bump_log_num = 0;
     const char *option = NULL;
 
+    /* If necessary, create PID1 now before any FDs are opened */
+    spawn_pidone(argc, argv, envp);
 
 #ifndef ENABLE_PCMK_REMOTE
     crm_log_preinit("lrmd", argc, argv);
@@ -405,12 +555,17 @@ main(int argc, char **argv)
 
         switch (flag) {
             case 'r':
+                crm_warn("The -r option to lrmd is deprecated (and ignored) "
+                         "and will be removed in a future release");
                 break;
             case 'l':
                 crm_add_logfile(optarg);
                 break;
+            case 'p':
+                setenv("PCMK_remote_port", optarg, 1);
+                break;
             case 'V':
-                crm_bump_log_level(argc, argv);
+                bump_log_num++;
                 break;
             case '?':
             case '$':
@@ -423,6 +578,11 @@ main(int argc, char **argv)
     }
 
     crm_log_init(NULL, LOG_INFO, TRUE, FALSE, argc, argv, FALSE);
+
+    while (bump_log_num > 0) {
+        crm_bump_log_level(argc, argv);
+        bump_log_num--;
+    }
 
     option = daemon_option("logfacility");
     if(option && safe_str_neq(option, "none")) {
@@ -458,16 +618,11 @@ main(int argc, char **argv)
     }
 
 #ifdef ENABLE_PCMK_REMOTE
-    {
-        const char *remote_port_str = getenv("PCMK_remote_port");
-        int remote_port = remote_port_str ? atoi(remote_port_str) : DEFAULT_REMOTE_PORT;
-
-        if (lrmd_init_remote_tls_server(remote_port) < 0) {
-            crm_err("Failed to create TLS server on port %d: shutting down and inhibiting respawn", remote_port);
-            crm_exit(DAEMON_RESPAWN_STOP);
-        }
-        ipc_proxy_init();
+    if (lrmd_init_remote_tls_server() < 0) {
+        crm_err("Failed to create TLS listener: shutting down and staying down");
+        crm_exit(DAEMON_RESPAWN_STOP);
     }
+    ipc_proxy_init();
 #endif
 
     mainloop_add_signal(SIGTERM, lrmd_shutdown);

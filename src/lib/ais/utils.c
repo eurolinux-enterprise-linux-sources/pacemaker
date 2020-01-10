@@ -190,7 +190,7 @@ spawn_child(crm_child_t * child)
     } else {
         pcmk_setscheduler(child);
 
-        /* Setup the two alternate arg arrarys */
+        /* Setup the two alternate arg arrays */
         opts_vgrind[0] = ais_strdup(VALGRIND_BIN);
         if (use_callgrind) {
             opts_vgrind[1] = ais_strdup("--tool=callgrind");
@@ -203,7 +203,7 @@ spawn_child(crm_child_t * child)
             opts_vgrind[3] = NULL;
             opts_vgrind[4] = NULL;
         }
-        opts_default[0] = ais_strdup(child->command);;
+        opts_default[0] = ais_strdup(child->command);
 
         if (uid && initgroups(child->uid, gid) < 0) {
             ais_perror("Cannot initialize groups for %s", child->uid);

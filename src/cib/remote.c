@@ -31,7 +31,6 @@
 
 #include <stdlib.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <glib.h>
 
 #include <crm/msg_xml.h>
@@ -285,9 +284,10 @@ cib_remote_listen(gpointer data)
 {
     int csock = 0;
     unsigned laddr;
-    struct sockaddr_in addr;
+    struct sockaddr_storage addr;
+    char ipstr[INET6_ADDRSTRLEN];
     int ssock = *(int *)data;
-    int flag;
+    int rc;
 
     crm_client_t *new_client = NULL;
 
@@ -300,22 +300,19 @@ cib_remote_listen(gpointer data)
     laddr = sizeof(addr);
     memset(&addr, 0, sizeof(addr));
     csock = accept(ssock, (struct sockaddr *)&addr, &laddr);
-    crm_debug("New %s connection from %s",
-              ssock == remote_tls_fd ? "secure" : "clear-text", inet_ntoa(addr.sin_addr));
-
     if (csock == -1) {
-        crm_err("accept socket failed");
+        crm_perror(LOG_ERR, "Could not accept socket connection");
         return TRUE;
     }
 
-    if ((flag = fcntl(csock, F_GETFL)) >= 0) {
-        if (fcntl(csock, F_SETFL, flag | O_NONBLOCK) < 0) {
-            crm_err("fcntl() write failed");
-            close(csock);
-            return TRUE;
-        }
-    } else {
-        crm_err("fcntl() read failed");
+    crm_sockaddr2str(&addr, ipstr);
+    crm_debug("New %s connection from %s",
+              ((ssock == remote_tls_fd)? "secure" : "clear-text"), ipstr);
+
+    rc = crm_set_nonblocking(csock);
+    if (rc < 0) {
+        crm_err("Could not set socket non-blocking: %s " CRM_XS " rc=%d",
+                pcmk_strerror(rc), rc);
         close(csock);
         return TRUE;
     }
@@ -323,12 +320,8 @@ cib_remote_listen(gpointer data)
     num_clients++;
 
     crm_client_init();
-    new_client = calloc(1, sizeof(crm_client_t));
+    new_client = crm_client_alloc(NULL);
     new_client->remote = calloc(1, sizeof(crm_remote_t));
-
-    new_client->id = crm_generate_uuid();
-
-    g_hash_table_insert(client_connections, new_client->id /* Should work */ , new_client);
 
     if (ssock == remote_tls_fd) {
 #ifdef HAVE_GNUTLS_GNUTLS_H
@@ -586,7 +579,7 @@ construct_pam_passwd(int num_msg, const struct pam_message **msg,
     for (count = 0; count < num_msg; ++count) {
         switch (msg[count]->msg_style) {
             case PAM_TEXT_INFO:
-                crm_info("PAM: %s\n", msg[count]->msg);
+                crm_info("PAM: %s", msg[count]->msg);
                 break;
             case PAM_PROMPT_ECHO_OFF:
             case PAM_PROMPT_ECHO_ON:
@@ -596,7 +589,7 @@ construct_pam_passwd(int num_msg, const struct pam_message **msg,
                 /* In theory we'd want to print this, but then
                  * we see the password prompt in the logs
                  */
-                /* crm_err("PAM error: %s\n", msg[count]->msg); */
+                /* crm_err("PAM error: %s", msg[count]->msg); */
                 break;
             default:
                 crm_err("Unhandled conversation type: %d", msg[count]->msg_style);

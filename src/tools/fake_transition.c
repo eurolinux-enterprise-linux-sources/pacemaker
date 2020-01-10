@@ -63,15 +63,13 @@ static void
 inject_transient_attr(xmlNode * cib_node, const char *name, const char *value)
 {
     xmlNode *attrs = NULL;
-    xmlNode *container = NULL;
-    xmlNode *nvp = NULL;
+    xmlNode *instance_attrs = NULL;
     xmlChar *node_path;
     const char *node_uuid = ID(cib_node);
-    char *nvp_id = crm_concat(name, node_uuid, '-');
 
     node_path = xmlGetNodePath(cib_node);
-    quiet_log("Injecting attribute %s=%s into %s '%s'", name, value, node_path,
-             ID(cib_node));
+    quiet_log(" + Injecting attribute %s=%s into %s '%s'\n",
+              name, value, node_path, ID(cib_node));
     free(node_path);
 
     attrs = first_named_child(cib_node, XML_TAG_TRANSIENT_NODEATTRS);
@@ -80,22 +78,18 @@ inject_transient_attr(xmlNode * cib_node, const char *name, const char *value)
         crm_xml_add(attrs, XML_ATTR_ID, node_uuid);
     }
 
-    container = first_named_child(attrs, XML_TAG_ATTR_SETS);
-    if (container == NULL) {
-        container = create_xml_node(attrs, XML_TAG_ATTR_SETS);
-        crm_xml_add(container, XML_ATTR_ID, node_uuid);
+    instance_attrs = first_named_child(attrs, XML_TAG_ATTR_SETS);
+    if (instance_attrs == NULL) {
+        instance_attrs = create_xml_node(attrs, XML_TAG_ATTR_SETS);
+        crm_xml_add(instance_attrs, XML_ATTR_ID, node_uuid);
     }
 
-    nvp = create_xml_node(container, XML_CIB_TAG_NVPAIR);
-    crm_xml_add(nvp, XML_ATTR_ID, nvp_id);
-    crm_xml_add(nvp, XML_NVPAIR_ATTR_NAME, name);
-    crm_xml_add(nvp, XML_NVPAIR_ATTR_VALUE, value);
-
-    free(nvp_id);
+    crm_create_nvpair_xml(instance_attrs, NULL, name, value);
 }
 
 static void
-update_failcounts(xmlNode * cib_node, const char *resource, int interval, int rc)
+update_failcounts(xmlNode * cib_node, const char *resource, const char *task,
+                  int interval, int rc)
 {
     if (rc == 0) {
         return;
@@ -107,12 +101,12 @@ update_failcounts(xmlNode * cib_node, const char *resource, int interval, int rc
         char *name = NULL;
         char *now = crm_itoa(time(NULL));
 
-        name = crm_concat("fail-count", resource, '-');
+        name = crm_failcount_name(resource, task, interval);
         inject_transient_attr(cib_node, name, "value++");
+        free(name);
 
-        name = crm_concat("last-failure", resource, '-');
+        name = crm_lastfailure_name(resource, task, interval);
         inject_transient_attr(cib_node, name, now);
-
         free(name);
         free(now);
     }
@@ -190,24 +184,22 @@ static xmlNode *
 inject_node_state(cib_t * cib_conn, const char *node, const char *uuid)
 {
     int rc = pcmk_ok;
-    int max = strlen(rsc_template) + strlen(node) + 1;
-    char *xpath = NULL;
     xmlNode *cib_object = NULL;
-
-    xpath = calloc(1, max);
+    char *xpath = crm_strdup_printf(node_template, node);
 
     if (bringing_nodes_online) {
         create_node_entry(cib_conn, node);
     }
 
-    snprintf(xpath, max, node_template, node);
     rc = cib_conn->cmds->query(cib_conn, xpath, &cib_object,
                                cib_xpath | cib_sync_call | cib_scope_local);
 
     if (cib_object && ID(cib_object) == NULL) {
         crm_err("Detected multiple node_state entries for xpath=%s, bailing", xpath);
         crm_log_xml_warn(cib_object, "Duplicates");
+        free(xpath);
         crm_exit(ENOTUNIQ);
+        return NULL; // not reached, but makes static analysis happy
     }
 
     if (rc == -ENXIO) {
@@ -265,7 +257,7 @@ find_resource_xml(xmlNode * cib_node, const char *resource)
     char *xpath = NULL;
     xmlNode *match = NULL;
     const char *node = crm_element_value(cib_node, XML_ATTR_UNAME);
-    int max = strlen(rsc_template) + strlen(resource) + strlen(node) + 1;
+    int max = strlen(rsc_template) + strlen(node) + strlen(resource) + 1;
 
     xpath = calloc(1, max);
 
@@ -298,17 +290,17 @@ inject_resource(xmlNode * cib_node, const char *resource, const char *rclass, co
                 "  Please supply the class and type to continue\n", resource, ID(cib_node));
         return NULL;
 
-    } else if (safe_str_neq(rclass, "ocf")
-               && safe_str_neq(rclass, "stonith")
-               && safe_str_neq(rclass, "heartbeat")
-               && safe_str_neq(rclass, "service")
-               && safe_str_neq(rclass, "upstart")
-               && safe_str_neq(rclass, "systemd")
-               && safe_str_neq(rclass, "lsb")) {
+    } else if (safe_str_neq(rclass, PCMK_RESOURCE_CLASS_OCF)
+               && safe_str_neq(rclass, PCMK_RESOURCE_CLASS_STONITH)
+               && safe_str_neq(rclass, PCMK_RESOURCE_CLASS_HB)
+               && safe_str_neq(rclass, PCMK_RESOURCE_CLASS_SERVICE)
+               && safe_str_neq(rclass, PCMK_RESOURCE_CLASS_UPSTART)
+               && safe_str_neq(rclass, PCMK_RESOURCE_CLASS_SYSTEMD)
+               && safe_str_neq(rclass, PCMK_RESOURCE_CLASS_LSB)) {
         fprintf(stderr, "Invalid class for %s: %s\n", resource, rclass);
         return NULL;
 
-    } else if (safe_str_eq(rclass, "ocf") && rprovider == NULL) {
+    } else if (crm_provider_required(rclass) && (rprovider == NULL)) {
         fprintf(stderr, "Please specify the provider for resource %s\n", resource);
         return NULL;
     }
@@ -340,11 +332,12 @@ inject_resource(xmlNode * cib_node, const char *resource, const char *rclass, co
     return cib_resource;
 }
 
+#define XPATH_MAX 1024
+
 static int
 find_ticket_state(cib_t * the_cib, const char *ticket_id, xmlNode ** ticket_state_xml)
 {
     int offset = 0;
-    static int xpath_max = 1024;
     int rc = pcmk_ok;
     xmlNode *xml_search = NULL;
 
@@ -353,11 +346,11 @@ find_ticket_state(cib_t * the_cib, const char *ticket_id, xmlNode ** ticket_stat
     CRM_ASSERT(ticket_state_xml != NULL);
     *ticket_state_xml = NULL;
 
-    xpath_string = calloc(1, xpath_max);
-    offset += snprintf(xpath_string + offset, xpath_max - offset, "%s", "/cib/status/tickets");
+    xpath_string = calloc(1, XPATH_MAX);
+    offset += snprintf(xpath_string + offset, XPATH_MAX - offset, "%s", "/cib/status/tickets");
 
     if (ticket_id) {
-        offset += snprintf(xpath_string + offset, xpath_max - offset, "/%s[@id=\"%s\"]",
+        offset += snprintf(xpath_string + offset, XPATH_MAX - offset, "/%s[@id=\"%s\"]",
                            XML_CIB_TAG_TICKET_STATE, ticket_id);
     }
     CRM_LOG_ASSERT(offset > 0);
@@ -589,7 +582,7 @@ modify_configuration(pe_working_set_t * data_set, cib_t *cib,
             cib_node = inject_node_state(cib, node, NULL);
             CRM_ASSERT(cib_node != NULL);
 
-            update_failcounts(cib_node, resource, interval, outcome);
+            update_failcounts(cib_node, resource, task, interval, outcome);
 
             cib_resource = inject_resource(cib_node, resource, rclass, rtype, rprovider);
             CRM_ASSERT(cib_resource != NULL);
@@ -650,7 +643,7 @@ exec_rsc_action(crm_graph_t * graph, crm_action_t * action)
 
     if (safe_str_eq(operation, CRM_OP_PROBED)
         || safe_str_eq(operation, CRM_OP_REPROBE)) {
-        crm_info("Skipping %s op for %s\n", operation, node);
+        crm_info("Skipping %s op for %s", operation, node);
         goto done;
     }
 
@@ -673,8 +666,8 @@ exec_rsc_action(crm_graph_t * graph, crm_action_t * action)
         }
     }
 
-    if (safe_str_eq(operation, "delete")) {
-        quiet_log(" * Resource action: %-15s delete on %s\n", resource, node);
+    if (safe_str_eq(operation, "delete") || safe_str_eq(operation, RSC_METADATA)) {
+        quiet_log(" * Resource action: %-15s %s on %s\n", resource, operation, node);
         goto done;
     }
 
@@ -715,12 +708,20 @@ exec_rsc_action(crm_graph_t * graph, crm_action_t * action)
         snprintf(key, strlen(spec), "%s_%s_%d@%s=", resource, op->op_type, op->interval, node);
 
         if (strncasecmp(key, spec, strlen(key)) == 0) {
-            sscanf(spec, "%*[^=]=%d", (int *)&op->rc);
+            rc = sscanf(spec, "%*[^=]=%d", (int *) &op->rc);
+            // ${resource}_${task}_${interval}@${node}=${rc}
 
+            if (rc != 1) {
+                fprintf(stderr,
+                        "Invalid failed operation spec: %s. Result code must be integer\n",
+                        spec);
+                free(key);
+                continue;
+            }
             action->failed = TRUE;
             graph->abort_priority = INFINITY;
             printf("\tPretending action %d failed with rc=%d\n", action->id, op->rc);
-            update_failcounts(cib_node, resource, op->interval, op->rc);
+            update_failcounts(cib_node, resource, op->op_type, op->interval, op->rc);
             free(key);
             break;
         }

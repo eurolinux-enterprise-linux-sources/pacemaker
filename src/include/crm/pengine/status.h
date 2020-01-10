@@ -19,6 +19,7 @@
 #  define PENGINE_STATUS__H
 
 #  include <glib.h>
+#  include <stdbool.h>
 #  include <crm/common/iso8601.h>
 #  include <crm/pengine/common.h>
 
@@ -48,34 +49,37 @@ enum pe_restart {
 };
 
 enum pe_find {
-    pe_find_renamed = 0x001,
-    pe_find_clone = 0x004,
-    pe_find_current = 0x008,
-    pe_find_inactive = 0x010,
+    pe_find_renamed  = 0x001, // match resource ID or LRM history ID
+    pe_find_anon     = 0x002, // match base name of anonymous clone instances
+    pe_find_clone    = 0x004, // match only clone instances
+    pe_find_current  = 0x008, // match resource active on specified node
+    pe_find_inactive = 0x010, // match resource not running anywhere
+    pe_find_any      = 0x020, // match base name of any clone instance
 };
 
-#  define pe_flag_have_quorum		0x00000001ULL
-#  define pe_flag_symmetric_cluster	0x00000002ULL
-#  define pe_flag_is_managed_default	0x00000004ULL
-#  define pe_flag_maintenance_mode	0x00000008ULL
+#  define pe_flag_have_quorum           0x00000001ULL
+#  define pe_flag_symmetric_cluster     0x00000002ULL
+#  define pe_flag_is_managed_default    0x00000004ULL
+#  define pe_flag_maintenance_mode      0x00000008ULL
 
-#  define pe_flag_stonith_enabled	0x00000010ULL
-#  define pe_flag_have_stonith_resource	0x00000020ULL
-#  define pe_flag_enable_unfencing	0x00000040ULL
-#  define pe_flag_concurrent_fencing	0x00000080ULL
+#  define pe_flag_stonith_enabled       0x00000010ULL
+#  define pe_flag_have_stonith_resource 0x00000020ULL
+#  define pe_flag_enable_unfencing      0x00000040ULL
+#  define pe_flag_concurrent_fencing    0x00000080ULL
 
-#  define pe_flag_stop_rsc_orphans	0x00000100ULL
-#  define pe_flag_stop_action_orphans	0x00000200ULL
-#  define pe_flag_stop_everything	0x00000400ULL
+#  define pe_flag_stop_rsc_orphans      0x00000100ULL
+#  define pe_flag_stop_action_orphans   0x00000200ULL
+#  define pe_flag_stop_everything       0x00000400ULL
 
-#  define pe_flag_start_failure_fatal	0x00001000ULL
-#  define pe_flag_remove_after_stop	0x00002000ULL
+#  define pe_flag_start_failure_fatal   0x00001000ULL
+#  define pe_flag_remove_after_stop     0x00002000ULL
+#  define pe_flag_startup_fencing       0x00004000ULL
 
-#  define pe_flag_startup_probes	0x00010000ULL
-#  define pe_flag_have_status		0x00020000ULL
-#  define pe_flag_have_remote_nodes	0x00040000ULL
+#  define pe_flag_startup_probes        0x00010000ULL
+#  define pe_flag_have_status           0x00020000ULL
+#  define pe_flag_have_remote_nodes     0x00040000ULL
 
-#  define pe_flag_quick_location  	0x00100000ULL
+#  define pe_flag_quick_location        0x00100000ULL
 #  define pe_flag_sanitized             0x00200000ULL
 
 typedef struct pe_working_set_s {
@@ -96,7 +100,9 @@ typedef struct pe_working_set_s {
 
     GHashTable *config_hash;
     GHashTable *tickets;
-    GHashTable *singletons; /* Actions for which there can be only one - ie. fence nodeX */
+
+    // Actions for which there can be only one (e.g. fence nodeX)
+    GHashTable *singletons;
 
     GListPtr nodes;
     GListPtr resources;
@@ -131,7 +137,8 @@ typedef struct pe_working_set_s {
 struct node_shared_s {
     const char *id;
     const char *uname;
-/* Make all these flags into a bitfield one day */
+
+    /* @TODO convert these flags (and the ones at the end) into a bitfield */
     gboolean online;
     gboolean standby;
     gboolean standby_onfail;
@@ -160,6 +167,8 @@ struct node_shared_s {
     gboolean rsc_discovery_enabled;
     gboolean remote_requires_reset;
     gboolean remote_was_fenced;
+    gboolean remote_maintenance; /* what the remote-rsc is thinking */
+    gboolean unpacked;
 };
 
 struct node_s {
@@ -172,41 +181,43 @@ struct node_s {
 
 #  include <crm/pengine/complex.h>
 
-#  define pe_rsc_orphan		0x00000001ULL
-#  define pe_rsc_managed	0x00000002ULL
-#  define pe_rsc_block          0x00000004ULL   /* Further operations are prohibited due to failure policy */
-#  define pe_rsc_orphan_container_filler	0x00000008ULL
+#  define pe_rsc_orphan                     0x00000001ULL
+#  define pe_rsc_managed                    0x00000002ULL
+#  define pe_rsc_block                      0x00000004ULL
+#  define pe_rsc_orphan_container_filler    0x00000008ULL
 
-#  define pe_rsc_notify		0x00000010ULL
-#  define pe_rsc_unique		0x00000020ULL
-#  define pe_rsc_fence_device   0x00000040ULL
+#  define pe_rsc_notify                     0x00000010ULL
+#  define pe_rsc_unique                     0x00000020ULL
+#  define pe_rsc_fence_device               0x00000040ULL
 
-#  define pe_rsc_provisional	0x00000100ULL
-#  define pe_rsc_allocating	0x00000200ULL
-#  define pe_rsc_merging	0x00000400ULL
-#  define pe_rsc_munging	0x00000800ULL
+#  define pe_rsc_provisional                0x00000100ULL
+#  define pe_rsc_allocating                 0x00000200ULL
+#  define pe_rsc_merging                    0x00000400ULL
+#  define pe_rsc_munging                    0x00000800ULL
 
-#  define pe_rsc_try_reload     0x00001000ULL
-#  define pe_rsc_reload         0x00002000ULL
+#  define pe_rsc_try_reload                 0x00001000ULL
+#  define pe_rsc_reload                     0x00002000ULL
+#  define pe_rsc_allow_remote_remotes       0x00004000ULL
 
-#  define pe_rsc_failed		0x00010000ULL
-#  define pe_rsc_shutdown	0x00020000ULL
-#  define pe_rsc_runnable	0x00040000ULL
-#  define pe_rsc_start_pending	0x00080000ULL
+#  define pe_rsc_failed                     0x00010000ULL
+#  define pe_rsc_shutdown                   0x00020000ULL
+#  define pe_rsc_runnable                   0x00040000ULL
+#  define pe_rsc_start_pending              0x00080000ULL
 
-#  define pe_rsc_starting       0x00100000ULL
-#  define pe_rsc_stopping       0x00200000ULL
-#  define pe_rsc_migrating      0x00400000ULL
-#  define pe_rsc_allow_migrate  0x00800000ULL
+#  define pe_rsc_starting                   0x00100000ULL
+#  define pe_rsc_stopping                   0x00200000ULL
+#  define pe_rsc_migrating                  0x00400000ULL
+#  define pe_rsc_allow_migrate              0x00800000ULL
 
-#  define pe_rsc_failure_ignored 0x01000000ULL
-#  define pe_rsc_unexpectedly_running 0x02000000ULL
-#  define pe_rsc_maintenance	 0x04000000ULL
+#  define pe_rsc_failure_ignored            0x01000000ULL
+#  define pe_rsc_unexpectedly_running       0x02000000ULL
+#  define pe_rsc_maintenance                0x04000000ULL
+#  define pe_rsc_is_container               0x08000000ULL
 
-#  define pe_rsc_needs_quorum	 0x10000000ULL
-#  define pe_rsc_needs_fencing	 0x20000000ULL
-#  define pe_rsc_needs_unfencing 0x40000000ULL
-#  define pe_rsc_have_unfencing  0x80000000ULL
+#  define pe_rsc_needs_quorum               0x10000000ULL
+#  define pe_rsc_needs_fencing              0x20000000ULL
+#  define pe_rsc_needs_unfencing            0x40000000ULL
+#  define pe_rsc_have_unfencing             0x80000000ULL // obsolete (not set or used by cluster)
 
 enum pe_graph_flags {
     pe_graph_none = 0x00000,
@@ -232,9 +243,11 @@ enum pe_action_flags {
     pe_action_clear = 0x00400,
     pe_action_dangle = 0x00800,
 
-    pe_action_requires_any = 0x01000, /* This action requires one or mre of its dependencies to be runnable
-                                       * We use this to clear the runnable flag before checking dependencies
-                                       */
+    /* This action requires one or more of its dependencies to be runnable.
+     * We use this to clear the runnable flag before checking dependencies.
+     */
+    pe_action_requires_any = 0x01000,
+
     pe_action_reschedule = 0x02000,
     pe_action_tracking = 0x04000,
 };
@@ -301,7 +314,19 @@ struct resource_s {
     int remote_reconnect_interval;
 
     pe_working_set_t *cluster;
+
+#if ENABLE_VERSIONED_ATTRS
+    xmlNode *versioned_parameters;
+#endif
 };
+
+#if ENABLE_VERSIONED_ATTRS
+// Used as action->action_details if action->rsc is not NULL
+typedef struct pe_rsc_action_details_s {
+    xmlNode *versioned_parameters;
+    xmlNode *versioned_meta;
+} pe_rsc_action_details_t;
+#endif
 
 struct pe_action_s {
     int id;
@@ -339,8 +364,8 @@ struct pe_action_s {
      * requires at minimum X number of cloned instances to be running
      * before an order dependency can run. Another option that uses
      * this is 'require-all=false' in ordering constrants. This option
-     * says "only required one instance of a resource to start before
-     * allowing dependencies to start" basicall require-all=false is
+     * says "only require one instance of a resource to start before
+     * allowing dependencies to start" -- basically, require-all=false is
      * the same as clone-min=1.
      */
 
@@ -350,8 +375,15 @@ struct pe_action_s {
      * to be considered runnable */ 
     int required_runnable_before;
 
-    GListPtr actions_before;    /* action_warpper_t* */
-    GListPtr actions_after;     /* action_warpper_t* */
+    GListPtr actions_before;    /* action_wrapper_t* */
+    GListPtr actions_after;     /* action_wrapper_t* */
+
+    /* Some of the above fields could be moved to the details,
+     * except for API backward compatibility.
+     */
+    void *action_details; // varies by type of action
+
+    char *reason;
 };
 
 struct ticket_s {
@@ -371,6 +403,12 @@ enum pe_link_state {
     pe_link_not_dumped,
     pe_link_dumped,
     pe_link_dup,
+};
+
+enum pe_discover_e {
+    pe_discover_always = 0,
+    pe_discover_never,
+    pe_discover_exclusive,
 };
 
 /* *INDENT-OFF* */
@@ -393,20 +431,26 @@ enum pe_ordering {
                                                  * ensure instances of 'then' on 'nodeX' are too.
                                                  * Only really useful if 'then' is a clone and 'first' is not
                                                  */
+    pe_order_probe                 = 0x800,     /* If 'first->rsc' is
+                                                 *  - running but about to stop, ignore the constraint
+                                                 *  - otherwise, behave as runnable_left
+                                                 */
 
     pe_order_restart               = 0x1000,    /* 'then' is runnable if 'first' is optional or runnable */
     pe_order_stonith_stop          = 0x2000,    /* only applies if the action is non-pseudo */
     pe_order_serialize_only        = 0x4000,    /* serialize */
+    pe_order_same_node             = 0x8000,    /* applies only if 'first' and 'then' are on same node */
 
     pe_order_implies_first_printed = 0x10000,   /* Like ..implies_first but only ensures 'first' is printed, not mandatory */
     pe_order_implies_then_printed  = 0x20000,   /* Like ..implies_then but only ensures 'then' is printed, not mandatory */
 
     pe_order_asymmetrical          = 0x100000,  /* Indicates asymmetrical one way ordering constraint. */
     pe_order_load                  = 0x200000,  /* Only relevant if... */
-    pe_order_one_or_more           = 0x400000,  /* 'then' is only runnable if one or more of it's dependencies are too */
+    pe_order_one_or_more           = 0x400000,  /* 'then' is runnable only if one or more of its dependencies are too */
     pe_order_anti_colocation       = 0x800000,
 
     pe_order_preserve              = 0x1000000, /* Hack for breaking user ordering constraints with container resources */
+    pe_order_then_cancels_first    = 0x2000000, // if 'then' becomes required, 'first' becomes optional
     pe_order_trace                 = 0x4000000, /* test marker */
 };
 /* *INDENT-ON* */
@@ -423,9 +467,60 @@ gboolean cluster_status(pe_working_set_t * data_set);
 void set_working_set_defaults(pe_working_set_t * data_set);
 void cleanup_calculations(pe_working_set_t * data_set);
 resource_t *pe_find_resource(GListPtr rsc_list, const char *id_rh);
+resource_t *pe_find_resource_with_flags(GListPtr rsc_list, const char *id, enum pe_find flags);
 node_t *pe_find_node(GListPtr node_list, const char *uname);
 node_t *pe_find_node_id(GListPtr node_list, const char *id);
 node_t *pe_find_node_any(GListPtr node_list, const char *id, const char *uname);
 GListPtr find_operations(const char *rsc, const char *node, gboolean active_filter,
                          pe_working_set_t * data_set);
+int pe_bundle_replicas(const resource_t *rsc);
+#if ENABLE_VERSIONED_ATTRS
+pe_rsc_action_details_t *pe_rsc_action_details(pe_action_t *action);
+#endif
+
+/*!
+ * \brief Check whether a resource is any clone type
+ *
+ * \param[in] rsc  Resource to check
+ *
+ * \return TRUE if resource is clone, FALSE otherwise
+ */
+static inline bool
+pe_rsc_is_clone(resource_t *rsc)
+{
+    return rsc && ((rsc->variant == pe_clone) || (rsc->variant == pe_master));
+}
+
+/*!
+ * \brief Check whether a resource is a globally unique clone
+ *
+ * \param[in] rsc  Resource to check
+ *
+ * \return TRUE if resource is unique clone, FALSE otherwise
+ */
+static inline bool
+pe_rsc_is_unique_clone(resource_t *rsc)
+{
+    return pe_rsc_is_clone(rsc) && is_set(rsc->flags, pe_rsc_unique);
+}
+
+/*!
+ * \brief Check whether a resource is an anonymous clone
+ *
+ * \param[in] rsc  Resource to check
+ *
+ * \return TRUE if resource is anonymous clone, FALSE otherwise
+ */
+static inline bool
+pe_rsc_is_anon_clone(resource_t *rsc)
+{
+    return pe_rsc_is_clone(rsc) && is_not_set(rsc->flags, pe_rsc_unique);
+}
+
+static inline bool
+pe_rsc_is_bundled(resource_t *rsc)
+{
+    return uber_parent(rsc)->parent != NULL;
+}
+
 #endif

@@ -53,7 +53,8 @@ enum pe_ordering get_flags(const char *id, enum pe_order_kind kind,
                            const char *action_first, const char *action_then, gboolean invert);
 enum pe_ordering get_asymmetrical_flags(enum pe_order_kind kind);
 static rsc_to_node_t *generate_location_rule(resource_t * rsc, xmlNode * rule_xml,
-                                             const char *discovery, pe_working_set_t * data_set);
+                                             const char *discovery, pe_working_set_t * data_set,
+                                             pe_match_data_t * match_data);
 
 gboolean
 unpack_constraints(xmlNode * xml_constraints, pe_working_set_t * data_set)
@@ -76,7 +77,7 @@ unpack_constraints(xmlNode * xml_constraints, pe_working_set_t * data_set)
         lifetime = first_named_child(xml_obj, "lifetime");
         if (lifetime) {
             crm_config_warn("Support for the lifetime tag, used by %s, is deprecated."
-                            " The rules it contains should instead be direct decendants of the constraint object",
+                            " The rules it contains should instead be direct descendents of the constraint object",
                             id);
         }
 
@@ -152,7 +153,7 @@ get_ordering_type(xmlNode * xml_obj)
                 kind_e = pe_order_kind_optional;
             }
 
-            /* } else if(rsc_then->variant == pe_native && rsc_first->variant > pe_group) { */
+            /* } else if(rsc_then->variant == pe_native && rsc_first->variant >= pe_clone) { */
             /*     kind_e = pe_order_kind_optional; */
         }
 
@@ -180,9 +181,8 @@ pe_find_constraint_resource(GListPtr rsc_list, const char *id)
 
     for (rIter = rsc_list; id && rIter; rIter = rIter->next) {
         resource_t *parent = rIter->data;
-
-        resource_t *match =
-            parent->fns->find_rsc(parent, id, NULL, pe_find_renamed | pe_find_current);
+        resource_t *match = parent->fns->find_rsc(parent, id, NULL,
+                                                  pe_find_renamed);
 
         if (match != NULL) {
             if(safe_str_neq(match->id, id)) {
@@ -315,13 +315,13 @@ unpack_simple_rsc_order(xmlNode * xml_obj, pe_working_set_t * data_set)
         crm_config_err("Constraint %s: no resource found for name '%s'", id, id_first);
         return FALSE;
 
-    } else if (instance_then && rsc_then->variant < pe_clone) {
+    } else if (instance_then && pe_rsc_is_clone(rsc_then) == FALSE) {
         crm_config_err("Invalid constraint '%s':"
                        " Resource '%s' is not a clone but instance %s was requested",
                        id, id_then, instance_then);
         return FALSE;
 
-    } else if (instance_first && rsc_first->variant < pe_clone) {
+    } else if (instance_first && pe_rsc_is_clone(rsc_first) == FALSE) {
         crm_config_err("Invalid constraint '%s':"
                        " Resource '%s' is not a clone but instance %s was requested",
                        id, id_first, instance_first);
@@ -349,11 +349,11 @@ unpack_simple_rsc_order(xmlNode * xml_obj, pe_working_set_t * data_set)
     require_all_s = crm_element_value(xml_obj, "require-all");
     if (require_all_s
         && crm_is_true(require_all_s) == FALSE
-        && rsc_first->variant >= pe_clone) {
+        && pe_rsc_is_clone(rsc_first)) {
 
         /* require-all=false means only one instance of the clone is required */
         min_required_before = 1;
-    } else if (rsc_first->variant >= pe_clone) {
+    } else if (pe_rsc_is_clone(rsc_first)) {
         const char *min_clones_s = g_hash_table_lookup(rsc_first->meta, XML_RSC_ATTR_INCARNATION_MIN);
         if (min_clones_s) {
             /* if clone min is set, we require at a minimum X number of instances
@@ -389,7 +389,7 @@ unpack_simple_rsc_order(xmlNode * xml_obj, pe_working_set_t * data_set)
          * actions to be considered runnable before allowing the pseudo action
          * to be runnable. */ 
         unordered_action->required_runnable_before = min_required_before;
-        update_action_flags(unordered_action, pe_action_requires_any);
+        update_action_flags(unordered_action, pe_action_requires_any, __FUNCTION__, __LINE__);
 
         for (rIter = rsc_first->children; id && rIter; rIter = rIter->next) {
             resource_t *child = rIter->data;
@@ -645,22 +645,22 @@ tag_to_set(xmlNode * xml_obj, xmlNode ** rsc_set, const char * attr,
     return TRUE;
 }
 
-gboolean unpack_rsc_location(xmlNode * xml_obj, resource_t * rsc_lh, const char * role,
-                             const char * score, pe_working_set_t * data_set);
+static gboolean unpack_rsc_location(xmlNode * xml_obj, resource_t * rsc_lh, const char * role,
+                             const char * score, pe_working_set_t * data_set, pe_match_data_t * match_data);
 
 static gboolean
 unpack_simple_location(xmlNode * xml_obj, pe_working_set_t * data_set)
 {
     const char *id = crm_element_value(xml_obj, XML_ATTR_ID);
-    const char *value = crm_element_value(xml_obj, XML_COLOC_ATTR_SOURCE);
+    const char *value = crm_element_value(xml_obj, XML_LOC_ATTR_SOURCE);
 
     if(value) {
         resource_t *rsc_lh = pe_find_constraint_resource(data_set->resources, value);
 
-        return unpack_rsc_location(xml_obj, rsc_lh, NULL, NULL, data_set);
+        return unpack_rsc_location(xml_obj, rsc_lh, NULL, NULL, data_set, NULL);
     }
 
-    value = crm_element_value(xml_obj, XML_COLOC_ATTR_SOURCE"-pattern");
+    value = crm_element_value(xml_obj, XML_LOC_ATTR_SOURCE_PATTERN);
     if(value) {
         regex_t *r_patt = calloc(1, sizeof(regex_t));
         bool invert = FALSE;
@@ -672,7 +672,7 @@ unpack_simple_location(xmlNode * xml_obj, pe_working_set_t * data_set)
         }
 
         if (regcomp(r_patt, value, REG_EXTENDED)) {
-            crm_config_err("Bad regex '%s' for constraint '%s'\n", value, id);
+            crm_config_err("Bad regex '%s' for constraint '%s'", value, id);
             regfree(r_patt);
             free(r_patt);
             return FALSE;
@@ -680,19 +680,42 @@ unpack_simple_location(xmlNode * xml_obj, pe_working_set_t * data_set)
 
         for (rIter = data_set->resources; rIter; rIter = rIter->next) {
             resource_t *r = rIter->data;
-            int status = regexec(r_patt, r->id, 0, NULL, 0);
+            int nregs = 0;
+            regmatch_t *pmatch = NULL;
+            int status;
+
+            if(r_patt->re_nsub > 0) {
+                nregs = r_patt->re_nsub + 1;
+            } else {
+                nregs = 1;
+            }
+            pmatch = calloc(nregs, sizeof(regmatch_t));
+
+            status = regexec(r_patt, r->id, nregs, pmatch, 0);
 
             if(invert == FALSE && status == 0) {
+                pe_re_match_data_t re_match_data = {
+                                                .string = r->id,
+                                                .nregs = nregs,
+                                                .pmatch = pmatch
+                                               };
+                pe_match_data_t match_data = {
+                                                .re = &re_match_data,
+                                                .params = r->parameters,
+                                                .meta = r->meta,
+                                             };
                 crm_debug("'%s' matched '%s' for %s", r->id, value, id);
-                unpack_rsc_location(xml_obj, r, NULL, NULL, data_set);
+                unpack_rsc_location(xml_obj, r, NULL, NULL, data_set, &match_data);
 
             } if(invert && status != 0) {
                 crm_debug("'%s' is an inverted match of '%s' for %s", r->id, value, id);
-                unpack_rsc_location(xml_obj, r, NULL, NULL, data_set);
+                unpack_rsc_location(xml_obj, r, NULL, NULL, data_set, NULL);
 
             } else {
                 crm_trace("'%s' does not match '%s' for %s", r->id, value, id);
             }
+
+            free(pmatch);
         }
 
         regfree(r_patt);
@@ -702,13 +725,13 @@ unpack_simple_location(xmlNode * xml_obj, pe_working_set_t * data_set)
     return FALSE;
 }
 
-gboolean
+static gboolean
 unpack_rsc_location(xmlNode * xml_obj, resource_t * rsc_lh, const char * role,
-                    const char * score, pe_working_set_t * data_set)
+                    const char * score, pe_working_set_t * data_set, pe_match_data_t * match_data)
 {
     gboolean empty = TRUE;
     rsc_to_node_t *location = NULL;
-    const char *id_lh = crm_element_value(xml_obj, XML_COLOC_ATTR_SOURCE);
+    const char *id_lh = crm_element_value(xml_obj, XML_LOC_ATTR_SOURCE);
     const char *id = crm_element_value(xml_obj, XML_ATTR_ID);
     const char *node = crm_element_value(xml_obj, XML_CIB_TAG_NODE);
     const char *discovery = crm_element_value(xml_obj, XML_LOCATION_ATTR_DISCOVERY);
@@ -718,7 +741,7 @@ unpack_rsc_location(xmlNode * xml_obj, resource_t * rsc_lh, const char * role,
         crm_config_warn("No resource (con=%s, rsc=%s)", id, id_lh);
         return FALSE;
     }
-    
+
     if (score == NULL) {
         score = crm_element_value(xml_obj, XML_RULE_ATTR_SCORE);
     }
@@ -740,7 +763,7 @@ unpack_rsc_location(xmlNode * xml_obj, resource_t * rsc_lh, const char * role,
             if (crm_str_eq((const char *)rule_xml->name, XML_TAG_RULE, TRUE)) {
                 empty = FALSE;
                 crm_trace("Unpacking %s/%s", id, ID(rule_xml));
-                generate_location_rule(rsc_lh, rule_xml, discovery, data_set);
+                generate_location_rule(rsc_lh, rule_xml, discovery, data_set, match_data);
             }
         }
 
@@ -814,7 +837,7 @@ unpack_location_tags(xmlNode * xml_obj, xmlNode ** expanded_xml, pe_working_set_
         return TRUE;
     }
 
-    id_lh = crm_element_value(xml_obj, XML_COLOC_ATTR_SOURCE);
+    id_lh = crm_element_value(xml_obj, XML_LOC_ATTR_SOURCE);
     if (id_lh == NULL) {
         return TRUE;
     }
@@ -833,7 +856,7 @@ unpack_location_tags(xmlNode * xml_obj, xmlNode ** expanded_xml, pe_working_set_
     new_xml = copy_xml(xml_obj);
 
     /* Convert the template/tag reference in "rsc" into a resource_set under the rsc_location constraint. */
-    if (tag_to_set(new_xml, &rsc_set_lh, XML_COLOC_ATTR_SOURCE, FALSE, data_set) == FALSE) {
+    if (tag_to_set(new_xml, &rsc_set_lh, XML_LOC_ATTR_SOURCE, FALSE, data_set) == FALSE) {
         free_xml(new_xml);
         return FALSE;
     }
@@ -882,7 +905,7 @@ unpack_location_set(xmlNode * location, xmlNode * set, pe_working_set_t * data_s
     for (xml_rsc = __xml_first_child(set); xml_rsc != NULL; xml_rsc = __xml_next_element(xml_rsc)) {
         if (crm_str_eq((const char *)xml_rsc->name, XML_TAG_RESOURCE_REF, TRUE)) {
             EXPAND_CONSTRAINT_IDREF(set_id, resource, ID(xml_rsc));
-            unpack_rsc_location(location, resource, role, local_score, data_set);
+            unpack_rsc_location(location, resource, role, local_score, data_set, NULL);
         }
     }
 
@@ -933,7 +956,7 @@ unpack_location(xmlNode * xml_obj, pe_working_set_t * data_set)
 }
 
 static int
-get_node_score(const char *rule, const char *score, gboolean raw, node_t * node)
+get_node_score(const char *rule, const char *score, gboolean raw, node_t * node, resource_t *rsc)
 {
     int score_f = 0;
 
@@ -944,7 +967,7 @@ get_node_score(const char *rule, const char *score, gboolean raw, node_t * node)
         score_f = char2score(score);
 
     } else {
-        const char *attr_score = g_hash_table_lookup(node->details->attrs, score);
+        const char *attr_score = pe_node_attribute_calculated(node, score, rsc);
 
         if (attr_score == NULL) {
             crm_debug("Rule %s: node %s did not have a value for %s",
@@ -961,7 +984,8 @@ get_node_score(const char *rule, const char *score, gboolean raw, node_t * node)
 }
 
 static rsc_to_node_t *
-generate_location_rule(resource_t * rsc, xmlNode * rule_xml, const char *discovery, pe_working_set_t * data_set)
+generate_location_rule(resource_t * rsc, xmlNode * rule_xml, const char *discovery, pe_working_set_t * data_set,
+                       pe_match_data_t * match_data)
 {
     const char *rule_id = NULL;
     const char *score = NULL;
@@ -974,6 +998,7 @@ generate_location_rule(resource_t * rsc, xmlNode * rule_xml, const char *discove
     gboolean do_and = TRUE;
     gboolean accept = TRUE;
     gboolean raw_score = TRUE;
+    gboolean score_allocated = FALSE;
 
     rsc_to_node_t *location_rule = NULL;
 
@@ -992,9 +1017,6 @@ generate_location_rule(resource_t * rsc, xmlNode * rule_xml, const char *discove
     score = crm_element_value(rule_xml, XML_RULE_ATTR_SCORE);
     if (score == NULL) {
         score = crm_element_value(rule_xml, XML_RULE_ATTR_SCORE_ATTRIBUTE);
-        if (score == NULL) {
-            score = crm_element_value(rule_xml, XML_RULE_ATTR_SCORE_MANGLED);
-        }
         if (score != NULL) {
             raw_score = FALSE;
         }
@@ -1008,6 +1030,18 @@ generate_location_rule(resource_t * rsc, xmlNode * rule_xml, const char *discove
     if (location_rule == NULL) {
         return NULL;
     }
+
+    if (match_data && match_data->re && match_data->re->nregs > 0 && match_data->re->pmatch[0].rm_so != -1) {
+        if (raw_score == FALSE) {
+            char *result = pe_expand_re_matches(score, match_data->re);
+
+            if (result) {
+                score = (const char *) result;
+                score_allocated = TRUE;
+            }
+        }
+    }
+
     if (role != NULL) {
         crm_trace("Setting role filter: %s", role);
         location_rule->role_filter = text2role(role);
@@ -1025,7 +1059,7 @@ generate_location_rule(resource_t * rsc, xmlNode * rule_xml, const char *discove
         for (gIter = match_L; gIter != NULL; gIter = gIter->next) {
             node_t *node = (node_t *) gIter->data;
 
-            node->weight = get_node_score(rule_id, score, raw_score, node);
+            node->weight = get_node_score(rule_id, score, raw_score, node, rsc);
         }
     }
 
@@ -1033,12 +1067,12 @@ generate_location_rule(resource_t * rsc, xmlNode * rule_xml, const char *discove
         int score_f = 0;
         node_t *node = (node_t *) gIter->data;
 
-        accept = test_rule(rule_xml, node->details->attrs, RSC_ROLE_UNKNOWN, data_set->now);
+        accept = pe_test_rule_full(rule_xml, node->details->attrs, RSC_ROLE_UNKNOWN, data_set->now, match_data);
 
         crm_trace("Rule %s %s on %s", ID(rule_xml), accept ? "passed" : "failed",
                   node->details->uname);
 
-        score_f = get_node_score(rule_id, score, raw_score, node);
+        score_f = get_node_score(rule_id, score, raw_score, node, rsc);
 /* 			if(accept && score_f == -INFINITY) { */
 /* 				accept = FALSE; */
 /* 			} */
@@ -1069,6 +1103,10 @@ generate_location_rule(resource_t * rsc, xmlNode * rule_xml, const char *discove
             }
             free(delete);
         }
+    }
+
+    if (score_allocated == TRUE) {
+        free((char *)score);
     }
 
     location_rule->node_list_rh = match_L;
@@ -1229,7 +1267,7 @@ rsc_colocation_new(const char *id, const char *node_attr, int score,
     new_con->node_attribute = node_attr;
 
     if (node_attr == NULL) {
-        node_attr = "#" XML_ATTR_UNAME;
+        node_attr = CRM_ATTR_UNAME;
     }
 
     pe_rsc_trace(rsc_lh, "%s ==> %s (%s %d)", rsc_lh->id, rsc_rh->id, node_attr, score);
@@ -1754,7 +1792,7 @@ order_rsc_sets(const char *id, xmlNode * set1, xmlNode * set2, enum pe_order_kin
         action_t *unordered_action = get_pseudo_op(task, data_set);
 
         free(task);
-        update_action_flags(unordered_action, pe_action_requires_any);
+        update_action_flags(unordered_action, pe_action_requires_any, __FUNCTION__, __LINE__);
 
         for (xml_rsc = __xml_first_child(set1); xml_rsc != NULL; xml_rsc = __xml_next_element(xml_rsc)) {
             if (!crm_str_eq((const char *)xml_rsc->name, XML_TAG_RESOURCE_REF, TRUE)) {
@@ -2170,8 +2208,7 @@ unpack_colocation_set(xmlNode * set, int score, pe_working_set_t * data_set)
     } else {
         /* Anti-colocating with every prior resource is
          * the only way to ensure the intuitive result
-         * (ie. that no-one in the set can run with anyone
-         * else in the set)
+         * (i.e. that no one in the set can run with anyone else in the set)
          */
 
         for (xml_rsc = __xml_first_child(set); xml_rsc != NULL; xml_rsc = __xml_next_element(xml_rsc)) {
@@ -2309,13 +2346,13 @@ unpack_simple_colocation(xmlNode * xml_obj, pe_working_set_t * data_set)
         crm_config_err("Invalid constraint '%s': No resource named '%s'", id, id_rh);
         return FALSE;
 
-    } else if (instance_lh && rsc_lh->variant < pe_clone) {
+    } else if (instance_lh && pe_rsc_is_clone(rsc_lh) == FALSE) {
         crm_config_err
             ("Invalid constraint '%s': Resource '%s' is not a clone but instance %s was requested",
              id, id_lh, instance_lh);
         return FALSE;
 
-    } else if (instance_rh && rsc_rh->variant < pe_clone) {
+    } else if (instance_rh && pe_rsc_is_clone(rsc_rh) == FALSE) {
         crm_config_err
             ("Invalid constraint '%s': Resource '%s' is not a clone but instance %s was requested",
              id, id_rh, instance_rh);
@@ -2551,10 +2588,19 @@ rsc_ticket_new(const char *id, resource_t * rsc_lh, ticket_t * ticket,
     new_rsc_ticket->role_lh = text2role(state_lh);
 
     if (safe_str_eq(loss_policy, "fence")) {
+        if (is_set(data_set->flags, pe_flag_stonith_enabled)) {
+            new_rsc_ticket->loss_policy = loss_ticket_fence;
+        } else {
+            crm_config_err("Resetting %s loss-policy to 'stop': fencing is not configured",
+                           ticket->id);
+            loss_policy = "stop";
+        }
+    }
+
+    if (new_rsc_ticket->loss_policy == loss_ticket_fence) {
         crm_debug("On loss of ticket '%s': Fence the nodes running %s (%s)",
                   new_rsc_ticket->ticket->id, new_rsc_ticket->rsc_lh->id,
                   role2text(new_rsc_ticket->role_lh));
-        new_rsc_ticket->loss_policy = loss_ticket_fence;
 
     } else if (safe_str_eq(loss_policy, "freeze")) {
         crm_debug("On loss of ticket '%s': Freeze %s (%s)",
@@ -2609,31 +2655,27 @@ unpack_rsc_ticket_set(xmlNode * set, ticket_t * ticket, const char *loss_policy,
 {
     xmlNode *xml_rsc = NULL;
     resource_t *resource = NULL;
-    const char *set_id = ID(set);
-    const char *role = crm_element_value(set, "role");
+    const char *set_id = NULL;
+    const char *role = NULL;
 
-    if (set == NULL) {
-        crm_config_err("No resource_set object to process.");
-        return FALSE;
-    }
+    CRM_CHECK(set != NULL, return FALSE);
+    CRM_CHECK(ticket != NULL, return FALSE);
 
+    set_id = ID(set);
     if (set_id == NULL) {
         crm_config_err("resource_set must have an id");
         return FALSE;
     }
 
-    if (ticket == NULL) {
-        crm_config_err("No dependented ticket specified for '%s'", set_id);
-        return FALSE;
-    }
+    role = crm_element_value(set, "role");
 
-    for (xml_rsc = __xml_first_child(set); xml_rsc != NULL; xml_rsc = __xml_next_element(xml_rsc)) {
-        if (crm_str_eq((const char *)xml_rsc->name, XML_TAG_RESOURCE_REF, TRUE)) {
-            EXPAND_CONSTRAINT_IDREF(set_id, resource, ID(xml_rsc));
-            pe_rsc_trace(resource, "Resource '%s' depends on ticket '%s'", resource->id,
-                         ticket->id);
-            rsc_ticket_new(set_id, resource, ticket, role, loss_policy, data_set);
-        }
+    for (xml_rsc = first_named_child(set, XML_TAG_RESOURCE_REF);
+         xml_rsc != NULL; xml_rsc = crm_next_same_xml(xml_rsc)) {
+
+        EXPAND_CONSTRAINT_IDREF(set_id, resource, ID(xml_rsc));
+        pe_rsc_trace(resource, "Resource '%s' depends on ticket '%s'",
+                     resource->id, ticket->id);
+        rsc_ticket_new(set_id, resource, ticket, role, loss_policy, data_set);
     }
 
     return TRUE;
@@ -2687,7 +2729,7 @@ unpack_simple_rsc_ticket(xmlNode * xml_obj, pe_working_set_t * data_set)
         crm_config_err("Invalid constraint '%s': No resource named '%s'", id, id_lh);
         return FALSE;
 
-    } else if (instance_lh && rsc_lh->variant < pe_clone) {
+    } else if (instance_lh && pe_rsc_is_clone(rsc_lh) == FALSE) {
         crm_config_err
             ("Invalid constraint '%s': Resource '%s' is not a clone but instance %s was requested",
              id, id_lh, instance_lh);

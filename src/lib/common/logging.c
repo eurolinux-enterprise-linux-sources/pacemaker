@@ -197,10 +197,11 @@ set_format_string(int method, const char *daemon)
 
         if (uname(&res) == 0) {
             offset +=
-                snprintf(fmt + offset, FMT_MAX - offset, "%%t [%d] %s %10s: ", getpid(),
-                         res.nodename, daemon);
+                snprintf(fmt + offset, FMT_MAX - offset, "%%t [%lu] %s %10s: ",
+                         (unsigned long) getpid(), res.nodename, daemon);
         } else {
-            offset += snprintf(fmt + offset, FMT_MAX - offset, "%%t [%d] %10s: ", getpid(), daemon);
+            offset += snprintf(fmt + offset, FMT_MAX - offset, "%%t [%lu] %10s: ",
+                               (unsigned long) getpid(), daemon);
         }
     }
 
@@ -223,6 +224,10 @@ crm_add_logfile(const char *filename)
     bool is_default = false;
     static int default_fd = -1;
     static gboolean have_logfile = FALSE;
+
+    /* @COMPAT This should be CRM_LOG_DIR "/pacemaker.log". We aren't changing
+     * it yet because it will be a significant user-visible change to publicize.
+     */
     const char *default_logfile = "/var/log/pacemaker.log";
 
     struct stat parent;
@@ -358,16 +363,24 @@ blackbox_logger(int32_t t, struct qb_log_callsite *cs, time_t timestamp, const c
 static void
 crm_control_blackbox(int nsig, bool enable)
 {
+    int lpc = 0;
+
     if (blackbox_file_prefix == NULL) {
         pid_t pid = getpid();
 
         blackbox_file_prefix = malloc(NAME_MAX);
-        snprintf(blackbox_file_prefix, NAME_MAX, "%s/%s-%d", CRM_BLACKBOX_DIR, crm_system_name, pid);
+        snprintf(blackbox_file_prefix, NAME_MAX, "%s/%s-%lu",
+                 CRM_BLACKBOX_DIR, crm_system_name, (unsigned long) pid);
     }
 
     if (enable && qb_log_ctl(QB_LOG_BLACKBOX, QB_LOG_CONF_STATE_GET, 0) != QB_LOG_STATE_ENABLED) {
         qb_log_ctl(QB_LOG_BLACKBOX, QB_LOG_CONF_SIZE, 5 * 1024 * 1024); /* Any size change drops existing entries */
         qb_log_ctl(QB_LOG_BLACKBOX, QB_LOG_CONF_ENABLED, QB_TRUE);      /* Setting the size seems to disable it */
+
+        /* Enable synchronous logging */
+        for (lpc = QB_LOG_BLACKBOX; lpc < QB_LOG_TARGET_MAX; lpc++) {
+            qb_log_ctl(lpc, QB_LOG_CONF_FILE_SYNC, QB_TRUE);
+        }
 
         crm_notice("Initiated blackbox recorder: %s", blackbox_file_prefix);
 
@@ -376,6 +389,7 @@ crm_control_blackbox(int nsig, bool enable)
         crm_signal(SIGABRT, crm_trigger_blackbox);
         crm_signal(SIGILL,  crm_trigger_blackbox);
         crm_signal(SIGBUS,  crm_trigger_blackbox);
+        crm_signal(SIGFPE,  crm_trigger_blackbox);
 
         crm_update_callsites();
 
@@ -388,6 +402,11 @@ crm_control_blackbox(int nsig, bool enable)
 
     } else if (!enable && qb_log_ctl(QB_LOG_BLACKBOX, QB_LOG_CONF_STATE_GET, 0) == QB_LOG_STATE_ENABLED) {
         qb_log_ctl(QB_LOG_BLACKBOX, QB_LOG_CONF_ENABLED, QB_FALSE);
+
+        /* Disable synchronous logging again when the blackbox is disabled */
+        for (lpc = QB_LOG_BLACKBOX; lpc < QB_LOG_TARGET_MAX; lpc++) {
+            qb_log_ctl(lpc, QB_LOG_CONF_FILE_SYNC, QB_FALSE);
+        }
     }
 }
 
@@ -550,7 +569,7 @@ crm_log_filter(struct qb_log_callsite *cs)
             do {
                 offset = next;
                 next = strchrnul(offset, ',');
-                snprintf(token, 499, "%.*s", (int)(next - offset), offset);
+                snprintf(token, sizeof(token), "%.*s", (int)(next - offset), offset);
 
                 tag = g_quark_from_string(token);
                 crm_info("Created GQuark %u from token '%s' in '%s'", tag, token, trace_tags);
@@ -724,9 +743,12 @@ crm_log_preinit(const char *entity, int argc, char **argv)
         /* Nuke any syslog activity until it's asked for */
         qb_log_ctl(QB_LOG_SYSLOG, QB_LOG_CONF_ENABLED, QB_FALSE);
 
-        /* Set format strings */
+        /* Set format strings and disable threading
+         * Pacemaker and threads do not mix well (due to the amount of forking)
+         */
         qb_log_tags_stringify_fn_set(crm_quark_to_string);
         for (lpc = QB_LOG_SYSLOG; lpc < QB_LOG_TARGET_MAX; lpc++) {
+            qb_log_ctl(lpc, QB_LOG_CONF_THREADED, QB_FALSE);
             set_format_string(lpc, crm_system_name);
         }
     }
@@ -849,7 +871,7 @@ crm_log_init(const char *entity, uint8_t level, gboolean daemon, gboolean to_std
             {
                 char path[512];
 
-                snprintf(path, 512, "%s-%d", crm_system_name, getpid());
+                snprintf(path, 512, "%s-%lu", crm_system_name, (unsigned long) getpid());
                 mkdir(path, 0750);
                 chdir(path);
                 crm_info("Changed active directory to %s/%s/%s", base, pwent->pw_name, path);

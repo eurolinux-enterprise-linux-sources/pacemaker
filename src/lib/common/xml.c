@@ -17,25 +17,21 @@
  */
 
 #include <crm_internal.h>
+
 #include <sys/param.h>
 #include <stdio.h>
 #include <sys/types.h>
-#include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
 #include <string.h>
-#include <dirent.h>
-
 #include <stdlib.h>
-#include <errno.h>
-#include <fcntl.h>
 #include <ctype.h>
-#include <math.h>
+#include <stdarg.h>
 
 #include <crm/crm.h>
 #include <crm/msg_xml.h>
 #include <crm/common/xml.h>
-#include <libxml/xmlreader.h>
+#include <crm/common/xml_internal.h>  /* CRM_XML_LOG_BASE */
 
 #if HAVE_BZLIB_H
 #  include <bzlib.h>
@@ -44,48 +40,13 @@
 #if HAVE_LIBXML2
 #  include <libxml/parser.h>
 #  include <libxml/tree.h>
-#  include <libxml/relaxng.h>
-#endif
-
-#if HAVE_LIBXSLT
-#  include <libxslt/xslt.h>
-#  include <libxslt/transform.h>
 #endif
 
 #define XML_BUFFER_SIZE	4096
 #define XML_PARSER_DEBUG 0
 
-void
-xml_log(int priority, const char *fmt, ...)
-G_GNUC_PRINTF(2, 3);
 static inline int
 __get_prefix(const char *prefix, xmlNode *xml, char *buffer, int offset);
-
-void
-xml_log(int priority, const char *fmt, ...)
-{
-    va_list ap;
-
-    va_start(ap, fmt);
-    qb_log_from_external_source_va(__FUNCTION__, __FILE__, fmt, priority, __LINE__, 0, ap);
-    va_end(ap);
-}
-
-typedef struct {
-    xmlRelaxNGPtr rng;
-    xmlRelaxNGValidCtxtPtr valid;
-    xmlRelaxNGParserCtxtPtr parser;
-} relaxng_ctx_cache_t;
-
-struct schema_s {
-    int type;
-    float version;
-    char *name;
-    char *location;
-    char *transform;
-    int after_transform;
-    void *cache;
-};
 
 typedef struct {
     int found;
@@ -119,13 +80,18 @@ typedef struct xml_private_s
         uint32_t flags;
         char *user;
         GListPtr acls;
-        GListPtr deleted_paths;
+        GListPtr deleted_objs;
 } xml_private_t;
 
 typedef struct xml_acl_s {
         enum xml_private_flags mode;
         char *xpath;
 } xml_acl_t;
+
+typedef struct xml_deleted_obj_s {
+        char *path;
+        int position;
+} xml_deleted_obj_t;
 
 /* *INDENT-OFF* */
 
@@ -138,49 +104,11 @@ static filter_t filter[] = {
 };
 /* *INDENT-ON* */
 
-static struct schema_s *known_schemas = NULL;
-static int xml_schema_max = 0;
-
 static xmlNode *subtract_xml_comment(xmlNode * parent, xmlNode * left, xmlNode * right, gboolean * changed);
-static xmlNode *find_xml_comment(xmlNode * root, xmlNode * search_comment);
+static xmlNode *find_xml_comment(xmlNode * root, xmlNode * search_comment, gboolean exact);
 static int add_xml_comment(xmlNode * parent, xmlNode * target, xmlNode * update);
 static bool __xml_acl_check(xmlNode *xml, const char *name, enum xml_private_flags mode);
 const char *__xml_acl_to_text(enum xml_private_flags flags);
-
-static int
-xml_latest_schema_index(void)
-{
-    return xml_schema_max - 4;
-}
-
-static int
-xml_minimum_schema_index(void)
-{
-    static int best = 0;
-    if(best == 0) {
-        int lpc = 0;
-        float target = 0.0;
-
-        best = xml_latest_schema_index();
-        target = floor(known_schemas[best].version);
-
-        for(lpc = best; lpc > 0; lpc--) {
-            if(known_schemas[lpc].version < target) {
-                return best;
-            } else {
-                best = lpc;
-            }
-        }
-        best = xml_latest_schema_index();
-    }
-    return best;
-}
-
-const char *
-xml_latest_schema(void)
-{
-    return get_schema_name(xml_latest_schema_index());
-}
 
 #define CHUNK_SIZE 1024
 static inline bool TRACKING_CHANGES(xmlNode *xml)
@@ -201,10 +129,11 @@ static inline bool TRACKING_CHANGES(xmlNode *xml)
         if(buffer && rc < 0) {                                          \
             crm_perror(LOG_ERR, "snprintf failed at offset %d", offset); \
             (buffer)[(offset)] = 0;                                     \
+            break;                                                      \
         } else if(rc >= ((max) - (offset))) {                           \
             char *tmp = NULL;                                           \
             (max) = QB_MAX(CHUNK_SIZE, (max) * 2);                      \
-            tmp = realloc_safe((buffer), (max) + 1);                         \
+            tmp = realloc_safe((buffer), (max));                        \
             CRM_ASSERT(tmp);                                            \
             (buffer) = tmp;                                             \
         } else {                                                        \
@@ -221,192 +150,11 @@ insert_prefix(int options, char **buffer, int *offset, int *max, int depth)
 
         if ((*buffer) == NULL || spaces >= ((*max) - (*offset))) {
             (*max) = QB_MAX(CHUNK_SIZE, (*max) * 2);
-            (*buffer) = realloc_safe((*buffer), (*max) + 1);
+            (*buffer) = realloc_safe((*buffer), (*max));
         }
         memset((*buffer) + (*offset), ' ', spaces);
         (*offset) += spaces;
     }
-}
-
-static const char *
-get_schema_root(void)
-{
-    static const char *base = NULL;
-
-    if (base == NULL) {
-        base = getenv("PCMK_schema_directory");
-    }
-    if (base == NULL || strlen(base) == 0) {
-        base = CRM_DTD_DIRECTORY;
-    }
-    return base;
-}
-
-static char *
-get_schema_path(const char *name, const char *file)
-{
-    const char *base = get_schema_root();
-
-    if(file) {
-        return crm_strdup_printf("%s/%s", base, file);
-    }
-    return crm_strdup_printf("%s/%s.rng", base, name);
-}
-
-static int schema_filter(const struct dirent * a)
-{
-    int rc = 0;
-    float version = 0;
-
-    if(strstr(a->d_name, "pacemaker-") != a->d_name) {
-        /* crm_trace("%s - wrong prefix", a->d_name); */
-
-    } else if(strstr(a->d_name, ".rng") == NULL) {
-        /* crm_trace("%s - wrong suffix", a->d_name); */
-
-    } else if(sscanf(a->d_name, "pacemaker-%f.rng", &version) == 0) {
-        /* crm_trace("%s - wrong format", a->d_name); */
-
-    } else if(strcmp(a->d_name, "pacemaker-1.1.rng") == 0) {
-        /* crm_trace("%s - hack", a->d_name); */
-
-    } else {
-        /* crm_debug("%s - candidate", a->d_name); */
-        rc = 1;
-    }
-
-    return rc;
-}
-
-static int schema_sort(const struct dirent ** a, const struct dirent **b)
-{
-    int rc = 0;
-    float a_version = 0.0;
-    float b_version = 0.0;
-
-    sscanf(a[0]->d_name, "pacemaker-%f.rng", &a_version);
-    sscanf(b[0]->d_name, "pacemaker-%f.rng", &b_version);
-
-    if(a_version > b_version) {
-        rc = 1;
-    } else if(a_version < b_version) {
-        rc = -1;
-    }
-
-    /* crm_trace("%s (%f) vs. %s (%f) : %d", a[0]->d_name, a_version, b[0]->d_name, b_version, rc); */
-    return rc;
-}
-
-static void __xml_schema_add(
-    int type, float version, const char *name, const char *location, const char *transform, int after_transform)
-{
-    int last = xml_schema_max;
-
-    xml_schema_max++;
-    known_schemas = realloc_safe(known_schemas, xml_schema_max*sizeof(struct schema_s));
-    CRM_ASSERT(known_schemas != NULL);
-    memset(known_schemas+last, 0, sizeof(struct schema_s));
-    known_schemas[last].type = type;
-    known_schemas[last].after_transform = after_transform;
-
-    if(version > 0.0) {
-        known_schemas[last].version = version;
-        known_schemas[last].name = crm_strdup_printf("pacemaker-%.1f", version);
-        known_schemas[last].location = crm_strdup_printf("%s.rng", known_schemas[last].name);
-
-    } else {
-        char dummy[1024];
-        CRM_ASSERT(name);
-        CRM_ASSERT(location);
-        sscanf(name, "%[^-]-%f", dummy, &version);
-        known_schemas[last].version = version;
-        known_schemas[last].name = strdup(name);
-        known_schemas[last].location = strdup(location);
-    }
-
-    if(transform) {
-        known_schemas[last].transform = strdup(transform);
-    }
-    if(after_transform == 0) {
-        after_transform = xml_schema_max;
-    }
-    known_schemas[last].after_transform = after_transform;
-
-    if(known_schemas[last].after_transform < 0) {
-        crm_debug("Added supported schema %d: %s (%s)",
-                  last, known_schemas[last].name, known_schemas[last].location);
-
-    } else if(known_schemas[last].transform) {
-        crm_debug("Added supported schema %d: %s (%s upgrades to %d with %s)",
-                  last, known_schemas[last].name, known_schemas[last].location,
-                  known_schemas[last].after_transform,
-                  known_schemas[last].transform);
-
-    } else {
-        crm_debug("Added supported schema %d: %s (%s upgrades to %d)",
-                  last, known_schemas[last].name, known_schemas[last].location,
-                  known_schemas[last].after_transform);
-    }
-}
-
-
-static int __xml_build_schema_list(void) 
-{
-    int lpc, max;
-    const char *base = get_schema_root();
-    struct dirent **namelist = NULL;
-
-    max = scandir(base, &namelist, schema_filter, schema_sort);
-    __xml_schema_add(1, 0.0, "pacemaker-0.6", "crm.dtd", "upgrade06.xsl", 3);
-    __xml_schema_add(1, 0.0, "transitional-0.6", "crm-transitional.dtd", "upgrade06.xsl", 3);
-    __xml_schema_add(2, 0.0, "pacemaker-0.7", "pacemaker-1.0.rng", NULL, 0);
-
-    if (max < 0) {
-        crm_notice("scandir(%s) failed: %s (%d)", base, strerror(errno), errno);
-
-    } else {
-        for (lpc = 0; lpc < max; lpc++) {
-            int next = 0;
-            float version = 0.0;
-            char *transform = NULL;
-
-            sscanf(namelist[lpc]->d_name, "pacemaker-%f.rng", &version);
-            if((lpc + 1) < max) {
-                float next_version = 0.0;
-
-                sscanf(namelist[lpc+1]->d_name, "pacemaker-%f.rng", &next_version);
-
-                if(floor(version) < floor(next_version)) {
-                    struct stat s;
-                    char *xslt = NULL;
-
-                    transform = crm_strdup_printf("upgrade-%.1f.xsl", version);
-                    xslt = get_schema_path(NULL, transform);
-                    if(stat(xslt, &s) != 0) {
-                        crm_err("Transform %s not found", xslt);
-                        free(xslt);
-                        __xml_schema_add(2, version, NULL, NULL, NULL, -1);
-                        break;
-                    } else {
-                        free(xslt);
-                    }
-                }
-
-            } else {
-                next = -1;
-            }
-            __xml_schema_add(2, version, NULL, NULL, transform, next);
-            free(namelist[lpc]);
-            free(transform);
-        }
-    }
-
-    /* 1.1 was the old name for -next */
-    __xml_schema_add(2, 0.0, "pacemaker-1.1", "pacemaker-next.rng", NULL, 0);
-    __xml_schema_add(2, 0.0, "pacemaker-next", "pacemaker-next.rng", NULL, -1);
-    __xml_schema_add(0, 0.0, "none", "N/A", NULL, -1);
-    free(namelist);
-    return TRUE;
 }
 
 static void
@@ -535,6 +283,17 @@ __xml_acl_free(void *data)
 }
 
 static void
+__xml_deleted_obj_free(void *data)
+{
+    if(data) {
+        xml_deleted_obj_t *deleted_obj = data;
+
+        free(deleted_obj->path);
+        free(deleted_obj);
+    }
+}
+
+static void
 __xml_private_clean(xml_private_t *p)
 {
     if(p) {
@@ -548,9 +307,9 @@ __xml_private_clean(xml_private_t *p)
             p->acls = NULL;
         }
 
-        if(p->deleted_paths) {
-            g_list_free_full(p->deleted_paths, free);
-            p->deleted_paths = NULL;
+        if(p->deleted_objs) {
+            g_list_free_full(p->deleted_objs, __xml_deleted_obj_free);
+            p->deleted_objs = NULL;
         }
     }
 }
@@ -1023,8 +782,8 @@ __xml_acl_post_process(xmlNode * xml)
         xmlAttr *xIter = NULL;
         char *path = xml_get_path(xml);
 
-        /* Always allow new scaffolding, ie. node with no attributes or only an 'id'
-         * Except in the ACLs section
+        /* Always allow new scaffolding (e.g. node with no attributes or only an
+         * 'id'), except in the ACLs section
          */
 
         for (xIter = crm_first_attr(xml); xIter != NULL; xIter = xIter->next) {
@@ -1354,10 +1113,10 @@ is_config_change(xmlNode *xml)
 
     if(xml->doc && xml->doc->_private) {
         p = xml->doc->_private;
-        for(gIter = p->deleted_paths; gIter; gIter = gIter->next) {
-            char *path = gIter->data;
+        for(gIter = p->deleted_objs; gIter; gIter = gIter->next) {
+            xml_deleted_obj_t *deleted_obj = gIter->data;
 
-            if(strstr(path, "/"XML_TAG_CIB"/"XML_CIB_TAG_CONFIGURATION) != NULL) {
+            if(strstr(deleted_obj->path, "/"XML_TAG_CIB"/"XML_CIB_TAG_CONFIGURATION) != NULL) {
                 return TRUE;
             }
         }
@@ -1501,11 +1260,15 @@ xml_create_patchset_v2(xmlNode *source, xmlNode *target)
         crm_xml_add(v, vfields[lpc], value);
     }
 
-    for(gIter = doc->deleted_paths; gIter; gIter = gIter->next) {
+    for(gIter = doc->deleted_objs; gIter; gIter = gIter->next) {
+        xml_deleted_obj_t *deleted_obj = gIter->data;
         xmlNode *change = create_xml_node(patchset, XML_DIFF_CHANGE);
 
         crm_xml_add(change, XML_DIFF_OP, "delete");
-        crm_xml_add(change, XML_DIFF_PATH, gIter->data);
+        crm_xml_add(change, XML_DIFF_PATH, deleted_obj->path);
+        if (deleted_obj->position >= 0) {
+            crm_xml_add_int(change, XML_DIFF_POSITION, deleted_obj->position);
+        }
     }
 
     __xml_build_changes(target, patchset);
@@ -1733,7 +1496,15 @@ xml_log_patchset(uint8_t log_level, const char *function, xmlNode * patchset)
                 }
 
             } else if(strcmp(op, "delete") == 0) {
-                do_crm_log_alias(log_level, __FILE__, function, __LINE__, "-- %s", xpath);
+                int position = -1;
+
+                crm_element_value_int(change, XML_DIFF_POSITION, &position);
+                if (position >= 0) {
+                    do_crm_log_alias(log_level, __FILE__, function, __LINE__, "-- %s (%d)", xpath, position);
+
+                } else {
+                    do_crm_log_alias(log_level, __FILE__, function, __LINE__, "-- %s", xpath);
+                }
             }
         }
         return;
@@ -1781,8 +1552,17 @@ xml_log_changes(uint8_t log_level, const char *function, xmlNode * xml)
         return;
     }
 
-    for(gIter = doc->deleted_paths; gIter; gIter = gIter->next) {
-        do_crm_log_alias(log_level, __FILE__, function, __LINE__, "-- %s", (char*)gIter->data);
+    for(gIter = doc->deleted_objs; gIter; gIter = gIter->next) {
+        xml_deleted_obj_t *deleted_obj = gIter->data;
+
+        if (deleted_obj->position >= 0) {
+            do_crm_log_alias(log_level, __FILE__, function, __LINE__, "-- %s (%d)",
+                             deleted_obj->path, deleted_obj->position);
+
+        } else {
+            do_crm_log_alias(log_level, __FILE__, function, __LINE__, "-- %s",
+                             deleted_obj->path);
+        }
     }
 
     log_data_element(log_level, __FILE__, function, __LINE__, "+ ", xml, 0,
@@ -1812,6 +1592,15 @@ xml_accept_changes(xmlNode * xml)
 
     doc->flags = xpf_none;
     __xml_accept_changes(top);
+}
+
+static xmlNode *
+find_element(xmlNode *haystack, xmlNode *needle, gboolean exact)
+{
+    CRM_CHECK(needle != NULL, return NULL);
+    return (needle->type == XML_COMMENT_NODE)?
+           find_xml_comment(haystack, needle, exact)
+           : find_entity(haystack, crm_element_name(needle), ID(needle));
 }
 
 /* Simplified version for applying v1-style XML patches */
@@ -1866,14 +1655,7 @@ __subtract_xml_object(xmlNode * target, xmlNode * patch)
         xmlNode *target_child = cIter;
 
         cIter = __xml_next(cIter);
-
-        if (target_child->type == XML_COMMENT_NODE) {
-            patch_child = find_xml_comment(patch, target_child);
-
-        } else {
-            patch_child = find_entity(patch, crm_element_name(target_child), ID(target_child));
-        }
-
+        patch_child = find_element(patch, target_child, FALSE);
         __subtract_xml_object(target_child, patch_child);
     }
     free(id);
@@ -1935,25 +1717,19 @@ __add_xml_object(xmlNode * parent, xmlNode * target, xmlNode * patch)
     for (patch_child = __xml_first_child(patch); patch_child != NULL;
          patch_child = __xml_next(patch_child)) {
 
-        if (patch_child->type == XML_COMMENT_NODE) {
-            target_child = find_xml_comment(target, patch_child);
-
-        } else {
-            target_child = find_entity(target, crm_element_name(patch_child), ID(patch_child));
-        }
-
+        target_child = find_element(target, patch_child, FALSE);
         __add_xml_object(target, target_child, patch_child);
     }
 }
 
-/*
+/*!
  * \internal
  * \brief Find additions or removals in a patch set
  *
  * \param[in]     patchset   XML of patch
  * \param[in]     format     Patch version
  * \param[in]     added      TRUE if looking for additions, FALSE if removals
- * \param[in/out] patch_node Will be set to node if found
+ * \param[in,out] patch_node Will be set to node if found
  *
  * \return TRUE if format is valid, FALSE if invalid
  */
@@ -2091,18 +1867,17 @@ xml_patch_version_check(xmlNode *xml, xmlNode *patchset, int format)
 }
 
 static int
-xml_apply_patchset_v1(xmlNode *xml, xmlNode *patchset, bool check_version) 
+xml_apply_patchset_v1(xmlNode *xml, xmlNode *patchset)
 {
     int rc = pcmk_ok;
     int root_nodes_seen = 0;
-    char *version = crm_element_value_copy(xml, XML_ATTR_CRM_VERSION);
 
     xmlNode *child_diff = NULL;
     xmlNode *added = find_xml_node(patchset, "diff-added", FALSE);
     xmlNode *removed = find_xml_node(patchset, "diff-removed", FALSE);
     xmlNode *old = copy_xml(xml);
 
-    crm_trace("Substraction Phase");
+    crm_trace("Subtraction Phase");
     for (child_diff = __xml_first_child(removed); child_diff != NULL;
          child_diff = __xml_next(child_diff)) {
         CRM_CHECK(root_nodes_seen == 0, rc = FALSE);
@@ -2140,12 +1915,11 @@ xml_apply_patchset_v1(xmlNode *xml, xmlNode *patchset, bool check_version)
     purge_diff_markers(xml);       /* Purge prior to checking the digest */
 
     free_xml(old);
-    free(version);
     return rc;
 }
 
 static xmlNode *
-__first_xml_child_match(xmlNode *parent, const char *name, const char *id)
+__first_xml_child_match(xmlNode *parent, const char *name, const char *id, int position)
 {
     xmlNode *cIter = NULL;
 
@@ -2158,13 +1932,21 @@ __first_xml_child_match(xmlNode *parent, const char *name, const char *id)
                 continue;
             }
         }
+
+        /* The "position" makes sense only for XML comments for now */
+        if (cIter->type == XML_COMMENT_NODE
+            && position >= 0
+            && __xml_offset(cIter) != position) {
+            continue;
+        }
+
         return cIter;
     }
     return NULL;
 }
 
 static xmlNode *
-__xml_find_path(xmlNode *top, const char *key)
+__xml_find_path(xmlNode *top, const char *key, int target_position)
 {
     xmlNode *target = (xmlNode*)top->doc;
     char *id = malloc(XML_BUFFER_SIZE);
@@ -2187,13 +1969,19 @@ __xml_find_path(xmlNode *top, const char *key)
 
         } else if(tag && section) {
             int f = sscanf (section, "%[^[][@id='%[^']", tag, id);
+            int current_position = -1;
+
+            /* The "target_position" is for the target tag */
+            if (rc == 1 && target_position >= 0) {
+                current_position = target_position;
+            }
 
             switch(f) {
                 case 1:
-                    target = __first_xml_child_match(target, tag, NULL);
+                    target = __first_xml_child_match(target, tag, NULL, current_position);
                     break;
                 case 2:
-                    target = __first_xml_child_match(target, tag, id);
+                    target = __first_xml_child_match(target, tag, id, current_position);
                     break;
                 default:
                     crm_trace("Aborting on %s", section);
@@ -2231,7 +2019,7 @@ __xml_find_path(xmlNode *top, const char *key)
 }
 
 static int
-xml_apply_patchset_v2(xmlNode *xml, xmlNode *patchset, bool check_version) 
+xml_apply_patchset_v2(xmlNode *xml, xmlNode *patchset)
 {
     int rc = pcmk_ok;
     xmlNode *change = NULL;
@@ -2239,16 +2027,20 @@ xml_apply_patchset_v2(xmlNode *xml, xmlNode *patchset, bool check_version)
         xmlNode *match = NULL;
         const char *op = crm_element_value(change, XML_DIFF_OP);
         const char *xpath = crm_element_value(change, XML_DIFF_PATH);
+        int position = -1;
 
         crm_trace("Processing %s %s", change->name, op);
         if(op == NULL) {
             continue;
         }
 
+        if(strcmp(op, "delete") == 0) {
+            crm_element_value_int(change, XML_DIFF_POSITION, &position);
+        }
 #if 0
         match = get_xpath_object(xpath, xml, LOG_TRACE);
 #else
-        match = __xml_find_path(xml, xpath);
+        match = __xml_find_path(xml, xpath, position);
 #endif
         crm_trace("Performing %s on %s with %p", op, xpath, match);
 
@@ -2392,10 +2184,10 @@ xml_apply_patchset(xmlNode *xml, xmlNode *patchset, bool check_version)
     if(rc == pcmk_ok) {
         switch(format) {
             case 1:
-                rc = xml_apply_patchset_v1(xml, patchset, check_version);
+                rc = xml_apply_patchset_v1(xml, patchset);
                 break;
             case 2:
-                rc = xml_apply_patchset_v2(xml, patchset, check_version);
+                rc = xml_apply_patchset_v2(xml, patchset);
                 break;
             default:
                 crm_err("Unknown patch format: %d", format);
@@ -2847,8 +2639,8 @@ xml_get_path(xmlNode *xml)
     return NULL;
 }
 
-void
-free_xml(xmlNode * child)
+static void
+free_xml_with_position(xmlNode * child, int position)
 {
     if (child != NULL) {
         xmlNode *top = NULL;
@@ -2877,9 +2669,25 @@ free_xml(xmlNode * child)
                 char buffer[XML_BUFFER_SIZE];
 
                 if(__get_prefix(NULL, child, buffer, offset) > 0) {
+                    xml_deleted_obj_t *deleted_obj = calloc(1, sizeof(xml_deleted_obj_t));
+
                     crm_trace("Deleting %s %p from %p", buffer, child, doc);
+
+                    deleted_obj->path = strdup(buffer);
+
+                    deleted_obj->position = -1;
+                    /* Record the "position" only for XML comments for now */
+                    if (child->type == XML_COMMENT_NODE) {
+                        if (position >= 0) {
+                            deleted_obj->position = position;
+
+                        } else {
+                            deleted_obj->position = __xml_offset(child);
+                        }
+                    }
+
                     p = doc->_private;
-                    p->deleted_paths = g_list_append(p->deleted_paths, strdup(buffer));
+                    p->deleted_objs = g_list_append(p->deleted_objs, deleted_obj);
                     set_doc_flag(child, xpf_dirty);
                 }
             }
@@ -2891,6 +2699,13 @@ free_xml(xmlNode * child)
             xmlFreeNode(child);
         }
     }
+}
+
+
+void
+free_xml(xmlNode * child)
+{
+    free_xml_with_position(child, -1);
 }
 
 xmlNode *
@@ -2905,55 +2720,30 @@ copy_xml(xmlNode * src)
 }
 
 static void
-crm_xml_err(void *ctx, const char *msg, ...)
+crm_xml_err(void *ctx, const char *fmt, ...)
 G_GNUC_PRINTF(2, 3);
 
 static void
-crm_xml_err(void *ctx, const char *msg, ...)
+crm_xml_err(void *ctx, const char *fmt, ...)
 {
-    int len = 0;
-    va_list args;
-    char *buf = NULL;
-    static int buffer_len = 0;
-    static char *buffer = NULL;
+    va_list ap;
     static struct qb_log_callsite *xml_error_cs = NULL;
 
-    va_start(args, msg);
-    len = vasprintf(&buf, msg, args);
-
-    if(xml_error_cs == NULL) {
+    if (xml_error_cs == NULL) {
         xml_error_cs = qb_log_callsite_get(
             __func__, __FILE__, "xml library error", LOG_TRACE, __LINE__, crm_trace_nonlog);
     }
 
-    if (strchr(buf, '\n')) {
-        buf[len - 1] = 0;
-        if (buffer) {
-            crm_err("XML Error: %s%s", buffer, buf);
-            free(buffer);
-        } else {
-            crm_err("XML Error: %s", buf);
-        }
-        if (xml_error_cs && xml_error_cs->targets) {
-            crm_abort(__FILE__, __PRETTY_FUNCTION__, __LINE__, "xml library error", TRUE, TRUE);
-        }
-        buffer = NULL;
-        buffer_len = 0;
-
-    } else if (buffer == NULL) {
-        buffer_len = len;
-        buffer = buf;
-        buf = NULL;
-
+    va_start(ap, fmt);
+    if (xml_error_cs && xml_error_cs->targets) {
+        CRM_XML_LOG_BASE(LOG_ERR, TRUE,
+                         crm_abort(__FILE__, __PRETTY_FUNCTION__, __LINE__, "xml library error",
+                                   TRUE, TRUE),
+                         "XML Error: ", fmt, ap);
     } else {
-        buffer = realloc_safe(buffer, 1 + buffer_len + len);
-        memcpy(buffer + buffer_len, buf, len);
-        buffer_len += len;
-        buffer[buffer_len] = 0;
+        CRM_XML_LOG_BASE(LOG_ERR, TRUE, 0, "XML Error: ", fmt, ap);
     }
-
-    va_end(args);
-    free(buf);
+    va_end(ap);
 }
 
 xmlNode *
@@ -3145,7 +2935,7 @@ filename2xml(const char *filename)
 {
     xmlNode *xml = NULL;
     xmlDocPtr output = NULL;
-    const char *match = NULL;
+    gboolean uncompressed = TRUE;
     xmlParserCtxtPtr ctxt = NULL;
     xmlErrorPtr last_error = NULL;
     static int xml_options = XML_PARSE_NOBLANKS | XML_PARSE_RECOVER;
@@ -3161,14 +2951,14 @@ filename2xml(const char *filename)
     /* initGenericErrorDefaultFunc(crm_xml_err); */
 
     if (filename) {
-        match = strstr(filename, ".bz2");
+        uncompressed = !crm_ends_with_ext(filename, ".bz2");
     }
 
     if (filename == NULL) {
         /* STDIN_FILENO == fileno(stdin) */
         output = xmlCtxtReadFd(ctxt, STDIN_FILENO, "unknown.xml", NULL, xml_options);
 
-    } else if (match == NULL || match[4] != 0) {
+    } else if (uncompressed) {
         output = xmlCtxtReadFile(ctxt, filename, NULL, xml_options);
 
     } else {
@@ -3220,6 +3010,51 @@ crm_xml_add_last_written(xmlNode *xml_node)
 
     now_str[24] = EOS; /* replace the newline */
     return crm_xml_add(xml_node, XML_CIB_ATTR_WRITTEN, now_str);
+}
+
+/*!
+ * \brief Sanitize a string so it is usable as an XML ID
+ *
+ * \param[in,out] id  String to sanitize
+ */
+void
+crm_xml_sanitize_id(char *id)
+{
+    char *c;
+
+    for (c = id; *c; ++c) {
+        /* @TODO Sanitize more comprehensively */
+        switch (*c) {
+            case ':':
+            case '#':
+                *c = '.';
+        }
+    }
+}
+
+/*!
+ * \brief Set the ID of an XML element using a format
+ *
+ * \param[in,out] xml  XML element
+ * \param[in]     fmt  printf-style format
+ * \param[in]     ...  any arguments required by format
+ */
+void
+crm_xml_set_id(xmlNode *xml, const char *format, ...)
+{
+    va_list ap;
+    int len = 0;
+    char *id = NULL;
+
+    /* equivalent to crm_strdup_printf() */
+    va_start(ap, format);
+    len = vasprintf(&id, format, ap);
+    va_end(ap);
+    CRM_ASSERT(len > 0);
+
+    crm_xml_sanitize_id(id);
+    crm_xml_add(xml, XML_ATTR_ID, id);
+    free(id);
 }
 
 static int
@@ -3286,12 +3121,13 @@ write_xml_stream(xmlNode * xml_node, const char *filename, FILE * stream, gboole
   bail:
 
     if (fflush(stream) != 0) {
-        crm_perror(LOG_ERR, "fflush for %s failed:", filename);
+        crm_perror(LOG_ERR, "fflush for %s failed", filename);
         res = -1;
     }
 
-    if (fsync(fileno(stream)) < 0) {
-        crm_perror(LOG_ERR, "fsync for %s failed:", filename);
+    /* Don't report error if the file does not support synchronization */
+    if (fsync(fileno(stream)) < 0 && errno != EROFS  && errno != EINVAL) {
+        crm_perror(LOG_ERR, "fsync for %s failed", filename);
         res = -1;
     }
 
@@ -3375,7 +3211,7 @@ crm_xml_escape(const char *text)
      * converted back to their escape sequences.
      *
      * However xmlNodeDump() is randomly dog slow, even with the same
-     * input. So we need to replicate the escapeing in our custom
+     * input. So we need to replicate the escaping in our custom
      * version so that the result can be re-parsed by xmlCtxtReadDoc()
      * when necessary.
      */
@@ -3487,48 +3323,47 @@ __xml_log_element(int log_level, const char *file, const char *function, int lin
         char *buffer = NULL;
 
         insert_prefix(options, &buffer, &offset, &max, depth);
-        if(data->type == XML_COMMENT_NODE) {
-            buffer_print(buffer, max, offset, "<!--");
-            buffer_print(buffer, max, offset, "%s", data->content);
-            buffer_print(buffer, max, offset, "-->");
+
+        if (data->type == XML_COMMENT_NODE) {
+            buffer_print(buffer, max, offset, "<!--%s-->", data->content);
 
         } else {
             buffer_print(buffer, max, offset, "<%s", name);
-        }
 
-        hidden = crm_element_value(data, "hidden");
-        for (pIter = crm_first_attr(data); pIter != NULL; pIter = pIter->next) {
-            xml_private_t *p = pIter->_private;
-            const char *p_name = (const char *)pIter->name;
-            const char *p_value = crm_attr_value(pIter);
-            char *p_copy = NULL;
+            hidden = crm_element_value(data, "hidden");
+            for (pIter = crm_first_attr(data); pIter != NULL; pIter = pIter->next) {
+                xml_private_t *p = pIter->_private;
+                const char *p_name = (const char *)pIter->name;
+                const char *p_value = crm_attr_value(pIter);
+                char *p_copy = NULL;
 
-            if(is_set(p->flags, xpf_deleted)) {
-                continue;
-            } else if ((is_set(options, xml_log_option_diff_plus)
-                 || is_set(options, xml_log_option_diff_minus))
-                && strcmp(XML_DIFF_MARKER, p_name) == 0) {
-                continue;
+                if(is_set(p->flags, xpf_deleted)) {
+                    continue;
+                } else if ((is_set(options, xml_log_option_diff_plus)
+                     || is_set(options, xml_log_option_diff_minus))
+                    && strcmp(XML_DIFF_MARKER, p_name) == 0) {
+                    continue;
 
-            } else if (hidden != NULL && p_name[0] != 0 && strstr(hidden, p_name) != NULL) {
-                p_copy = strdup("*****");
+                } else if (hidden != NULL && p_name[0] != 0 && strstr(hidden, p_name) != NULL) {
+                    p_copy = strdup("*****");
 
-            } else {
-                p_copy = crm_xml_escape(p_value);
+                } else {
+                    p_copy = crm_xml_escape(p_value);
+                }
+
+                buffer_print(buffer, max, offset, " %s=\"%s\"", p_name, p_copy);
+                free(p_copy);
             }
 
-            buffer_print(buffer, max, offset, " %s=\"%s\"", p_name, p_copy);
-            free(p_copy);
-        }
+            if(xml_has_children(data) == FALSE) {
+                buffer_print(buffer, max, offset, "/>");
 
-        if(xml_has_children(data) == FALSE) {
-            buffer_print(buffer, max, offset, "/>");
+            } else if(is_set(options, xml_log_option_children)) {
+                buffer_print(buffer, max, offset, ">");
 
-        } else if(is_set(options, xml_log_option_children)) {
-            buffer_print(buffer, max, offset, ">");
-
-        } else {
-            buffer_print(buffer, max, offset, "/>");
+            } else {
+                buffer_print(buffer, max, offset, "/>");
+            }
         }
 
         do_crm_log_alias(log_level, file, function, line, "%s %s", prefix, buffer);
@@ -4114,7 +3949,7 @@ apply_xml_diff(xmlNode * old, xmlNode * diff, xmlNode ** new)
                                 crm_trace_nonlog);
     }
 
-    crm_trace("Substraction Phase");
+    crm_trace("Subtraction Phase");
     for (child_diff = __xml_first_child(removed); child_diff != NULL;
          child_diff = __xml_next(child_diff)) {
         CRM_CHECK(root_nodes_seen == 0, result = FALSE);
@@ -4239,7 +4074,9 @@ __xml_diff_object(xmlNode * old, xmlNode * new)
             p->flags = (p->flags & ~xpf_created);
 
             if(strcmp(value, old_value) != 0) {
-                /* Restore the original value, so we can call crm_xml_add() whcih checks ACLs */
+                /* Restore the original value, so we can call crm_xml_add(),
+                 * which checks ACLs
+                 */
                 char *vcopy = crm_element_value_copy(new, name);
 
                 crm_trace("Modified %s@%s %s->%s", old->name, name, old_value, vcopy);
@@ -4288,24 +4125,25 @@ __xml_diff_object(xmlNode * old, xmlNode * new)
 
     for (cIter = __xml_first_child(old); cIter != NULL; ) {
         xmlNode *old_child = cIter;
-        xmlNode *new_child = find_entity(new, crm_element_name(cIter), ID(cIter));
+        xmlNode *new_child = find_element(new, cIter, TRUE);
 
         cIter = __xml_next(cIter);
         if(new_child) {
             __xml_diff_object(old_child, new_child);
 
         } else {
-            xml_private_t *p = old_child->_private;
-
             /* Create then free (which will check the acls if necessary) */
             xmlNode *candidate = add_node_copy(new, old_child);
             xmlNode *top = xmlDocGetRootElement(candidate->doc);
 
             __xml_node_clean(candidate);
             __xml_acl_apply(top); /* Make sure any ACLs are applied to 'candidate' */
-            free_xml(candidate);
+            /* Record the old position */
+            free_xml_with_position(candidate, __xml_offset(old_child));
 
-            if(NULL == find_entity(new, crm_element_name(old_child), ID(old_child))) {
+            if (find_element(new, old_child, TRUE) == NULL) {
+                xml_private_t *p = old_child->_private;
+
                 p->flags |= xpf_skip;
             }
         }
@@ -4313,7 +4151,7 @@ __xml_diff_object(xmlNode * old, xmlNode * new)
 
     for (cIter = __xml_first_child(new); cIter != NULL; ) {
         xmlNode *new_child = cIter;
-        xmlNode *old_child = find_entity(old, crm_element_name(cIter), ID(cIter));
+        xmlNode *old_child = find_element(old, cIter, TRUE);
 
         cIter = __xml_next(cIter);
         if(old_child == NULL) {
@@ -4325,22 +4163,21 @@ __xml_diff_object(xmlNode * old, xmlNode * new)
             /* Check for movement, we already checked for differences */
             int p_new = __xml_offset(new_child);
             int p_old = __xml_offset(old_child);
-            xml_private_t *p = new_child->_private;
 
             if(p_old != p_new) {
-                crm_info("%s.%s moved from %d to %d - %d",
+                xml_private_t *p = new_child->_private;
+
+                crm_info("%s.%s moved from %d to %d",
                          new_child->name, ID(new_child), p_old, p_new);
                 __xml_node_dirty(new);
                 p->flags |= xpf_moved;
 
                 if(p_old > p_new) {
                     p = old_child->_private;
-                    p->flags |= xpf_skip;
-
                 } else {
                     p = new_child->_private;
-                    p->flags |= xpf_skip;
                 }
+                p->flags |= xpf_skip;
             }
         }
     }
@@ -4489,18 +4326,36 @@ in_upper_context(int depth, int context, xmlNode * xml_node)
 }
 
 static xmlNode *
-find_xml_comment(xmlNode * root, xmlNode * search_comment)
+find_xml_comment(xmlNode * root, xmlNode * search_comment, gboolean exact)
 {
     xmlNode *a_child = NULL;
+    int search_offset = __xml_offset(search_comment);
 
     CRM_CHECK(search_comment->type == XML_COMMENT_NODE, return NULL);
 
     for (a_child = __xml_first_child(root); a_child != NULL; a_child = __xml_next(a_child)) {
-        if (a_child->type != XML_COMMENT_NODE) {
-            continue;
+        if (exact) {
+            int offset = __xml_offset(a_child);
+            xml_private_t *p = a_child->_private;
+
+            if (offset < search_offset) {
+                continue;
+
+            } else if (offset > search_offset) {
+                return NULL;
+            }
+
+            if (is_set(p->flags, xpf_skip)) {
+                continue;
+            }
         }
-        if (safe_str_eq((const char *)a_child->content, (const char *)search_comment->content)) {
+
+        if (a_child->type == XML_COMMENT_NODE
+            && safe_str_eq((const char *)a_child->content, (const char *)search_comment->content)) {
             return a_child;
+
+        } else if (exact) {
+            return NULL;
         }
     }
 
@@ -4595,13 +4450,7 @@ subtract_xml_object(xmlNode * parent, xmlNode * left, xmlNode * right,
          left_child = __xml_next(left_child)) {
         gboolean child_changed = FALSE;
 
-        if (left_child->type == XML_COMMENT_NODE) {
-            right_child = find_xml_comment(right, left_child);
-
-        } else {
-            right_child = find_entity(right, crm_element_name(left_child), ID(left_child));
-        }
-
+        right_child = find_element(right, left_child, FALSE);
         subtract_xml_object(diff, left_child, right_child, full, &child_changed, marker);
         if (child_changed) {
             *changed = TRUE;
@@ -4727,7 +4576,7 @@ add_xml_comment(xmlNode * parent, xmlNode * target, xmlNode * update)
     CRM_CHECK(update->type == XML_COMMENT_NODE, return 0);
 
     if (target == NULL) {
-        target = find_xml_comment(parent, update);
+        target = find_xml_comment(parent, update, FALSE);
     }
 
     if (target == NULL) {
@@ -4968,19 +4817,51 @@ replace_xml_child(xmlNode * parent, xmlNode * child, xmlNode * update, gboolean 
     return can_delete;
 }
 
+/*!
+ * \brief Create an XML name/value pair
+ *
+ * \param[in] parent  If not NULL, make new XML node a child of this one
+ * \param[in] id      If not NULL, use this as ID (otherwise auto-generate)
+ * \param[in] name    Name to use
+ * \param[in] value   Value to use
+ *
+ * \return New XML object on success, NULL otherwise
+ */
+xmlNode *
+crm_create_nvpair_xml(xmlNode *parent, const char *id, const char *name,
+                      const char *value)
+{
+    xmlNode *nvp;
+
+    /* id can be NULL so we auto-generate one, and name can be NULL if this
+     * will be used to delete a name/value pair by ID, but both can't be NULL
+     */
+    CRM_CHECK(id || name, return NULL);
+
+    nvp = create_xml_node(parent, XML_CIB_TAG_NVPAIR);
+    CRM_CHECK(nvp, return NULL);
+
+    if (id) {
+        crm_xml_add(nvp, XML_ATTR_ID, id);
+    } else {
+        const char *parent_id = ID(parent);
+
+        crm_xml_set_id(nvp, "%s-%s",
+                       (parent_id? parent_id : XML_CIB_TAG_NVPAIR), name);
+    }
+    crm_xml_add(nvp, XML_NVPAIR_ATTR_NAME, name);
+    crm_xml_add(nvp, XML_NVPAIR_ATTR_VALUE, value);
+    return nvp;
+}
+
 void
 hash2nvpair(gpointer key, gpointer value, gpointer user_data)
 {
     const char *name = key;
     const char *s_value = value;
-
     xmlNode *xml_node = user_data;
-    xmlNode *xml_child = create_xml_node(xml_node, XML_CIB_TAG_NVPAIR);
 
-    crm_xml_add(xml_child, XML_ATTR_ID, name);
-    crm_xml_add(xml_child, XML_NVPAIR_ATTR_NAME, name);
-    crm_xml_add(xml_child, XML_NVPAIR_ATTR_VALUE, s_value);
-
+    crm_create_nvpair_xml(xml_node, name, name, s_value);
     crm_trace("dumped: name=%s value=%s", name, s_value);
 }
 
@@ -5030,10 +4911,15 @@ hash2metafield(gpointer key, gpointer value, gpointer user_data)
 
     if (key == NULL || value == NULL) {
         return;
-    } else if (((char *)key)[0] == '#') {
-        return;
-    } else if (strstr(key, ":")) {
-        return;
+    }
+
+    /* Filter out cluster-generated attributes that contain a '#' or ':'
+     * (like fail-count and last-failure).
+     */
+    for (crm_name = key; *crm_name; ++crm_name) {
+        if ((*crm_name == '#') || (*crm_name == ':')) {
+            return;
+        }
     }
 
     crm_name = crm_meta_name(key);
@@ -5047,8 +4933,7 @@ xml2list(xmlNode * parent)
     xmlNode *child = NULL;
     xmlAttrPtr pIter = NULL;
     xmlNode *nvpair_list = NULL;
-    GHashTable *nvpair_hash = g_hash_table_new_full(crm_str_hash, g_str_equal,
-                                                    g_hash_destroy_str, g_hash_destroy_str);
+    GHashTable *nvpair_hash = crm_str_table_new();
 
     CRM_CHECK(parent != NULL, return nvpair_hash);
 
@@ -5164,48 +5049,6 @@ sorted_xml(xmlNode * input, xmlNode * parent, gboolean recursive)
     return result;
 }
 
-static gboolean
-validate_with_dtd(xmlDocPtr doc, gboolean to_logs, const char *dtd_file)
-{
-    gboolean valid = TRUE;
-
-    xmlDtdPtr dtd = NULL;
-    xmlValidCtxtPtr cvp = NULL;
-
-    CRM_CHECK(doc != NULL, return FALSE);
-    CRM_CHECK(dtd_file != NULL, return FALSE);
-
-    dtd = xmlParseDTD(NULL, (const xmlChar *)dtd_file);
-    if(dtd == NULL) {
-        crm_err("Could not locate/parse DTD: %s", dtd_file);
-        return TRUE;
-    }
-
-    cvp = xmlNewValidCtxt();
-    if(cvp) {
-        if (to_logs) {
-            cvp->userData = (void *)LOG_ERR;
-            cvp->error = (xmlValidityErrorFunc) xml_log;
-            cvp->warning = (xmlValidityWarningFunc) xml_log;
-        } else {
-            cvp->userData = (void *)stderr;
-            cvp->error = (xmlValidityErrorFunc) fprintf;
-            cvp->warning = (xmlValidityWarningFunc) fprintf;
-        }
-
-        if (!xmlValidateDtd(cvp, doc, dtd)) {
-            valid = FALSE;
-        }
-        xmlFreeValidCtxt(cvp);
-
-    } else {
-        crm_err("Internal error: No valid context");
-    }
-
-    xmlFreeDtd(dtd);
-    return valid;
-}
-
 xmlNode *
 first_named_child(xmlNode * parent, const char *name)
 {
@@ -5214,7 +5057,7 @@ first_named_child(xmlNode * parent, const char *name)
     for (match = __xml_first_child(parent); match != NULL; match = __xml_next(match)) {
         /*
          * name == NULL gives first child regardless of name; this is
-         * semantically incorrect in this funciton, but may be necessary
+         * semantically incorrect in this function, but may be necessary
          * due to prior use of xml_child_iter_filter
          */
         if (name == NULL || strcmp((const char *)match->name, name) == 0) {
@@ -5224,115 +5067,26 @@ first_named_child(xmlNode * parent, const char *name)
     return NULL;
 }
 
-#if 0
-static void
-relaxng_invalid_stderr(void *userData, xmlErrorPtr error)
+/*!
+ * \brief Get next instance of same XML tag
+ *
+ * \param[in] sibling  XML tag to start from
+ *
+ * \return Next sibling XML tag with same name
+ */
+xmlNode *
+crm_next_same_xml(xmlNode *sibling)
 {
-    /*
-       Structure xmlError
-       struct _xmlError {
-       int      domain  : What part of the library raised this er
-       int      code    : The error code, e.g. an xmlParserError
-       char *   message : human-readable informative error messag
-       xmlErrorLevel    level   : how consequent is the error
-       char *   file    : the filename
-       int      line    : the line number if available
-       char *   str1    : extra string information
-       char *   str2    : extra string information
-       char *   str3    : extra string information
-       int      int1    : extra number information
-       int      int2    : column number of the error or 0 if N/A
-       void *   ctxt    : the parser context if available
-       void *   node    : the node in the tree
-       }
-     */
-    crm_err("Structured error: line=%d, level=%d %s", error->line, error->level, error->message);
-}
-#endif
+    xmlNode *match = __xml_next(sibling);
+    const char *name = crm_element_name(sibling);
 
-static gboolean
-validate_with_relaxng(xmlDocPtr doc, gboolean to_logs, const char *relaxng_file,
-                      relaxng_ctx_cache_t ** cached_ctx)
-{
-    int rc = 0;
-    gboolean valid = TRUE;
-    relaxng_ctx_cache_t *ctx = NULL;
-
-    CRM_CHECK(doc != NULL, return FALSE);
-    CRM_CHECK(relaxng_file != NULL, return FALSE);
-
-    if (cached_ctx && *cached_ctx) {
-        ctx = *cached_ctx;
-
-    } else {
-        crm_info("Creating RNG parser context");
-        ctx = calloc(1, sizeof(relaxng_ctx_cache_t));
-
-        xmlLoadExtDtdDefaultValue = 1;
-        ctx->parser = xmlRelaxNGNewParserCtxt(relaxng_file);
-        CRM_CHECK(ctx->parser != NULL, goto cleanup);
-
-        if (to_logs) {
-            xmlRelaxNGSetParserErrors(ctx->parser,
-                                      (xmlRelaxNGValidityErrorFunc) xml_log,
-                                      (xmlRelaxNGValidityWarningFunc) xml_log,
-                                      GUINT_TO_POINTER(LOG_ERR));
-        } else {
-            xmlRelaxNGSetParserErrors(ctx->parser,
-                                      (xmlRelaxNGValidityErrorFunc) fprintf,
-                                      (xmlRelaxNGValidityWarningFunc) fprintf, stderr);
+    while (match != NULL) {
+        if (!strcmp(crm_element_name(match), name)) {
+            return match;
         }
-
-        ctx->rng = xmlRelaxNGParse(ctx->parser);
-        CRM_CHECK(ctx->rng != NULL, crm_err("Could not find/parse %s", relaxng_file);
-                  goto cleanup);
-
-        ctx->valid = xmlRelaxNGNewValidCtxt(ctx->rng);
-        CRM_CHECK(ctx->valid != NULL, goto cleanup);
-
-        if (to_logs) {
-            xmlRelaxNGSetValidErrors(ctx->valid,
-                                     (xmlRelaxNGValidityErrorFunc) xml_log,
-                                     (xmlRelaxNGValidityWarningFunc) xml_log,
-                                     GUINT_TO_POINTER(LOG_ERR));
-        } else {
-            xmlRelaxNGSetValidErrors(ctx->valid,
-                                     (xmlRelaxNGValidityErrorFunc) fprintf,
-                                     (xmlRelaxNGValidityWarningFunc) fprintf, stderr);
-        }
+        match = __xml_next(match);
     }
-
-    /* xmlRelaxNGSetValidStructuredErrors( */
-    /*  valid, relaxng_invalid_stderr, valid); */
-
-    xmlLineNumbersDefault(1);
-    rc = xmlRelaxNGValidateDoc(ctx->valid, doc);
-    if (rc > 0) {
-        valid = FALSE;
-
-    } else if (rc < 0) {
-        crm_err("Internal libxml error during validation\n");
-    }
-
-  cleanup:
-
-    if (cached_ctx) {
-        *cached_ctx = ctx;
-
-    } else {
-        if (ctx->parser != NULL) {
-            xmlRelaxNGFreeParserCtxt(ctx->parser);
-        }
-        if (ctx->valid != NULL) {
-            xmlRelaxNGFreeValidCtxt(ctx->valid);
-        }
-        if (ctx->rng != NULL) {
-            xmlRelaxNGFree(ctx->rng);
-        }
-        free(ctx);
-    }
-
-    return valid;
+    return NULL;
 }
 
 void
@@ -5353,450 +5107,19 @@ crm_xml_init(void)
         xmlDeregisterNodeDefault(pcmkDeregisterNode);
         xmlRegisterNodeDefault(pcmkRegisterNode);
 
-        __xml_build_schema_list();
+        crm_schema_init();
     }
 }
 
 void
 crm_xml_cleanup(void)
 {
-    int lpc = 0;
-    relaxng_ctx_cache_t *ctx = NULL;
-
     crm_info("Cleaning up memory from libxml2");
-    for (; lpc < xml_schema_max; lpc++) {
-
-        switch (known_schemas[lpc].type) {
-            case 0:
-                /* None */
-                break;
-            case 1:
-                /* DTD - Not cached */
-                break;
-            case 2:
-                /* RNG - Cached */
-                ctx = (relaxng_ctx_cache_t *) known_schemas[lpc].cache;
-                if (ctx == NULL) {
-                    break;
-                }
-                if (ctx->parser != NULL) {
-                    xmlRelaxNGFreeParserCtxt(ctx->parser);
-                }
-                if (ctx->valid != NULL) {
-                    xmlRelaxNGFreeValidCtxt(ctx->valid);
-                }
-                if (ctx->rng != NULL) {
-                    xmlRelaxNGFree(ctx->rng);
-                }
-                free(ctx);
-                known_schemas[lpc].cache = NULL;
-                break;
-            default:
-                break;
-        }
-        free(known_schemas[lpc].name);
-        free(known_schemas[lpc].location);
-        free(known_schemas[lpc].transform);
-    }
-    free(known_schemas);
-    xsltCleanupGlobals();
+    crm_schema_cleanup();
     xmlCleanupParser();
 }
 
-static gboolean
-validate_with(xmlNode * xml, int method, gboolean to_logs)
-{
-    xmlDocPtr doc = NULL;
-    gboolean valid = FALSE;
-    int type = 0;
-    char *file = NULL;
-
-    if(method < 0) {
-        return FALSE;
-    }
-
-    type = known_schemas[method].type;
-    if(type == 0) {
-        return TRUE;
-    }
-
-    CRM_CHECK(xml != NULL, return FALSE);
-    doc = getDocPtr(xml);
-    file = get_schema_path(known_schemas[method].name, known_schemas[method].location);
-
-    crm_trace("Validating with: %s (type=%d)", crm_str(file), type);
-    switch (type) {
-        case 1:
-            valid = validate_with_dtd(doc, to_logs, file);
-            break;
-        case 2:
-            valid =
-                validate_with_relaxng(doc, to_logs, file,
-                                      (relaxng_ctx_cache_t **) & (known_schemas[method].cache));
-            break;
-        default:
-            crm_err("Unknown validator type: %d", type);
-            break;
-    }
-
-    free(file);
-    return valid;
-}
-
-#include <stdio.h>
-static void
-dump_file(const char *filename)
-{
-
-    FILE *fp = NULL;
-    int ch, line = 0;
-
-    CRM_CHECK(filename != NULL, return);
-
-    fp = fopen(filename, "r");
-    CRM_CHECK(fp != NULL, return);
-
-    fprintf(stderr, "%4d ", ++line);
-    do {
-        ch = getc(fp);
-        if (ch == EOF) {
-            putc('\n', stderr);
-            break;
-        } else if (ch == '\n') {
-            fprintf(stderr, "\n%4d ", ++line);
-        } else {
-            putc(ch, stderr);
-        }
-    } while (1);
-
-    fclose(fp);
-}
-
-gboolean
-validate_xml_verbose(xmlNode * xml_blob)
-{
-    int fd = 0;
-    xmlDoc *doc = NULL;
-    xmlNode *xml = NULL;
-    gboolean rc = FALSE;
-    char *filename = strdup(CRM_STATE_DIR "/cib-invalid.XXXXXX");
-
-    umask(S_IWGRP | S_IWOTH | S_IROTH);
-    fd = mkstemp(filename);
-    write_xml_fd(xml_blob, filename, fd, FALSE);
-
-    dump_file(filename);
-
-    doc = xmlParseFile(filename);
-    xml = xmlDocGetRootElement(doc);
-    rc = validate_xml(xml, NULL, FALSE);
-    free_xml(xml);
-
-    unlink(filename);
-    free(filename);
-
-    return rc;
-}
-
-gboolean
-validate_xml(xmlNode * xml_blob, const char *validation, gboolean to_logs)
-{
-    int version = 0;
-
-    if (validation == NULL) {
-        validation = crm_element_value(xml_blob, XML_ATTR_VALIDATION);
-    }
-
-    if (validation == NULL) {
-        int lpc = 0;
-        bool valid = FALSE;
-
-        validation = crm_element_value(xml_blob, "ignore-dtd");
-        if (crm_is_true(validation)) {
-            /* Legacy compatibilty */
-            crm_xml_add(xml_blob, XML_ATTR_VALIDATION, "none");
-            return TRUE;
-        }
-
-        /* Work it out */
-        for (lpc = 0; lpc < xml_schema_max; lpc++) {
-            if(validate_with(xml_blob, lpc, FALSE)) {
-                valid = TRUE;
-                crm_xml_add(xml_blob, XML_ATTR_VALIDATION, known_schemas[lpc].name);
-                crm_info("XML validated against %s", known_schemas[lpc].name);
-                if(known_schemas[lpc].after_transform == 0) {
-                    break;
-                }
-            }
-        }
-
-        return valid;
-    }
-
-    version = get_schema_version(validation);
-    if (strcmp(validation, "none") == 0) {
-        return TRUE;
-
-    } else if(version < xml_schema_max) {
-        return validate_with(xml_blob, version, to_logs);
-
-    }
-
-    crm_err("Unknown validator: %s", validation);
-    return FALSE;
-}
-
-#if HAVE_LIBXSLT
-static xmlNode *
-apply_transformation(xmlNode * xml, const char *transform)
-{
-    char *xform = NULL;
-    xmlNode *out = NULL;
-    xmlDocPtr res = NULL;
-    xmlDocPtr doc = NULL;
-    xsltStylesheet *xslt = NULL;
-
-    CRM_CHECK(xml != NULL, return FALSE);
-    doc = getDocPtr(xml);
-    xform = get_schema_path(NULL, transform);
-
-    xmlLoadExtDtdDefaultValue = 1;
-    xmlSubstituteEntitiesDefault(1);
-
-    xslt = xsltParseStylesheetFile((const xmlChar *)xform);
-    CRM_CHECK(xslt != NULL, goto cleanup);
-
-    res = xsltApplyStylesheet(xslt, doc, NULL);
-    CRM_CHECK(res != NULL, goto cleanup);
-
-    out = xmlDocGetRootElement(res);
-
-  cleanup:
-    if (xslt) {
-        xsltFreeStylesheet(xslt);
-    }
-
-    free(xform);
-
-    return out;
-}
-#endif
-
-const char *
-get_schema_name(int version)
-{
-    if (version < 0 || version >= xml_schema_max) {
-        return "unknown";
-    }
-    return known_schemas[version].name;
-}
-
-int
-get_schema_version(const char *name)
-{
-    int lpc = 0;
-
-    if(name == NULL) {
-        name = "none";
-    }
-    for (; lpc < xml_schema_max; lpc++) {
-        if (safe_str_eq(name, known_schemas[lpc].name)) {
-            return lpc;
-        }
-    }
-    return -1;
-}
-
-/* set which validation to use */
-#include <crm/cib.h>
-int
-update_validation(xmlNode ** xml_blob, int *best, int max, gboolean transform, gboolean to_logs)
-{
-    xmlNode *xml = NULL;
-    char *value = NULL;
-    int max_stable_schemas = xml_latest_schema_index();
-    int lpc = 0, match = -1, rc = pcmk_ok;
-
-    CRM_CHECK(best != NULL, return -EINVAL);
-    CRM_CHECK(xml_blob != NULL, return -EINVAL);
-    CRM_CHECK(*xml_blob != NULL, return -EINVAL);
-
-    *best = 0;
-    xml = *xml_blob;
-    value = crm_element_value_copy(xml, XML_ATTR_VALIDATION);
-
-    if (value != NULL) {
-        match = get_schema_version(value);
-
-        lpc = match;
-        if (lpc >= 0 && transform == FALSE) {
-            lpc++;
-
-        } else if (lpc < 0) {
-            crm_debug("Unknown validation type");
-            lpc = 0;
-        }
-    }
-
-    if (match >= max_stable_schemas) {
-        /* nothing to do */
-        free(value);
-        *best = match;
-        return pcmk_ok;
-    }
-
-    while(lpc <= max_stable_schemas) {
-        gboolean valid = TRUE;
-
-        crm_debug("Testing '%s' validation (%d of %d)",
-                  known_schemas[lpc].name ? known_schemas[lpc].name : "<unset>",
-                  lpc, max_stable_schemas);
-        valid = validate_with(xml, lpc, to_logs);
-
-        if (valid) {
-            *best = lpc;
-        } else {
-            crm_trace("%s validation failed", known_schemas[lpc].name ? known_schemas[lpc].name : "<unset>");
-        }
-
-        if (valid && transform) {
-            xmlNode *upgrade = NULL;
-            int next = known_schemas[lpc].after_transform;
-
-            if (next < 0) {
-                crm_trace("Stopping at %s", known_schemas[lpc].name);
-                break;
-
-            } else if (max > 0 && lpc == max) {
-                crm_trace("Upgrade limit reached at %s (lpc=%d, next=%d, max=%d)",
-                          known_schemas[lpc].name, lpc, next, max);
-                break;
-
-            } else if (max > 0 && next > max) {
-                crm_debug("Upgrade limit reached at %s (lpc=%d, next=%d, max=%d)",
-                          known_schemas[lpc].name, lpc, next, max);
-                break;
-
-            } else if (known_schemas[lpc].transform == NULL) {
-                crm_debug("%s-style configuration is also valid for %s",
-                           known_schemas[lpc].name, known_schemas[next].name);
-
-                if (validate_with(xml, next, to_logs)) {
-                    crm_debug("Configuration valid for schema: %s", known_schemas[next].name);
-                    lpc = next;
-                    *best = next;
-                    rc = pcmk_ok;
-
-                } else {
-                    crm_info("Configuration not valid for schema: %s", known_schemas[next].name);
-                }
-
-            } else {
-                crm_debug("Upgrading %s-style configuration to %s with %s",
-                           known_schemas[lpc].name, known_schemas[next].name,
-                           known_schemas[lpc].transform ? known_schemas[lpc].transform : "no-op");
-
-#if HAVE_LIBXSLT
-                upgrade = apply_transformation(xml, known_schemas[lpc].transform);
-#endif
-                if (upgrade == NULL) {
-                    crm_err("Transformation %s failed", known_schemas[lpc].transform);
-                    rc = -pcmk_err_transform_failed;
-
-                } else if (validate_with(upgrade, next, to_logs)) {
-                    crm_info("Transformation %s successful", known_schemas[lpc].transform);
-                    lpc = next;
-                    *best = next;
-                    free_xml(xml);
-                    xml = upgrade;
-                    rc = pcmk_ok;
-
-                } else {
-                    crm_err("Transformation %s did not produce a valid configuration",
-                            known_schemas[lpc].transform);
-                    crm_log_xml_info(upgrade, "transform:bad");
-                    free_xml(upgrade);
-                    rc = -pcmk_err_schema_validation;
-                }
-            }
-        }
-    }
-
-    if (*best > match) {
-        crm_info("%s the configuration from %s to %s",
-                   transform?"Transformed":"Upgraded",
-                   value ? value : "<none>", known_schemas[*best].name);
-        crm_xml_add(xml, XML_ATTR_VALIDATION, known_schemas[*best].name);
-    }
-
-    *xml_blob = xml;
-    free(value);
-    return rc;
-}
-
-gboolean
-cli_config_update(xmlNode ** xml, int *best_version, gboolean to_logs)
-{
-    gboolean rc = TRUE;
-    const char *value = crm_element_value(*xml, XML_ATTR_VALIDATION);
-
-    int version = get_schema_version(value);
-    int min_version = xml_minimum_schema_index();
-
-    if (version < min_version) {
-        xmlNode *converted = NULL;
-
-        converted = copy_xml(*xml);
-        update_validation(&converted, &version, 0, TRUE, to_logs);
-
-        value = crm_element_value(converted, XML_ATTR_VALIDATION);
-        if (version < min_version) {
-            if (to_logs) {
-                crm_config_err("Your current configuration could only be upgraded to %s... "
-                               "the minimum requirement is %s.\n", crm_str(value),
-                               get_schema_name(min_version));
-            } else {
-                fprintf(stderr, "Your current configuration could only be upgraded to %s... "
-                        "the minimum requirement is %s.\n",
-                        crm_str(value), get_schema_name(min_version));
-            }
-
-            free_xml(converted);
-            converted = NULL;
-            rc = FALSE;
-
-        } else {
-            free_xml(*xml);
-            *xml = converted;
-
-            if (version < xml_latest_schema_index()) {
-                crm_config_warn("Your configuration was internally updated to %s... "
-                                "which is acceptable but not the most recent",
-                                get_schema_name(version));
-
-            } else if (to_logs) {
-                crm_info("Your configuration was internally updated to the latest version (%s)",
-                         get_schema_name(version));
-            }
-        }
-
-    } else if (version >= get_schema_version("none")) {
-        if (to_logs) {
-            crm_config_warn("Configuration validation is currently disabled."
-                            " It is highly encouraged and prevents many common cluster issues.");
-
-        } else {
-            fprintf(stderr, "Configuration validation is currently disabled."
-                    " It is highly encouraged and prevents many common cluster issues.\n");
-        }
-    }
-
-    if (best_version) {
-        *best_version = version;
-    }
-
-    return rc;
-}
+#define XPATH_MAX 512
 
 xmlNode *
 expand_idref(xmlNode * input, xmlNode * top)
@@ -5817,11 +5140,11 @@ expand_idref(xmlNode * input, xmlNode * top)
     ref = crm_element_value(result, XML_ATTR_IDREF);
 
     if (ref != NULL) {
-        int xpath_max = 512, offset = 0;
+        int offset = 0;
 
-        xpath_string = calloc(1, xpath_max);
+        xpath_string = calloc(1, XPATH_MAX);
 
-        offset += snprintf(xpath_string + offset, xpath_max - offset, "//%s[@id='%s']", tag, ref);
+        offset += snprintf(xpath_string + offset, XPATH_MAX - offset, "//%s[@id='%s']", tag, ref);
         CRM_LOG_ASSERT(offset > 0);
 
         result = get_xpath_object(xpath_string, top, LOG_ERR);
@@ -5860,3 +5183,8 @@ crm_element_value(xmlNode * data, const char *name)
     return (const char *)attr->children->content;
 }
 
+void
+crm_destroy_xml(gpointer data)
+{
+    free_xml(data);
+}

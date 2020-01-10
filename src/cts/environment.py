@@ -182,7 +182,6 @@ class Environment:
 
         else:
             raise ValueError("Unknown stack: "+name)
-            sys.exit(1)
 
     def get_stack_short(self):
         # Create the Cluster Manager object
@@ -361,18 +360,15 @@ class Environment:
                 elif args[i+1] == "phd":
                     self["DoStonith"]=1
                     self["stonith-type"] = "fence_phd_kvm"
-                    self["stonith-params"] = "pcmk_arg_map=domain:uname,delay=0"
                 elif args[i+1] == "rhcs" or args[i+1] == "xvm" or args[i+1] == "virt":
                     self["DoStonith"]=1
                     self["stonith-type"] = "fence_xvm"
-                    self["stonith-params"] = "pcmk_arg_map=domain:uname,delay=0"
                 elif args[i+1] == "docker":
                     self["DoStonith"]=1
                     self["stonith-type"] = "fence_docker_cts"
                 elif args[i+1] == "scsi":
                     self["DoStonith"]=1
                     self["stonith-type"] = "fence_scsi"
-                    self["stonith-params"] = "delay=0"
                 elif args[i+1] == "ssh" or args[i+1] == "lha":
                     self["DoStonith"]=1
                     self["stonith-type"] = "external/ssh"

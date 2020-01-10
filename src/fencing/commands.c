@@ -147,6 +147,24 @@ get_action_delay_max(stonith_device_t * device, const char * action)
     return delay_max_ms;
 }
 
+static int
+get_action_delay_base(stonith_device_t * device, const char * action)
+{
+    const char *value = NULL;
+    int delay_base_ms = 0;
+
+    if (safe_str_neq(action, "off") && safe_str_neq(action, "reboot")) {
+        return 0;
+    }
+
+    value = g_hash_table_lookup(device->params, STONITH_ATTR_DELAY_BASE);
+    if (value) {
+       delay_base_ms = crm_get_msec(value);
+    }
+
+    return delay_base_ms;
+}
+
 /*!
  * \internal
  * \brief Override STONITH timeout with pcmk_*_timeout if available
@@ -185,7 +203,7 @@ get_action_timeout(stonith_device_t * device, const char *action, int default_ti
         }
 
         /* If the device config specified an action-specific timeout, use it */
-        snprintf(buffer, sizeof(buffer) - 1, "pcmk_%s_timeout", action);
+        snprintf(buffer, sizeof(buffer), "pcmk_%s_timeout", action);
         value = g_hash_table_lookup(device->params, buffer);
         if (value) {
             return atoi(value);
@@ -424,6 +442,7 @@ static void
 schedule_stonith_command(async_command_t * cmd, stonith_device_t * device)
 {
     int delay_max = 0;
+    int delay_base = 0;
 
     CRM_CHECK(cmd != NULL, return);
     CRM_CHECK(device != NULL, return);
@@ -453,11 +472,27 @@ schedule_stonith_command(async_command_t * cmd, stonith_device_t * device)
     mainloop_set_trigger(device->work);
 
     delay_max = get_action_delay_max(device, cmd->action);
+    delay_base = get_action_delay_base(device, cmd->action);
+    if (delay_max == 0) {
+        delay_max = delay_base;
+    }
+    if (delay_max < delay_base) {
+        crm_warn("Base-delay (%dms) is larger than max-delay (%dms) "
+                 "for %s on %s - limiting to max-delay",
+                 delay_base, delay_max, cmd->action, device->id);
+        delay_base = delay_max;
+    }
     if (delay_max > 0) {
-        cmd->start_delay = rand() % delay_max;
-        crm_notice("Delaying %s on %s for %lldms (timeout=%ds)",
-                    cmd->action, device->id, cmd->start_delay, cmd->timeout);
-        cmd->delay_id = g_timeout_add(cmd->start_delay, start_delay_helper, cmd);
+        // coverity[dont_call] We're not using rand() for security
+        cmd->start_delay =
+            ((delay_max != delay_base)?(rand() % (delay_max - delay_base)):0)
+            + delay_base;
+        crm_notice("Delaying %s on %s for %lldms (timeout=%ds, base=%dms, "
+                   "max=%dms)",
+                    cmd->action, device->id, cmd->start_delay, cmd->timeout,
+                    delay_base, delay_max);
+        cmd->delay_id =
+            g_timeout_add(cmd->start_delay, start_delay_helper, cmd);
     }
 }
 
@@ -475,7 +510,6 @@ free_device(gpointer data)
 
         crm_warn("Removal of device '%s' purged operation %s", device->id, cmd->action);
         cmd->done_cb(0, -ENODEV, NULL, cmd);
-        free_async_command(cmd);
     }
     g_list_free(device->pending_ops);
 
@@ -496,8 +530,7 @@ build_port_aliases(const char *hostmap, GListPtr * targets)
 {
     char *name = NULL;
     int last = 0, lpc = 0, max = 0, added = 0;
-    GHashTable *aliases =
-        g_hash_table_new_full(crm_strcase_hash, crm_strcase_equal, g_hash_destroy_str, g_hash_destroy_str);
+    GHashTable *aliases = crm_strcase_table_new();
 
     if (hostmap == NULL) {
         return aliases;
@@ -659,8 +692,7 @@ get_agent_metadata(const char *agent)
     char *buffer = NULL;
 
     if(metadata_cache == NULL) {
-        metadata_cache = g_hash_table_new_full(
-            crm_str_hash, g_str_equal, g_hash_destroy_str, g_hash_destroy_str);
+        metadata_cache = crm_str_table_new();
     }
 
     buffer = g_hash_table_lookup(metadata_cache, agent);
@@ -707,22 +739,23 @@ is_nodeid_required(xmlNode * xml)
     return TRUE;
 }
 
+#define MAX_ACTION_LEN 256
+
 static char *
 add_action(char *actions, const char *action)
 {
-    static size_t len = 256;
     int offset = 0;
 
     if (actions == NULL) {
-        actions = calloc(1, len);
+        actions = calloc(1, MAX_ACTION_LEN);
     } else {
         offset = strlen(actions);
     }
 
     if (offset > 0) {
-        offset += snprintf(actions+offset, len-offset, " ");
+        offset += snprintf(actions+offset, MAX_ACTION_LEN - offset, " ");
     }
-    offset += snprintf(actions+offset, len-offset, "%s", action);
+    offset += snprintf(actions+offset, MAX_ACTION_LEN - offset, "%s", action);
 
     return actions;
 }
@@ -783,6 +816,73 @@ read_action_metadata(stonith_device_t *device)
     freeXpathObject(xpath);
 }
 
+/*!
+ * \internal
+ * \brief Set a pcmk_*_action parameter if not already set
+ *
+ * \param[in,out] params  Device parameters
+ * \param[in]     action  Name of action
+ * \param[in]     value   Value to use if action is not already set
+ */
+static void
+map_action(GHashTable *params, const char *action, const char *value)
+{
+    char *key = crm_strdup_printf("pcmk_%s_action", action);
+
+    if (g_hash_table_lookup(params, key)) {
+        crm_warn("Ignoring %s='%s', see %s instead",
+                 STONITH_ATTR_ACTION_OP, value, key);
+        free(key);
+    } else {
+        crm_warn("Mapping %s='%s' to %s='%s'",
+                 STONITH_ATTR_ACTION_OP, value, key, value);
+        g_hash_table_insert(params, key, strdup(value));
+    }
+}
+
+/*!
+ * \internal
+ * \brief Create device parameter table from XML
+ *
+ * \param[in]     name    Device name (used for logging only)
+ * \param[in,out] params  Device parameters
+ */
+static GHashTable *
+xml2device_params(const char *name, xmlNode *dev)
+{
+    GHashTable *params = xml2list(dev);
+    const char *value;
+
+    /* Action should never be specified in the device configuration,
+     * but we support it for users who are familiar with other software
+     * that worked that way.
+     */
+    value = g_hash_table_lookup(params, STONITH_ATTR_ACTION_OP);
+    if (value != NULL) {
+        crm_warn("%s has '%s' parameter, which should never be specified in configuration",
+                 name, STONITH_ATTR_ACTION_OP);
+
+        if (*value == '\0') {
+            crm_warn("Ignoring empty '%s' parameter", STONITH_ATTR_ACTION_OP);
+
+        } else if (strcmp(value, "reboot") == 0) {
+            crm_warn("Ignoring %s='reboot' (see stonith-action cluster property instead)",
+                     STONITH_ATTR_ACTION_OP);
+
+        } else if (strcmp(value, "off") == 0) {
+            map_action(params, "reboot", value);
+
+        } else {
+            map_action(params, "off", value);
+            map_action(params, "reboot", value);
+        }
+
+        g_hash_table_remove(params, STONITH_ATTR_ACTION_OP);
+    }
+
+    return params;
+}
+
 static stonith_device_t *
 build_device_from_xml(xmlNode * msg)
 {
@@ -794,7 +894,7 @@ build_device_from_xml(xmlNode * msg)
     device->id = crm_element_value_copy(dev, XML_ATTR_ID);
     device->agent = crm_element_value_copy(dev, "agent");
     device->namespace = crm_element_value_copy(dev, "namespace");
-    device->params = xml2list(dev);
+    device->params = xml2device_params(device->id, dev);
 
     value = g_hash_table_lookup(device->params, STONITH_ATTR_HOSTLIST);
     if (value) {
@@ -988,14 +1088,41 @@ dynamic_list_search_cb(GPid pid, int rc, const char *output, gpointer user_data)
 
 /*!
  * \internal
+ * \brief Returns true if any key in first is not in second or second has a different value for key
+ */
+static int
+device_params_diff(GHashTable *first, GHashTable *second) {
+    char *key = NULL;
+    char *value = NULL;
+    GHashTableIter gIter;
+
+    g_hash_table_iter_init(&gIter, first);
+    while (g_hash_table_iter_next(&gIter, (void **)&key, (void **)&value)) {
+
+        if(strstr(key, "CRM_meta") == key) {
+            continue;
+        } else if(strcmp(key, "crm_feature_set") == 0) {
+            continue;
+        } else {
+            char *other_value = g_hash_table_lookup(second, key);
+
+            if (!other_value || safe_str_neq(other_value, value)) {
+                crm_trace("Different value for %s: %s != %s", key, other_value, value);
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+/*!
+ * \internal
  * \brief Checks to see if an identical device already exists in the device_list
  */
 static stonith_device_t *
 device_has_duplicate(stonith_device_t * device)
 {
-    char *key = NULL;
-    char *value = NULL;
-    GHashTableIter gIter;
     stonith_device_t *dup = g_hash_table_lookup(device_list, device->id);
 
     if (!dup) {
@@ -1008,21 +1135,9 @@ device_has_duplicate(stonith_device_t * device)
     }
 
     /* Use calculate_operation_digest() here? */
-    g_hash_table_iter_init(&gIter, device->params);
-    while (g_hash_table_iter_next(&gIter, (void **)&key, (void **)&value)) {
-
-        if(strstr(key, "CRM_meta") == key) {
-            continue;
-        } else if(strcmp(key, "crm_feature_set") == 0) {
-            continue;
-        } else {
-            char *other_value = g_hash_table_lookup(dup->params, key);
-
-            if (!other_value || safe_str_neq(other_value, value)) {
-                crm_trace("Different value for %s: %s != %s", key, other_value, value);
-                return NULL;
-            }
-        }
+    if (device_params_diff(device->params, dup->params) ||
+        device_params_diff(dup->params, device->params)) {
+        return NULL;
     }
 
     crm_trace("Match");
@@ -1097,6 +1212,10 @@ stonith_device_remove(const char *id, gboolean from_cib)
         g_hash_table_remove(device_list, id);
         crm_info("Removed '%s' from the device list (%d active devices)",
                  id, g_hash_table_size(device_list));
+    } else {
+        crm_trace("Not removing '%s' from the device list (%d active devices) "
+                  "- still %s%s_registered", id, g_hash_table_size(device_list),
+                  device->cib_registered?"cib":"", device->api_registered?"api":"");
     }
     return pcmk_ok;
 }
@@ -1413,7 +1532,7 @@ search_devices_record_result(struct device_search_s *search, const char *device,
     }
 }
 
-/*
+/*!
  * \internal
  * \brief Check whether the local host is allowed to execute a fencing action
  *
@@ -1628,7 +1747,7 @@ struct st_query_data {
     int call_options;
 };
 
-/*
+/*!
  * \internal
  * \brief Add action-specific attributes to query reply XML
  *
@@ -1642,6 +1761,7 @@ add_action_specific_attributes(xmlNode *xml, const char *action,
 {
     int action_specific_timeout;
     int delay_max;
+    int delay_base;
 
     CRM_CHECK(xml && action && device, return);
 
@@ -1663,9 +1783,26 @@ add_action_specific_attributes(xmlNode *xml, const char *action,
                   action, delay_max, device->id);
         crm_xml_add_int(xml, F_STONITH_DELAY_MAX, delay_max / 1000);
     }
+
+    delay_base = get_action_delay_base(device, action);
+    if (delay_base > 0) {
+        crm_xml_add_int(xml, F_STONITH_DELAY_BASE, delay_base / 1000);
+    }
+
+    if ((delay_max > 0) && (delay_base == 0)) {
+        crm_trace("Action %s has maximum random delay %dms on %s",
+                  action, delay_max, device->id);
+    } else if ((delay_max == 0) && (delay_base > 0)) {
+        crm_trace("Action %s has a static delay of %dms on %s",
+                  action, delay_base, device->id);
+    } else if ((delay_max > 0) && (delay_base > 0)) {
+        crm_trace("Action %s has a minimum delay of %dms and a randomly chosen "
+                  "maximum delay of %dms on %s",
+                  action, delay_base, delay_max, device->id);
+    }
 }
 
-/*
+/*!
  * \internal
  * \brief Add "disallowed" attribute to query reply XML if appropriate
  *
@@ -1686,7 +1823,7 @@ add_disallowed(xmlNode *xml, const char *action, stonith_device_t *device,
     }
 }
 
-/*
+/*!
  * \internal
  * \brief Add child element with action-specific values to query reply XML
  *
@@ -2461,30 +2598,30 @@ handle_request(crm_client_t * client, uint32_t id, uint32_t flags, xmlNode * req
         rc = stonith_fence_history(request, &data);
 
     } else if (crm_str_eq(op, STONITH_OP_DEVICE_ADD, TRUE)) {
-        const char *id = NULL;
+        const char *device_id = NULL;
 
-        rc = stonith_device_register(request, &id, FALSE);
-        do_stonith_notify_device(call_options, op, rc, id);
+        rc = stonith_device_register(request, &device_id, FALSE);
+        do_stonith_notify_device(call_options, op, rc, device_id);
 
     } else if (crm_str_eq(op, STONITH_OP_DEVICE_DEL, TRUE)) {
         xmlNode *dev = get_xpath_object("//" F_STONITH_DEVICE, request, LOG_ERR);
-        const char *id = crm_element_value(dev, XML_ATTR_ID);
+        const char *device_id = crm_element_value(dev, XML_ATTR_ID);
 
-        rc = stonith_device_remove(id, FALSE);
-        do_stonith_notify_device(call_options, op, rc, id);
+        rc = stonith_device_remove(device_id, FALSE);
+        do_stonith_notify_device(call_options, op, rc, device_id);
 
     } else if (crm_str_eq(op, STONITH_OP_LEVEL_ADD, TRUE)) {
-        char *id = NULL;
+        char *device_id = NULL;
 
-        rc = stonith_level_register(request, &id);
-        do_stonith_notify_level(call_options, op, rc, id);
-        free(id);
+        rc = stonith_level_register(request, &device_id);
+        do_stonith_notify_level(call_options, op, rc, device_id);
+        free(device_id);
 
     } else if (crm_str_eq(op, STONITH_OP_LEVEL_DEL, TRUE)) {
-        char *id = NULL;
+        char *device_id = NULL;
 
-        rc = stonith_level_remove(request, &id);
-        do_stonith_notify_level(call_options, op, rc, id);
+        rc = stonith_level_remove(request, &device_id);
+        do_stonith_notify_level(call_options, op, rc, device_id);
 
     } else if (crm_str_eq(op, STONITH_OP_CONFIRM, TRUE)) {
         async_command_t *cmd = create_async_command(request);
@@ -2498,12 +2635,12 @@ handle_request(crm_client_t * client, uint32_t id, uint32_t flags, xmlNode * req
         free_xml(reply);
 
     } else if(safe_str_eq(op, CRM_OP_RM_NODE_CACHE)) {
-        int id = 0;
+        int node_id = 0;
         const char *name = NULL;
 
-        crm_element_value_int(request, XML_ATTR_ID, &id);
+        crm_element_value_int(request, XML_ATTR_ID, &node_id);
         name = crm_element_value(request, XML_ATTR_UNAME);
-        reap_crm_member(id, name);
+        reap_crm_member(node_id, name);
 
         return pcmk_ok;
 

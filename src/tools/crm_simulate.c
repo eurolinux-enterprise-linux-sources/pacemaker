@@ -40,7 +40,7 @@ cib_t *global_cib = NULL;
 GListPtr op_fail = NULL;
 bool action_numbers = FALSE;
 gboolean quiet = FALSE;
-gboolean print_pending = FALSE;
+gboolean print_pending = TRUE;
 char *temp_shadow = NULL;
 extern gboolean bringing_nodes_online;
 
@@ -432,7 +432,7 @@ setup_input(const char *input, const char *output)
     }
 
     if (output == NULL) {
-        char *pid = crm_itoa(getpid());
+        char *pid = crm_getpid_s();
 
         local_output = get_shadow_file(pid);
         temp_shadow = strdup(local_output);
@@ -468,7 +468,7 @@ static struct crm_option long_options[] = {
     {"show-scores",   0, 0, 's', "Show allocation scores"},
     {"show-utilization",   0, 0, 'U', "Show utilization information"},
     {"profile",       1, 0, 'P', "Run all tests in the named directory to create profiling data"},
-    {"pending",       0, 0, 'j', "\tDisplay pending state if 'record-pending' is enabled"},
+    {"pending",       0, 0, 'j', "\tDisplay pending state if 'record-pending' is enabled", pcmk_option_hidden},
 
     {"-spacer-",     0, 0, '-', "\nSynthetic Cluster Events:"},
     {"node-up",      1, 0, 'u', "\tBring a node online"},
@@ -558,20 +558,20 @@ profile_all(const char *dir)
 
     if (file_num > 0) {
         struct stat prop;
-        char buffer[FILENAME_MAX + 1];
+        char buffer[FILENAME_MAX];
 
         while (file_num--) {
             if ('.' == namelist[file_num]->d_name[0]) {
                 free(namelist[file_num]);
                 continue;
 
-            } else if (strstr(namelist[file_num]->d_name, ".xml") == NULL) {
+            } else if (!crm_ends_with_ext(namelist[file_num]->d_name, ".xml")) {
                 free(namelist[file_num]);
                 continue;
             }
 
             lpc++;
-            snprintf(buffer, FILENAME_MAX, "%s/%s", dir, namelist[file_num]->d_name);
+            snprintf(buffer, sizeof(buffer), "%s/%s", dir, namelist[file_num]->d_name);
             if (stat(buffer, &prop) == 0 && S_ISREG(prop.st_mode)) {
                 profile_one(buffer);
             }
@@ -892,6 +892,7 @@ main(int argc, char **argv)
                       || modified ? "\n" : "");
             fflush(stdout);
 
+            LogNodeActions(&data_set, TRUE);
             for (gIter = data_set.resources; gIter != NULL; gIter = gIter->next) {
                 resource_t *rsc = (resource_t *) gIter->data;
 

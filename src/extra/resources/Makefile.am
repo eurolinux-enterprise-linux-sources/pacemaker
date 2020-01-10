@@ -31,12 +31,14 @@ ocf_SCRIPTS	     =  ClusterMon 	\
 			Dummy		\
 			HealthCPU	\
 			HealthSMART	\
+			ifspeed		\
 			o2cb		\
 			ping		\
 			pingd		\
 			Stateful	\
 			SysInfo		\
 			SystemHealth \
+			attribute	\
 			remote
 
 isolationtech_SCRIPTS	= docker-wrapper

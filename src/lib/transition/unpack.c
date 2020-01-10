@@ -41,7 +41,11 @@ unpack_action(synapse_t * parent, xmlNode * xml_action)
     }
 
     action = calloc(1, sizeof(crm_action_t));
-    CRM_CHECK(action != NULL, return NULL);
+    if (action == NULL) {
+        crm_perror(LOG_CRIT, "Cannot unpack action");
+        crm_log_xml_trace(xml_action, "Lost action");
+        return NULL;
+    }
 
     action->id = crm_parse_int(value, NULL);
     action->type = action_type_rsc;
@@ -105,9 +109,10 @@ unpack_synapse(crm_graph_t * new_graph, xmlNode * xml_synapse)
         new_synapse->priority = crm_parse_int(value, NULL);
     }
 
-    new_graph->num_synapses++;
     CRM_CHECK(new_synapse->id >= 0, free(new_synapse);
               return NULL);
+
+    new_graph->num_synapses++;
 
     crm_trace("look for actions in synapse %s", crm_element_value(xml_synapse, XML_ATTR_ID));
 
@@ -120,11 +125,12 @@ unpack_synapse(crm_graph_t * new_graph, xmlNode * xml_synapse)
                  action = __xml_next(action)) {
                 crm_action_t *new_action = unpack_action(new_synapse, action);
 
-                new_graph->num_actions++;
-
                 if (new_action == NULL) {
                     continue;
                 }
+
+                new_graph->num_actions++;
+
                 crm_trace("Adding action %d to synapse %d", new_action->id, new_synapse->id);
 
                 new_synapse->actions = g_list_append(new_synapse->actions, new_action);
@@ -159,6 +165,8 @@ unpack_synapse(crm_graph_t * new_graph, xmlNode * xml_synapse)
 
     return new_synapse;
 }
+
+static void destroy_action(crm_action_t * action);
 
 crm_graph_t *
 unpack_graph(xmlNode * xml_graph, const char *reference)

@@ -75,7 +75,10 @@ GMainLoop *mainloop = NULL;
 const char *cib_root = NULL;
 char *cib_our_uname = NULL;
 gboolean preserve_status = FALSE;
-gboolean cib_writes_enabled = TRUE;
+
+/* volatile because it may be changed in a signal handler */
+volatile gboolean cib_writes_enabled = TRUE;
+
 int remote_fd = 0;
 int remote_tls_fd = 0;
 
@@ -212,25 +215,17 @@ main(int argc, char **argv)
     }
 
     crm_log_init(NULL, LOG_INFO, TRUE, FALSE, argc, argv, FALSE);
+
     if (cib_root == NULL) {
-        char *path = crm_strdup_printf("%s/cib.xml", CRM_CONFIG_DIR);
-        char *legacy = crm_strdup_printf("%s/cib.xml", CRM_LEGACY_CONFIG_DIR);
+        if ((g_file_test(CRM_CONFIG_DIR "/cib.xml", G_FILE_TEST_EXISTS) == FALSE)
+            && (g_file_test(CRM_LEGACY_CONFIG_DIR "/cib.xml", G_FILE_TEST_EXISTS) == TRUE)) {
 
-        if (g_file_test(path, G_FILE_TEST_EXISTS)) {
-            cib_root = CRM_CONFIG_DIR;
-
-        } else if (g_file_test(legacy, G_FILE_TEST_EXISTS)) {
+            crm_notice("Using legacy config location: " CRM_LEGACY_CONFIG_DIR);
             cib_root = CRM_LEGACY_CONFIG_DIR;
-            crm_notice("Using legacy config location: %s", cib_root);
 
         } else {
             cib_root = CRM_CONFIG_DIR;
-            crm_notice("Using new config location: %s", cib_root);
         }
-
-        free(legacy);
-        free(path);
-
     } else {
         crm_notice("Using custom config location: %s", cib_root);
     }
@@ -422,7 +417,10 @@ cib_peer_update_callback(enum crm_status_type type, crm_node_t * node, const voi
 {
     switch (type) {
         case crm_status_processes:
-            if (legacy_mode && is_not_set(node->processes, crm_get_cluster_proc())) {
+#if !SUPPORT_PLUGIN
+            if (cib_legacy_mode()
+                && is_not_set(node->processes, crm_get_cluster_proc())) {
+
                 uint32_t old = data? *(const uint32_t *)data : 0;
 
                 if ((node->processes ^ old) & crm_proc_cpg) {
@@ -431,6 +429,7 @@ cib_peer_update_callback(enum crm_status_type type, crm_node_t * node, const voi
                     legacy_mode = FALSE;
                 }
             }
+#endif
             break;
 
         case crm_status_uname:
@@ -476,8 +475,7 @@ cib_init(void)
 #endif
     }
 
-    config_hash =
-        g_hash_table_new_full(crm_str_hash, g_str_equal, g_hash_destroy_str, g_hash_destroy_str);
+    config_hash = crm_str_table_new();
 
     if (startCib("cib.xml") == FALSE) {
         crm_crit("Cannot start CIB... terminating");

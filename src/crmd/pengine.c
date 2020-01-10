@@ -18,34 +18,18 @@
 
 #include <crm_internal.h>
 
-#include <sys/param.h>
-#include <crm/crm.h>
-#include <crmd_fsa.h>
-
-#include <sys/types.h>
-#include <sys/wait.h>
-
-#include <unistd.h>             /* for access */
-
-#include <sys/types.h>          /* for calls to open */
-#include <sys/stat.h>           /* for calls to open */
-#include <fcntl.h>              /* for calls to open */
-#include <pwd.h>                /* for getpwuid */
-#include <grp.h>                /* for initgroups */
-
-#include <sys/time.h>           /* for getrlimit */
-#include <sys/resource.h>       /* for getrlimit */
-
-#include <errno.h>
-
-#include <crm/msg_xml.h>
-#include <crm/common/xml.h>
-#include <crm/cluster.h>
-#include <crmd_messages.h>
-#include <crmd_callbacks.h>
+#include <unistd.h>  /* pid_t, sleep, ssize_t */
 
 #include <crm/cib.h>
+#include <crm/cluster.h>
+#include <crm/common/xml.h>
+#include <crm/crm.h>
+#include <crm/msg_xml.h>
+
 #include <crmd.h>
+#include <crmd_fsa.h>
+#include <crmd_messages.h>  /* register_fsa_error_adv */
+
 
 struct crm_subsystem_s *pe_subsystem = NULL;
 void do_pe_invoke_callback(xmlNode * msg, int call_id, int rc, xmlNode * output, void *user_data);
@@ -92,7 +76,7 @@ pe_ipc_destroy(gpointer user_data)
                  CRM_XS " pid=%d uuid=%s", pe_subsystem->pid, uuid_str);
 
         /*
-         *The PE died...
+         * The PE died...
          *
          * Save the current CIB so that we have a chance of
          * figuring out what killed it.
@@ -165,7 +149,7 @@ do_pe_control(long long action,
 
             pe_subsystem->source =
                 mainloop_add_ipc_client(CRM_SYSTEM_PENGINE, G_PRIORITY_DEFAULT,
-                                        5 * 1024 * 1024 /* 5Mb */ , NULL, &pe_callbacks);
+                                        5 * 1024 * 1024 /* 5MB */ , NULL, &pe_callbacks);
 
             if (pe_subsystem->source == NULL) {
                 crm_warn("Setup of client connection failed, not adding channel to mainloop");
@@ -264,12 +248,12 @@ force_local_option(xmlNode *xml, const char *attr_name, const char *attr_value)
     }
 
     if(max == 0) {
-        char *attr_id = crm_concat(CIB_OPTIONS_FIRST, attr_name, '-');
         xmlNode *configuration = NULL;
         xmlNode *crm_config = NULL;
         xmlNode *cluster_property_set = NULL;
 
-        crm_trace("Creating %s/%s = %s", attr_id, attr_name, attr_value);
+        crm_trace("Creating %s-%s for %s=%s",
+                  CIB_OPTIONS_FIRST, attr_name, attr_name, attr_value);
 
         configuration = find_entity(xml, XML_CIB_TAG_CONFIGURATION, NULL);
         if (configuration == NULL) {
@@ -289,11 +273,9 @@ force_local_option(xmlNode *xml, const char *attr_name, const char *attr_value)
 
         xml = create_xml_node(cluster_property_set, XML_CIB_TAG_NVPAIR);
 
-        crm_xml_add(xml, XML_ATTR_ID, attr_id);
+        crm_xml_set_id(xml, "%s-%s", CIB_OPTIONS_FIRST, attr_name);
         crm_xml_add(xml, XML_NVPAIR_ATTR_NAME, attr_name);
         crm_xml_add(xml, XML_NVPAIR_ATTR_VALUE, attr_value);
-
-        free(attr_id);
     }
     freeXpathObject(xpathObj);
 }

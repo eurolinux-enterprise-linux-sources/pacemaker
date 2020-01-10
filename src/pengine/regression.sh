@@ -20,16 +20,16 @@
 core=`dirname $0`
 . $core/regression.core.sh || exit 1
 
+DO_VERSIONED_TESTS=0
+
 create_mode="true"
 info Generating test outputs for these tests...
 # do_test file description
-
 info Done.
 echo ""
 
 info Performing the following tests from $io_dir
 create_mode="false"
-
 echo ""
 
 do_test simple1 "Offline     "
@@ -96,6 +96,7 @@ do_test bug-lf-2106 "Restart all anonymous clone instances after config change"
 do_test params-6 "Params: Detect reload in previously migrated resource"
 do_test nvpair-id-ref "Support id-ref in nvpair with optional name"
 do_test not-reschedule-unneeded-monitor "Do not reschedule unneeded monitors while resource definitions have changed"
+do_test reload-becomes-restart "Cancel reload if restart becomes required"
 
 echo ""
 do_test target-0 "Target Role : baseline"
@@ -138,7 +139,7 @@ do_test clone-require-all-7 "clone A and B both start at the same time. all inst
 do_test clone-require-all-no-interleave-1 "C starts everywhere after A and B"
 do_test clone-require-all-no-interleave-2 "C starts on nodes 1, 2, and 4 with only one active instance of B"
 do_test clone-require-all-no-interleave-3 "C remains active when instance of B is stopped on one node and started on another."
-do_test one-or-more-unrunnnable-instances "Avoid dependencies on instances that wont ever be started"
+do_test one-or-more-unrunnable-instances "Avoid dependencies on instances that won't ever be started"
 
 echo ""
 do_test order1 "Order start 1     "
@@ -239,6 +240,10 @@ do_test quorum-4 "No quorum - start anyway"
 do_test quorum-5 "No quorum - start anyway (group)"
 do_test quorum-6 "No quorum - start anyway (clone)"
 do_test bug-cl-5212 "No promotion with no-quorum-policy=freeze"
+do_test suicide-needed-inquorate "no-quorum-policy=suicide: suicide necessary"
+do_test suicide-not-needed-initial-quorum "no-quorum-policy=suicide: suicide not necessary at initial quorum"
+do_test suicide-not-needed-never-quorate "no-quorum-policy=suicide: suicide not necessary if never quorate"
+do_test suicide-not-needed-quorate "no-quorum-policy=suicide: suicide necessary if quorate"
 
 echo ""
 do_test rec-node-1 "Node Recover - Startup   - no fence"
@@ -299,6 +304,7 @@ do_test bug-1820-1 "Non-migration in a group"
 do_test migrate-5 "Primitive migration with a clone"
 do_test migrate-fencing "Migration after Fencing"
 do_test migrate-both-vms "Migrate two VMs that have no colocation"
+do_test migration-behind-migrating-remote "Migrate resource behind migrating remote connection"
 
 do_test 1-a-then-bm-move-b "Advanced migrate logic. A then B. migrate B."
 do_test 2-am-then-b-move-a "Advanced migrate logic, A then B, migrate A without stopping B"
@@ -314,6 +320,10 @@ do_test 11-a-then-bm-b-move-a-clone-starting "Advanced migrate logic, A clone th
 
 do_test a-promote-then-b-migrate "A promote then B start. migrate B"
 do_test a-demote-then-b-migrate "A demote then B stop. migrate B"
+
+if [ $DO_VERSIONED_TESTS -eq 1 ]; then
+	do_test migrate-versioned "Disable migration for versioned resources"
+fi
 
 #echo ""
 #do_test complex1 "Complex	"
@@ -362,6 +372,7 @@ do_test clone-fail-block-colocation "Move colocated group when failed clone has 
 do_test clone-interleave-1 "Clone-3 cannot start on pcmk-1 due to interleaved ordering (no colocation)"
 do_test clone-interleave-2 "Clone-3 must stop on pcmk-1 due to interleaved ordering (no colocation)"
 do_test clone-interleave-3 "Clone-3 must be recovered on pcmk-1 due to interleaved ordering (no colocation)"
+do_test rebalance-unique-clones "Rebalance unique clone instances with no stickiness"
 
 echo ""
 do_test cloned_start_one  "order first clone then clone... first clone_min=2"
@@ -382,6 +393,7 @@ echo ""
 do_test unfence-startup "Clean unfencing"
 do_test unfence-definition "Unfencing when the agent changes"
 do_test unfence-parameters "Unfencing when the agent parameters changes"
+do_test unfence-device "Unfencing when a cluster has only fence devices"
 
 echo ""
 do_test master-0 "Stopped -> Slave"
@@ -435,6 +447,7 @@ do_test bug-cl-5213 "Ensure role colocation with -INFINITY is enforced"
 do_test bug-cl-5219 "Allow unrelated resources with a common colocation target to remain promoted"
 do_test master-asymmetrical-order "Fix the behaviors of multi-state resources with asymmetrical ordering"
 do_test master-notify "Master promotion with notifies"
+do_test master-score-startup "Use permanent master scores without LRM history"
 
 echo ""
 do_test history-1 "Correctly parse stateful-1 resource state"
@@ -526,6 +539,8 @@ do_test bug-5025-3 "Automatically clean up failcount after resource config chang
 do_test bug-5025-4 "Clear failcount when last failure is a start op and rsc attributes changed."
 do_test failcount "Ensure failcounts are correctly expired"
 do_test failcount-block "Ensure failcounts are not expired when on-fail=block is present"
+do_test per-op-failcount "Ensure per-operation failcount is handled and not passed to fence agent"
+do_test on-fail-ignore "Ensure on-fail=ignore works even beyond migration-threshold"
 do_test monitor-onfail-restart "bug-5058 - Monitor failure with on-fail set to restart"
 do_test monitor-onfail-stop    "bug-5058 - Monitor failure wiht on-fail set to stop"
 do_test bug-5059 "No need to restart p_stateful1:*"
@@ -534,6 +549,7 @@ do_test bug-5069-op-disabled "Test on-fail-ignore with failure when monitor is d
 do_test obsolete-lrm-resource "cl#5115 - Do not use obsolete lrm_resource sections"
 do_test expire-non-blocked-failure "Ignore failure-timeout only if the failed operation has on-fail=block"
 do_test asymmetrical-order-move "Respect asymmetrical ordering when trying to move resources"
+do_test start-then-stop-with-unfence "Avoid graph loop with start-then-stop constraint plus unfencing"
 
 do_test ignore_stonith_rsc_order1 "cl#5056- Ignore order constraint between stonith and non-stonith rsc."
 do_test ignore_stonith_rsc_order2 "cl#5056- Ignore order constraint with group rsc containing mixed stonith and non-stonith."
@@ -596,6 +612,7 @@ echo ""
 do_test reprobe-target_rc "Ensure correct target_rc for reprobe of inactive resources"
 do_test node-maintenance-1 "cl#5128 - Node maintenance"
 do_test node-maintenance-2 "cl#5128 - Node maintenance (coming out of maintenance mode)"
+do_test shutdown-maintenance-node "Do not fence a maintenance node if it shuts down cleanly"
 
 do_test rsc-maintenance "Per-resource maintenance"
 
@@ -797,6 +814,25 @@ do_test container-is-remote-node "Place resource within container when container
 do_test bug-rh-1097457 "Kill user defined container/contents ordering"
 do_test bug-cl-5247 "Graph loop when recovering m/s resource in a container"
 
+do_test bundle-order-startup "Bundle startup ordering"
+do_test bundle-order-partial-start "Bundle startup ordering when some dependancies are already running"
+do_test bundle-order-partial-start-2 "Bundle startup ordering when some dependancies and the container are already running"
+do_test bundle-order-stop    "Bundle stop ordering"
+do_test bundle-order-partial-stop "Bundle startup ordering when some dependancies are already stopped"
+do_test bundle-order-stop-on-remote "Stop nested resource after bringing up the connection"
+
+do_test bundle-order-startup-clone "Prevent startup because bundle isn't promoted"
+do_test bundle-order-startup-clone-2 "Bundle startup with clones"
+do_test bundle-order-stop-clone "Stop bundle because clone is stopping"
+do_test bundle-nested-colocation "Colocation of nested connection resources"
+
+do_test bundle-order-fencing "Order pseudo bundle fencing after parent node fencing if both are happening"
+
+do_test bundle-probe-order-1 "order 1"
+do_test bundle-probe-order-2 "order 2"
+do_test bundle-probe-order-3 "order 3"
+do_test bundle-probe-remotes "Ensure remotes get probed too"
+
 echo ""
 do_test whitebox-fail1 "Fail whitebox container rsc."
 do_test whitebox-fail2 "Fail whitebox container rsc lrmd connection."
@@ -813,14 +849,17 @@ do_test whitebox-unexpectedly-running "Recover container nodes the cluster did n
 do_test whitebox-migrate1 "Migrate both container and connection resource"
 do_test whitebox-imply-stop-on-fence "imply stop action on container node rsc when host node is fenced"
 do_test whitebox-nested-group "Verify guest remote-node works nested in a group"
+do_test guest-node-host-dies "Verify guest node is recovered if host goes away"
 
 echo ""
 do_test remote-startup-probes  "Baremetal remote-node startup probes"
 do_test remote-startup         "Startup a newly discovered remote-nodes with no status."
 do_test remote-fence-unclean   "Fence unclean baremetal remote-node"
 do_test remote-fence-unclean2  "Fence baremetal remote-node after cluster node fails and connection can not be recovered"
+do_test remote-fence-unclean-3 "Probe failed remote nodes (triggers fencing)"
 do_test remote-move            "Move remote-node connection resource"
 do_test remote-disable         "Disable a baremetal remote-node"
+do_test remote-probe-disable   "Probe then stop a baremetal remote-node"
 do_test remote-orphaned        "Properly shutdown orphaned connection resource"
 do_test remote-orphaned2       "verify we can handle orphaned remote connections with active resources on the remote"
 do_test remote-recover         "Recover connection resource after cluster-node fails."
@@ -831,6 +870,13 @@ do_test remote-recover-fail     "Make sure start failure causes fencing if rsc a
 do_test remote-start-fail       "Make sure a start failure does not result in fencing if no active resources are on remote."
 do_test remote-unclean2         "Make monitor failure always results in fencing, even if no rsc are active on remote."
 do_test remote-fence-before-reconnect "Fence before clearing recurring monitor failure"
+do_test remote-recovery		"Recover remote connections before attempting demotion"
+do_test remote-recover-connection "Optimistically recovery of only the connection"
+do_test remote-recover-all        "Fencing when the connection has no home"
+do_test remote-recover-no-resources   "Fencing when the connection has no home and no active resources"
+do_test remote-recover-unknown        "Fencing when the connection has no home and the remote has no operation history"
+do_test remote-reconnect-delay        "Waiting for remote reconnect interval to expire"
+do_test remote-connection-unrecoverable  "Remote connection host must be fenced, with connection unrecoverable"
 
 echo ""
 do_test resource-discovery      "Exercises resource-discovery location constraint option."
@@ -840,6 +886,19 @@ echo ""
 do_test isolation-start-all   "Start docker isolated resources."
 do_test isolation-restart-all "Restart docker isolated resources."
 do_test isolation-clone       "Cloned isolated primitive."
+
+if [ $DO_VERSIONED_TESTS -eq 1 ]; then
+	echo ""
+	do_test versioned-resources     "Start resources with #ra-version rules"
+	do_test restart-versioned       "Restart resources on #ra-version change"
+	do_test reload-versioned        "Reload resources on #ra-version change"
+
+	echo ""
+	do_test versioned-operations-1  "Use #ra-version to configure operations of native resources"
+	do_test versioned-operations-2  "Use #ra-version to configure operations of stonith resources"
+	do_test versioned-operations-3  "Use #ra-version to configure operations of master/slave resources"
+	do_test versioned-operations-4  "Use #ra-version to configure operations of groups of the resources"
+fi
 
 echo ""
 test_results

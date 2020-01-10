@@ -152,7 +152,7 @@ check_capacity(gpointer key, gpointer value, gpointer user_data)
         CRM_ASSERT(data->rsc_id);
         CRM_ASSERT(data->node);
 
-        crm_debug("Node %s has no enough %s for %s: required=%d remaining=%d",
+        crm_debug("Node %s does not have enough %s for %s: required=%d remaining=%d",
                   data->node->details->uname, (char *)key, data->rsc_id, required, remaining);
         data->is_enough = FALSE;
     }
@@ -201,8 +201,7 @@ add_unallocated_utilization(GHashTable * all_utilization, resource_t * rsc,
                      orig_rsc->id, rsc->id);
         group_add_unallocated_utilization(all_utilization, rsc, all_rscs);
 
-    } else if (rsc->variant == pe_clone ||
-               rsc->variant == pe_master) {
+    } else if (pe_rsc_is_clone(rsc)) {
         GListPtr gIter1 = NULL;
         gboolean existing = FALSE;
 
@@ -247,8 +246,7 @@ sum_unallocated_utilization(resource_t * rsc, GListPtr colocated_rscs)
 {
     GListPtr gIter = NULL;
     GListPtr all_rscs = NULL;
-    GHashTable *all_utilization = g_hash_table_new_full(crm_str_hash, g_str_equal,
-                                          g_hash_destroy_str, g_hash_destroy_str);
+    GHashTable *all_utilization = crm_str_table_new();
 
     all_rscs = g_list_copy(colocated_rscs);
     if (g_list_find(all_rscs, rsc) == FALSE) {
@@ -317,7 +315,7 @@ find_colocated_rscs(GListPtr colocated_rscs, resource_t * rsc, resource_t * orig
             continue;
         }
 
-        if (rsc_lh->variant <= pe_group && rsc->variant > pe_group) {
+        if (pe_rsc_is_clone(rsc_lh) == FALSE && pe_rsc_is_clone(rsc)) {
             /* We do not know if rsc_lh will be colocated with orig_rsc in this case */
             continue;
         }
@@ -343,6 +341,7 @@ process_utilization(resource_t * rsc, node_t ** prefer, pe_working_set_t * data_
 {
     int alloc_details = scores_log_level + 1;
 
+    CRM_CHECK(rsc && prefer && data_set, return);
     if (safe_str_neq(data_set->placement_strategy, "default")) {
         GHashTableIter iter;
         GListPtr colocated_rscs = NULL;
@@ -382,7 +381,9 @@ process_utilization(resource_t * rsc, node_t ** prefer, pe_working_set_t * data_
                     }
 
                     if (have_enough_capacity(node, rscs_id, unallocated_utilization) == FALSE) {
-                        pe_rsc_debug(rsc, "Resource %s and its colocated resources cannot be allocated to node %s: no enough capacity",
+                        pe_rsc_debug(rsc,
+                                     "Resource %s and its colocated resources"
+                                     " cannot be allocated to node %s: not enough capacity",
                                      rsc->id, node->details->uname);
                         resource_location(rsc, node, -INFINITY, "__limit_utilization__", data_set);
                     }
@@ -408,7 +409,9 @@ process_utilization(resource_t * rsc, node_t ** prefer, pe_working_set_t * data_
                 }
 
                 if (have_enough_capacity(node, rsc->id, rsc->utilization) == FALSE) {
-                    pe_rsc_debug(rsc, "Resource %s cannot be allocated to node %s: no enough capacity",
+                    pe_rsc_debug(rsc,
+                                 "Resource %s cannot be allocated to node %s:"
+                                 " not enough capacity",
                                  rsc->id, node->details->uname);
                     resource_location(rsc, node, -INFINITY, "__limit_utilization__", data_set);
                 }
@@ -427,9 +430,7 @@ group_find_colocated_rscs(GListPtr colocated_rscs, resource_t * rsc, resource_t 
     group_variant_data_t *group_data = NULL;
 
     get_group_variant_data(group_data, rsc);
-    if (group_data->colocated ||
-        (rsc->parent &&
-         (rsc->parent->variant == pe_clone || rsc->parent->variant == pe_master))) {
+    if (group_data->colocated || pe_rsc_is_clone(rsc->parent)) {
         GListPtr gIter = rsc->children;
 
         for (; gIter != NULL; gIter = gIter->next) {
@@ -456,9 +457,7 @@ group_add_unallocated_utilization(GHashTable * all_utilization, resource_t * rsc
     group_variant_data_t *group_data = NULL;
 
     get_group_variant_data(group_data, rsc);
-    if (group_data->colocated ||
-        (rsc->parent &&
-         (rsc->parent->variant == pe_clone || rsc->parent->variant == pe_master))) {
+    if (group_data->colocated || pe_rsc_is_clone(rsc->parent)) {
         GListPtr gIter = rsc->children;
 
         for (; gIter != NULL; gIter = gIter->next) {

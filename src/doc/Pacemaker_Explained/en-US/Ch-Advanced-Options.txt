@@ -21,7 +21,7 @@ node.
 
 |CIB_user
 |$USER
-|The user to connect as. Needs to be part of the +hacluster+ group on
+|The user to connect as. Needs to be part of the +haclient+ group on
  the target host.
  indexterm:[Environment Variable,CIB_user]
 
@@ -48,7 +48,7 @@ node.
 |=========================================================
 
 So, if *c001n01* is an active cluster node and is listening on port 1234
-for connections, and *someuser* is a member of the *hacluster* group,
+for connections, and *someuser* is a member of the *haclient* group,
 then the following would prompt for *someuser*'s password and return
 the cluster's current configuration:
 
@@ -117,6 +117,127 @@ example, to specify an operation that would run on the first Monday of
 [source,XML]
 <op id="my-weekly-action" name="custom-action" interval="P7D" interval-origin="2009-W01-1"/> 
 =====
+
+[[s-failure-handling]]
+== Handling Resource Failure ==
+
+By default, Pacemaker will attempt to recover failed resources by restarting
+them. However, failure recovery is highly configurable.
+
+=== Failure Counts ===
+
+Pacemaker tracks resource failures for each combination of node, resource, and
+operation (start, stop, monitor, etc.).
+
+You can query the fail count for a particular node, resource, and/or operation
+using the `crm_failcount` command. For example, to see how many times the
+10-second monitor for +myrsc+ has failed on +node1+, run:
+
+----
+# crm_failcount --query -r myrsc -N node1 -n monitor -I 10s
+----
+
+If you omit the node, `crm_failcount` will use the local node. If you omit the
+operation and interval, `crm_failcount` will display the sum of the fail counts
+for all operations on the resource.
+
+You can use `crm_resource --cleanup` or `crm_failcount --delete` to clear
+fail counts. For example, to clear the above monitor failures, run:
+
+----
+# crm_resource --cleanup -r myrsc -N node1 -n monitor -I 10s
+----
+
+If you omit the resource, `crm_resource --cleanup` will clear failures for all
+resources. If you omit the node, it will clear failures on all nodes. If you
+omit the operation and interval, it will clear the failures for all operations
+on the resource.
+
+[NOTE]
+====
+Even when cleaning up only a single operation, all failed operations will
+disappear from the status display. This allows us to trigger a re-check of the
+resource's current status.
+====
+
+Higher-level tools may provide other commands for querying and clearing
+fail counts.
+
+The `crm_mon` tool shows the current cluster status, including any failed
+operations. To see the current fail counts for any failed resources, call
+`crm_mon` with the `--failcounts` option. This shows the fail counts per
+resource (that is, the sum of any operation fail counts for the resource).
+
+=== Failure Response ===
+
+Normally, if a running resource fails, pacemaker will try to stop it and start
+it again. Pacemaker will choose the best location to start it each time, which
+may be the same node that it failed on.
+
+However, if a resource fails repeatedly, it is possible that there is an
+underlying problem on that node, and you might desire trying a different node
+in such a case. Pacemaker allows you to set your preference via the
++migration-threshold+ resource meta-attribute.
+footnote:[
+The naming of this option was perhaps unfortunate as it is easily
+confused with live migration, the process of moving a resource from
+one node to another without stopping it.  Xen virtual guests are the
+most common example of resources that can be migrated in this manner.
+]
+
+If you define +migration-threshold=pass:[<replaceable>N</replaceable>]+ for a
+resource, it will be banned from the original node after 'N' failures.
+
+[NOTE]
+====
+The +migration-threshold+ is per 'resource', even though fail counts are
+tracked per 'operation'. The operation fail counts are added together
+to compare against the +migration-threshold+.
+====
+
+By default, fail counts remain until manually cleared by an administrator
+using `crm_resource --cleanup` or `crm_failcount --delete` (hopefully after
+first fixing the failure's cause). It is possible to have fail counts expire
+automatically by setting the +failure-timeout+ resource meta-attribute.
+
+[IMPORTANT]
+====
+A successful operation does not clear past failures. If a recurring monitor
+operation fails once, succeeds many times, then fails again days later, its
+fail count is 2. Fail counts are cleared only by manual intervention or
+falure timeout.
+====
+
+For example, a setting of +migration-threshold=2+ and +failure-timeout=60s+
+would cause the resource to move to a new node after 2 failures, and
+allow it to move back (depending on stickiness and constraint scores) after one
+minute.
+
+[NOTE]
+====
++failure-timeout+ is measured since the most recent failure. That is, older
+failures do not individually time out and lower the fail count. Instead, all
+failures are timed out simultaneously (and the fail count is reset to 0) if
+there is no new failure for the timeout period.
+====
+
+There are two exceptions to the migration threshold concept:
+when a resource either fails to start or fails to stop.
+
+If the cluster property +start-failure-is-fatal+ is set to +true+ (which is the
+default), start failures cause the fail count to be set to +INFINITY+ and thus
+always cause the resource to move immediately.
+
+Stop failures are slightly different and crucial.  If a resource fails
+to stop and STONITH is enabled, then the cluster will fence the node
+in order to be able to start the resource elsewhere.  If STONITH is
+not enabled, then the cluster has no way to continue and will not try
+to start the resource elsewhere, but will try to stop it again after
+the failure timeout.
+
+[IMPORTANT]
+Please read <<s-rules-recheck>> to understand how timeouts work
+before configuring a +failure-timeout+.
 
 == Moving Resources ==
 indexterm:[Moving,Resources] 
@@ -235,61 +356,6 @@ positive and negative constraints. E.g.
 +Email+ prefers +sles-2+ with a score of +INFINITY+
 
 which has the same long-term consequences as discussed earlier.
-
-[[s-failure-migration]]
-=== Moving Resources Due to Failure ===
-
-Normally, if a running resource fails, pacemaker will try to start
-it again on the same node. However if a resource fails repeatedly,
-it is possible that there is an underlying problem on that node, and you
-might desire trying a different node in such a case.
-
-indexterm:[migration-threshold]
-indexterm:[failure-timeout]
-indexterm:[start-failure-is-fatal]
-
-Pacemaker allows you to set your preference via the +migration-threshold+
-resource option.
-footnote:[
-The naming of this option was perhaps unfortunate as it is easily
-confused with live migration, the process of moving a resource from
-one node to another without stopping it.  Xen virtual guests are the
-most common example of resources that can be migrated in this manner.
-]
-
-Simply define +migration-threshold=pass:[<replaceable>N</replaceable>]+ for a resource and it will
-migrate to a new node after 'N' failures.  There is no threshold defined
-by default.  To determine the resource's current failure status and
-limits, run `crm_mon --failcounts`.
-
-By default, once the threshold has been reached, the troublesome node will no
-longer be allowed to run the failed resource until the administrator
-manually resets the resource's failcount using `crm_failcount` (after
-hopefully first fixing the failure's cause).  Alternatively, it is possible
-to expire them by setting the +failure-timeout+ option for the resource.
-
-For example, a setting of +migration-threshold=2+ and +failure-timeout=60s+
-would cause the resource to move to a new node after 2 failures, and
-allow it to move back (depending on stickiness and constraint scores) after one
-minute.
-
-There are two exceptions to the migration threshold concept:
-when a resource either fails to start or fails to stop.
-
-If the cluster property +start-failure-is-fatal+ is set to +true+ (which is the
-default), start failures cause the failcount to be set to +INFINITY+ and thus
-always cause the resource to move immediately.
-
-Stop failures are slightly different and crucial.  If a resource fails
-to stop and STONITH is enabled, then the cluster will fence the node
-in order to be able to start the resource elsewhere.  If STONITH is
-not enabled, then the cluster has no way to continue and will not try
-to start the resource elsewhere, but will try to stop it again after
-the failure timeout.
-
-[IMPORTANT]
-Please read <<s-rules-recheck>> to understand how timeouts work
-before configuring a +failure-timeout+.
 
 === Moving Resources Due to Connectivity Changes ===
 
@@ -480,6 +546,7 @@ three (again assuming that +multiplier+ is set to 1000).
 -------
 =====
 
+[[s-migrating-resources]]
 === Migrating Resources ===
 
 Normally, when the cluster needs to move a resource, it fully restarts
@@ -544,74 +611,112 @@ resources.
 Even in newer versions, if a migratable resource depends on a non-migratable
 resource, and both need to be moved, the migratable resource will be restarted.
 
-[[s-reusing-config-elements]]
-== Reusing Rules, Options and Sets of Operations ==
+[[s-node-health]]
+== Tracking Node Health ==
 
-Sometimes a number of constraints need to use the same set of rules,
-and resources need to set the same options and parameters.  To
-simplify this situation, you can refer to an existing object using an
-+id-ref+ instead of an id.
+A node may be functioning adequately as far as cluster membership is concerned,
+and yet be "unhealthy" in some respect that makes it an undesirable location
+for resources. For example, a disk drive may be reporting SMART errors, or the
+CPU may be highly loaded.
 
-So if for one resource you have
+Pacemaker offers a way to automatically move resources off unhealthy nodes.
 
-[source,XML]
-------
-<rsc_location id="WebServer-connectivity" rsc="Webserver">
-   <rule id="ping-prefer-rule" score-attribute="pingd" >
-    <expression id="ping-prefer" attribute="pingd" operation="defined"/>
-   </rule>
-</rsc_location>
-------
+=== Node Health Attributes ===
 
-Then instead of duplicating the rule for all your other resources, you can instead specify:
+Pacemaker will treat any node attribute whose name starts with +#health+ as an
+indicator of node health. Node health attributes may have one of the following
+values:
 
-.Referencing rules from other constraints
-=====
-[source,XML]
--------
-<rsc_location id="WebDB-connectivity" rsc="WebDB">
-      <rule id-ref="ping-prefer-rule"/>
-</rsc_location>
--------
-=====
+.Allowed Values for Node Health Attributes
+[width="95%",cols="1,3<",options="header",align="center"]
+|=========================================================
 
-[IMPORTANT]
-===========
-The cluster will insist that the +rule+ exists somewhere.  Attempting
-to add a reference to a non-existing rule will cause a validation
-failure, as will attempting to remove a +rule+ that is referenced
-elsewhere.
-===========
+|Value
+|Intended significance
 
-The same principle applies for +meta_attributes+ and
-+instance_attributes+ as illustrated in the example below:
+|+red+
+|This indicator is unhealthy
+ indexterm:[Node health,red]
 
-.Referencing attributes, options, and operations from other resources
-=====
-[source,XML]
--------
-<primitive id="mySpecialRsc" class="ocf" type="Special" provider="me">
-   <instance_attributes id="mySpecialRsc-attrs" score="1" >
-     <nvpair id="default-interface" name="interface" value="eth0"/>
-     <nvpair id="default-port" name="port" value="9999"/>
-   </instance_attributes>
-   <meta_attributes id="mySpecialRsc-options">
-     <nvpair id="failure-timeout" name="failure-timeout" value="5m"/>
-     <nvpair id="migration-threshold" name="migration-threshold" value="1"/>
-     <nvpair id="stickiness" name="resource-stickiness" value="0"/>
-   </meta_attributes>
-   <operations id="health-checks">
-     <op id="health-check" name="monitor" interval="60s"/>
-     <op id="health-check" name="monitor" interval="30min"/>
-   </operations>
-</primitive>
-<primitive id="myOtherlRsc" class="ocf" type="Other" provider="me">
-   <instance_attributes id-ref="mySpecialRsc-attrs"/>
-   <meta_attributes id-ref="mySpecialRsc-options"/>
-   <operations id-ref="health-checks"/>
-</primitive>
--------
-=====
+|+yellow+
+|This indicator is becoming unhealthy
+ indexterm:[Node health,yellow]
+
+|+green+
+|This indicator is healthy
+ indexterm:[Node health,green]
+
+|'integer'
+|A numeric score to apply to all resources on this node
+ (0 or positive is healthy, negative is unhealthy)
+ indexterm:[Node health,score]
+
+|=========================================================
+
+=== Node Health Strategy ===
+
+Pacemaker assigns a node health score to each node, as the sum of the values of
+all its node health attributes. This score will be used as a location
+constraint applied to this node for all resources.
+
+The +node-health-strategy+ cluster option controls how Pacemaker responds to
+changes in node health attributes, and how it translates +red+, +yellow+, and
++green+ to scores.
+
+Allowed values are:
+
+.Node Health Strategies
+[width="95%",cols="1m,3<",options="header",align="center"]
+|=========================================================
+
+|Value
+|Effect
+
+|none
+|Do not track node health attributes at all.
+ indexterm:[Node health,none]
+
+|migrate-on-red
+|Assign the value of +-INFINITY+ to +red+, and 0 to +yellow+ and +green+.
+ This will cause all resources to move off the node if any attribute is +red+.
+ indexterm:[Node health,migrate-on-red]
+
+|only-green
+|Assign the value of +-INFINITY+ to +red+ and +yellow+, and 0 to +green+.
+ This will cause all resources to move off the node if any attribute is +red+
+ or +yellow+.
+ indexterm:[Node health,only-green]
+
+|progressive
+|Assign the value of the +node-health-red+ cluster option to +red+, the value
+ of +node-health-yellow+ to +yellow+, and the value of +node-health-green+ to
+ +green+. Each node is additionally assigned a score of +node-health-base+
+ (this allows resources to start even if some attributes are +yellow+). This
+ strategy gives the administrator finer control over how important each value
+ is.
+ indexterm:[Node health,progressive]
+
+|custom
+|Track node health attributes using the same values as +progressive+ for
+ +red+, +yellow+, and +green+, but do not take them into account.
+ The administrator is expected to implement a policy by defining rules
+ (see <<ch-rules>>) referencing node health attributes.
+ indexterm:[Node health,custom]
+
+|=========================================================
+
+=== Measuring Node Health ===
+
+Since Pacemaker calculates node health based on node attributes,
+any method that sets node attributes may be used to measure node
+health. The most common ways are resource agents or separate daemons.
+
+Pacemaker provides examples that can be used directly or as a basis for
+custom code. The +ocf:pacemaker:HealthCPU+ and +ocf:pacemaker:HealthSMART+
+resource agents set node health attributes based on CPU and disk parameters.
+The +ipmiservicelogd+ daemon sets node health attributes based on IPMI
+values (the +ocf:pacemaker:SystemHealth+ resource agent can be used to manage
+the daemon as a cluster resource).
 
 == Reloading Services After a Definition Change ==
 

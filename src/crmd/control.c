@@ -35,11 +35,18 @@
 #include <crmd_messages.h>
 #include <crmd_callbacks.h>
 #include <crmd_lrm.h>
+#include <crmd_alerts.h>
+#include <crmd_metadata.h>
 #include <tengine.h>
 #include <throttle.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
+
+#ifdef RHEL7_COMPAT
+// for pe_enable_legacy_alerts()
+#include <crm/pengine/rules_internal.h>
+#endif
 
 qb_ipcs_service_t *ipcs = NULL;
 
@@ -184,7 +191,7 @@ do_shutdown(long long action,
         if (is_set(fsa_input_register, pe_subsystem->flag_connected)) {
             crm_info("Terminating the %s", pe_subsystem->name);
             if (stop_subsystem(pe_subsystem, TRUE) == FALSE) {
-                /* its gone... */
+                /* It's gone ... */
                 crm_err("Faking %s exit", pe_subsystem->name);
                 clear_bit(fsa_input_register, pe_subsystem->flag_connected);
             } else {
@@ -213,7 +220,9 @@ do_shutdown_req(long long action,
 {
     xmlNode *msg = NULL;
 
-    crm_info("Sending shutdown request to %s", crm_str(fsa_our_dc));
+    set_bit(fsa_input_register, R_SHUTDOWN);
+    crm_info("Sending shutdown request to all peers (DC is %s)",
+             (fsa_our_dc? fsa_our_dc : "not set"));
     msg = create_request(CRM_OP_SHUTDOWN_REQ, NULL, NULL, CRM_SYSTEM_CRMD, CRM_SYSTEM_CRMD, NULL);
 
 /* 	set_bit(fsa_input_register, R_STAYDOWN); */
@@ -228,7 +237,6 @@ extern char *max_generation_from;
 extern xmlNode *max_generation_xml;
 extern GHashTable *resource_history;
 extern GHashTable *voted;
-extern GHashTable *metadata_hash;
 extern char *te_client_id;
 
 void log_connected_client(gpointer key, gpointer value, gpointer user_data);
@@ -345,16 +353,16 @@ crmd_exit(int rc)
     free(te_subsystem); te_subsystem = NULL;
     free(cib_subsystem); cib_subsystem = NULL;
 
-    if (metadata_hash) {
-        crm_trace("Destroying reload cache with %d members", g_hash_table_size(metadata_hash));
-        g_hash_table_destroy(metadata_hash); metadata_hash = NULL;
-    }
+    metadata_cache_fini();
 
     election_fini(fsa_election);
     fsa_election = NULL;
 
-    cib_delete(fsa_cib_conn);
-    fsa_cib_conn = NULL;
+    /* Tear down the CIB connection, but don't free it yet -- it could be used
+     * when we drain the mainloop later.
+     */
+    cib_free_callbacks(fsa_cib_conn);
+    fsa_cib_conn->cmds->signoff(fsa_cib_conn);
 
     verify_stopped(fsa_state, LOG_WARNING);
     clear_bit(fsa_input_register, R_LRM_CONNECTED);
@@ -383,7 +391,6 @@ crmd_exit(int rc)
     free(integration_timer); integration_timer = NULL;
     free(finalization_timer); finalization_timer = NULL;
     free(election_trigger); election_trigger = NULL;
-    election_fini(fsa_election);
     free(shutdown_escalation_timer); shutdown_escalation_timer = NULL;
     free(wait_timer); wait_timer = NULL;
     free(recheck_timer); recheck_timer = NULL;
@@ -415,8 +422,6 @@ crmd_exit(int rc)
 
         /* Don't re-enter this block */
         crmd_mainloop = NULL;
-
-        crmd_drain_alerts(ctx);
 
         /* no signals on final draining anymore */
         mainloop_destroy_signal(SIGCHLD);
@@ -482,6 +487,11 @@ crmd_exit(int rc)
     } else {
         mainloop_destroy_signal(SIGCHLD);
     }
+
+    cib_delete(fsa_cib_conn);
+    fsa_cib_conn = NULL;
+
+    throttle_fini();
 
     /* Graceful */
     return rc;
@@ -581,12 +591,12 @@ do_startup(long long action,
         finalization_timer->callback = crm_timer_popped;
         finalization_timer->repeat = FALSE;
         /* for possible enabling... a bug in the join protocol left
-         *    a slave in S_PENDING while we think its in S_NOT_DC
+         *    a slave in S_PENDING while we think it's in S_NOT_DC
          *
          * raising I_FINALIZED put us into a transition loop which is
          *    never resolved.
          * in this loop we continually send probes which the node
-         *    NACK's because its in S_PENDING
+         *    NACK's because it's in S_PENDING
          *
          * if we have nodes where heartbeat is active but the
          *    CRM is not... then this will be handled in the
@@ -950,6 +960,9 @@ pe_cluster_option crmd_opts[] = {
 	{ "stonith-watchdog-timeout", NULL, "time", NULL, NULL, &check_sbd_timeout,
 	  "How long to wait before we can assume nodes are safely down", NULL
         },
+        { "stonith-max-attempts",NULL,"integer",NULL,"10",&check_positive_number,
+          "How many times stonith can fail before it will no longer be attempted on a target"
+        },   
 	{ "no-quorum-policy", "no_quorum_policy", "enum", "stop, freeze, ignore, suicide", "stop", &check_quorum, NULL, NULL },
 
 #if SUPPORT_PLUGIN
@@ -982,9 +995,6 @@ crmd_pref(GHashTable * options, const char *name)
 static void
 config_query_callback(xmlNode * msg, int call_id, int rc, xmlNode * output, void *user_data)
 {
-#ifdef RHEL7_COMPAT
-    const char *script = NULL;
-#endif
     const char *value = NULL;
     GHashTable *config_hash = NULL;
     crm_time_t *now = crm_time_new(NULL);
@@ -1019,18 +1029,19 @@ config_query_callback(xmlNode * msg, int call_id, int rc, xmlNode * output, void
     }
 
     crm_debug("Call %d : Parsing CIB options", call_id);
-    config_hash =
-        g_hash_table_new_full(crm_str_hash, g_str_equal, g_hash_destroy_str, g_hash_destroy_str);
-
+    config_hash = crm_str_table_new();
     unpack_instance_attributes(crmconfig, crmconfig, XML_CIB_TAG_PROPSET, NULL, config_hash,
                                CIB_OPTIONS_FIRST, FALSE, now);
 
     verify_crmd_options(config_hash);
 
 #ifdef RHEL7_COMPAT
-    script = crmd_pref(config_hash, "notification-agent");
-    value  = crmd_pref(config_hash, "notification-recipient");
-    crmd_enable_notifications(script, value);
+    {
+        const char *script = crmd_pref(config_hash, "notification-agent");
+        const char *recip  = crmd_pref(config_hash, "notification-recipient");
+
+        pe_enable_legacy_alerts(script, recip);
+    }
 #endif
 
     value = crmd_pref(config_hash, XML_CONFIG_ATTR_DC_DEADTIME);
@@ -1041,13 +1052,16 @@ config_query_callback(xmlNode * msg, int call_id, int rc, xmlNode * output, void
 
     value = crmd_pref(config_hash, "load-threshold");
     if(value) {
-        throttle_load_target = strtof(value, NULL) / 100;
+        throttle_set_load_target(strtof(value, NULL) / 100.0);
     }
 
     value = crmd_pref(config_hash, "no-quorum-policy");
     if (safe_str_eq(value, "suicide") && pcmk_locate_sbd()) {
         no_quorum_suicide_escalation = TRUE;
     }
+
+    value = crmd_pref(config_hash,"stonith-max-attempts");
+    update_stonith_max_attempts(value);
 
     value = crmd_pref(config_hash, XML_CONFIG_ATTR_FORCE_QUIT);
     shutdown_escalation_timer->period_ms = crm_get_msec(value);
@@ -1087,7 +1101,7 @@ config_query_callback(xmlNode * msg, int call_id, int rc, xmlNode * output, void
     }
 
     alerts = first_named_child(output, XML_CIB_TAG_ALERTS);
-    parse_notifications(alerts);
+    crmd_unpack_alerts(alerts);
 
     set_bit(fsa_input_register, R_READ_CONFIG);
     crm_trace("Triggering FSA: %s", __FUNCTION__);

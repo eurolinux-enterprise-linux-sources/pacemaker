@@ -17,6 +17,7 @@
  */
 #ifndef PE_INTERNAL__H
 #  define PE_INTERNAL__H
+#  include <string.h>
 #  include <crm/pengine/status.h>
 #  include <crm/pengine/remote.h>
 
@@ -28,8 +29,8 @@
 #  define pe_warn(fmt...) { was_processing_warning = TRUE; crm_config_warning = TRUE; crm_warn(fmt); }
 #  define pe_proc_err(fmt...) { was_processing_error = TRUE; crm_err(fmt); }
 #  define pe_proc_warn(fmt...) { was_processing_warning = TRUE; crm_warn(fmt); }
-#  define pe_set_action_bit(action, bit) action->flags = crm_set_bit(__FUNCTION__, action->uuid, action->flags, bit)
-#  define pe_clear_action_bit(action, bit) action->flags = crm_clear_bit(__FUNCTION__, action->uuid, action->flags, bit)
+#  define pe_set_action_bit(action, bit) action->flags = crm_set_bit(__FUNCTION__, __LINE__, action->uuid, action->flags, bit)
+#  define pe_clear_action_bit(action, bit) action->flags = crm_clear_bit(__FUNCTION__, __LINE__, action->uuid, action->flags, bit)
 
 typedef struct notify_data_s {
     GHashTable *keys;
@@ -74,6 +75,7 @@ gboolean native_unpack(resource_t * rsc, pe_working_set_t * data_set);
 gboolean group_unpack(resource_t * rsc, pe_working_set_t * data_set);
 gboolean clone_unpack(resource_t * rsc, pe_working_set_t * data_set);
 gboolean master_unpack(resource_t * rsc, pe_working_set_t * data_set);
+gboolean container_unpack(resource_t * rsc, pe_working_set_t * data_set);
 
 resource_t *native_find_rsc(resource_t * rsc, const char *id, node_t * node, int flags);
 
@@ -81,37 +83,47 @@ gboolean native_active(resource_t * rsc, gboolean all);
 gboolean group_active(resource_t * rsc, gboolean all);
 gboolean clone_active(resource_t * rsc, gboolean all);
 gboolean master_active(resource_t * rsc, gboolean all);
+gboolean container_active(resource_t * rsc, gboolean all);
 
 void native_print(resource_t * rsc, const char *pre_text, long options, void *print_data);
 void group_print(resource_t * rsc, const char *pre_text, long options, void *print_data);
 void clone_print(resource_t * rsc, const char *pre_text, long options, void *print_data);
 void master_print(resource_t * rsc, const char *pre_text, long options, void *print_data);
+void container_print(resource_t * rsc, const char *pre_text, long options, void *print_data);
 
 void native_free(resource_t * rsc);
 void group_free(resource_t * rsc);
 void clone_free(resource_t * rsc);
 void master_free(resource_t * rsc);
+void container_free(resource_t * rsc);
 
 enum rsc_role_e native_resource_state(const resource_t * rsc, gboolean current);
 enum rsc_role_e group_resource_state(const resource_t * rsc, gboolean current);
 enum rsc_role_e clone_resource_state(const resource_t * rsc, gboolean current);
 enum rsc_role_e master_resource_state(const resource_t * rsc, gboolean current);
+enum rsc_role_e container_resource_state(const resource_t * rsc, gboolean current);
 
 gboolean common_unpack(xmlNode * xml_obj, resource_t ** rsc, resource_t * parent,
                        pe_working_set_t * data_set);
-void common_print(resource_t * rsc, const char *pre_text, long options, void *print_data);
 void common_free(resource_t * rsc);
 
 extern pe_working_set_t *pe_dataset;
 
 extern node_t *node_copy(const node_t *this_node);
 extern time_t get_effective_time(pe_working_set_t * data_set);
-extern int get_failcount(node_t * node, resource_t * rsc, time_t *last_failure,
-                         pe_working_set_t * data_set);
-extern int get_failcount_full(node_t * node, resource_t * rsc, time_t *last_failure,
-                              bool effective, xmlNode * xml_op, pe_working_set_t * data_set);
-extern int get_failcount_all(node_t * node, resource_t * rsc, time_t *last_failure,
-                             pe_working_set_t * data_set);
+
+/* Failure handling utilities (from failcounts.c) */
+
+// bit flags for fail count handling options
+enum pe_fc_flags_e {
+    pe_fc_default   = 0x00,
+    pe_fc_effective = 0x01, // don't count expired failures
+    pe_fc_fillers   = 0x02, // if container, include filler failures in count
+};
+
+int pe_get_failcount(node_t *node, resource_t *rsc, time_t *last_failure,
+                     uint32_t flags, xmlNode *xml_op,
+                     pe_working_set_t *data_set);
 
 /* Binary like operators for lists of nodes */
 extern void node_list_exclude(GHashTable * list, GListPtr list2, gboolean merge_scores);
@@ -211,6 +223,9 @@ extern action_t *custom_action(resource_t * rsc, char *key, const char *task, no
 		rsc, demoted_key(rsc), CRMD_ACTION_DEMOTED, node,	\
 		optional, TRUE, data_set)
 
+extern int pe_get_configured_timeout(resource_t *rsc, const char *action,
+                                     pe_working_set_t *data_set);
+
 extern action_t *find_first_action(GListPtr input, const char *uuid, const char *task,
                                    node_t * on_node);
 extern enum action_tasks get_complex_task(resource_t * rsc, const char *name,
@@ -234,8 +249,22 @@ extern resource_t *find_clone_instance(resource_t * rsc, const char *sub_id,
 extern void destroy_ticket(gpointer data);
 extern ticket_t *ticket_new(const char *ticket_id, pe_working_set_t * data_set);
 
+// Resources for manipulating resource names
+const char *pe_base_name_end(const char *id);
 char *clone_strip(const char *last_rsc_id);
 char *clone_zero(const char *last_rsc_id);
+
+static inline bool
+pe_base_name_eq(resource_t *rsc, const char *id)
+{
+    if (id && rsc && rsc->id) {
+        // Number of characters in rsc->id before any clone suffix
+        size_t base_len = pe_base_name_end(rsc->id) - rsc->id + 1;
+
+        return (strlen(id) == base_len) && !strncmp(id, rsc->id, base_len);
+    }
+    return FALSE;
+}
 
 int get_target_rc(xmlNode * xml_op);
 
@@ -267,9 +296,15 @@ typedef struct op_digest_cache_s {
 op_digest_cache_t *rsc_action_digest_cmp(resource_t * rsc, xmlNode * xml_op, node_t * node,
                                          pe_working_set_t * data_set);
 
-action_t *pe_fence_op(node_t * node, const char *op, bool optional, pe_working_set_t * data_set);
+action_t *pe_fence_op(node_t * node, const char *op, bool optional, const char *reason, pe_working_set_t * data_set);
 void trigger_unfencing(
     resource_t * rsc, node_t *node, const char *reason, action_t *dependency, pe_working_set_t * data_set);
+
+void pe_action_set_reason(pe_action_t *action, const char *reason, bool overwrite);
+void pe_action_set_flag_reason(const char *function, long line, pe_action_t *action, pe_action_t *reason, const char *text, enum pe_action_flags flags, bool overwrite);
+
+#define pe_action_required(action, reason, text) pe_action_set_flag_reason(__FUNCTION__, __LINE__, action, reason, text, pe_action_optional, FALSE)
+#define pe_action_implies(action, reason, flag) pe_action_set_flag_reason(__FUNCTION__, __LINE__, action, reason, NULL, flag, FALSE)
 
 void set_bit_recursive(resource_t * rsc, unsigned long long flag);
 void clear_bit_recursive(resource_t * rsc, unsigned long long flag);
@@ -279,5 +314,15 @@ gboolean add_tag_ref(GHashTable * tags, const char * tag_name,  const char * obj
 void print_rscs_brief(GListPtr rsc_list, const char * pre_text, long options,
                       void * print_data, gboolean print_all);
 void pe_fence_node(pe_working_set_t * data_set, node_t * node, const char *reason);
+
+node_t *pe_create_node(const char *id, const char *uname, const char *type,
+                       const char *score, pe_working_set_t * data_set);
+bool remote_id_conflict(const char *remote_name, pe_working_set_t *data);
+void common_print(resource_t * rsc, const char *pre_text, const char *name, node_t *node, long options, void *print_data);
+resource_t *find_container_child(const char *stem, resource_t * rsc, node_t *node);
+bool container_fix_remote_addr(resource_t *rsc);
+const char *container_fix_remote_addr_in(resource_t *rsc, xmlNode *xml, const char *field);
+const char *pe_node_attribute_calculated(pe_node_t *node, const char *name, resource_t *rsc);
+const char *pe_node_attribute_raw(pe_node_t *node, const char *name);
 
 #endif

@@ -37,6 +37,9 @@
 
 #define PCMK_IPC_VERSION 1
 
+/* Evict clients whose event queue grows this large (by default) */
+#define PCMK_IPC_DEFAULT_QUEUE_MAX 500
+
 struct crm_ipc_response_header {
     struct qb_ipc_response_header qb;
     uint32_t size_uncompressed;
@@ -290,10 +293,28 @@ crm_client_disconnect_all(qb_ipcs_service_t *service)
     }
 }
 
+/*!
+ * \brief Allocate a new crm_client_t object and generate its ID
+ *
+ * \param[in] key  What to use as connections hash table key (NULL to use ID)
+ *
+ * \return Pointer to new crm_client_t (asserts on failure)
+ */
+crm_client_t *
+crm_client_alloc(void *key)
+{
+    crm_client_t *client = calloc(1, sizeof(crm_client_t));
+
+    CRM_ASSERT(client != NULL);
+    client->id = crm_generate_uuid();
+    g_hash_table_insert(client_connections, (key? key : client->id), client);
+    return client;
+}
+
 crm_client_t *
 crm_client_new(qb_ipcs_connection_t * c, uid_t uid_client, gid_t gid_client)
 {
-    static uid_t uid_server = 0;
+    static gid_t uid_cluster = 0;
     static gid_t gid_cluster = 0;
 
     crm_client_t *client = NULL;
@@ -303,47 +324,41 @@ crm_client_new(qb_ipcs_connection_t * c, uid_t uid_client, gid_t gid_client)
         return NULL;
     }
 
-    if (gid_cluster == 0) {
-        uid_server = getuid();
-        if(crm_user_lookup(CRM_DAEMON_USER, NULL, &gid_cluster) < 0) {
+    if (uid_cluster == 0) {
+        if (crm_user_lookup(CRM_DAEMON_USER, &uid_cluster, &gid_cluster) < 0) {
             static bool have_error = FALSE;
             if(have_error == FALSE) {
-                crm_warn("Could not find group for user %s", CRM_DAEMON_USER);
+                crm_warn("Could not find user and group IDs for user %s",
+                         CRM_DAEMON_USER);
                 have_error = TRUE;
             }
         }
     }
 
-    if(gid_cluster != 0 && gid_client != 0) {
-        uid_t best_uid = -1; /* Passing -1 to chown(2) means don't change */
-
-        if(uid_client == 0 || uid_server == 0) { /* Someone is priveliged, but the other may not be */
-            best_uid = QB_MAX(uid_client, uid_server);
-            crm_trace("Allowing user %u to clean up after disconnect", best_uid);
-        }
-
+    if (uid_client != 0) {
         crm_trace("Giving access to group %u", gid_cluster);
-        qb_ipcs_connection_auth_set(c, best_uid, gid_cluster, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+        /* Passing -1 to chown(2) means don't change */
+        qb_ipcs_connection_auth_set(c, -1, gid_cluster, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
     }
 
     crm_client_init();
 
     /* TODO: Do our own auth checking, return NULL if unauthorized */
-    client = calloc(1, sizeof(crm_client_t));
-
+    client = crm_client_alloc(c);
     client->ipcs = c;
     client->kind = CRM_CLIENT_IPC;
     client->pid = crm_ipcs_client_pid(c);
 
-    client->id = crm_generate_uuid();
+    if ((uid_client == 0) || (uid_client == uid_cluster)) {
+        /* Remember when a connection came from root or hacluster */
+        set_bit(client->flags, crm_client_flag_ipc_privileged);
+    }
 
     crm_debug("Connecting %p for uid=%d gid=%d pid=%u id=%s", c, uid_client, gid_client, client->pid, client->id);
 
 #if ENABLE_ACL
     client->user = uid2username(uid_client);
 #endif
-
-    g_hash_table_insert(client_connections, c, client);
     return client;
 }
 
@@ -392,6 +407,28 @@ crm_client_destroy(crm_client_t * c)
         free(c->remote);
     }
     free(c);
+}
+
+/*!
+ * \brief Raise IPC eviction threshold for a client, if allowed
+ *
+ * \param[in,out] client     Client to modify
+ * \param[in]     queue_max  New threshold (as string)
+ *
+ * \return TRUE if change was allowed, FALSE otherwise
+ */
+bool
+crm_set_client_queue_max(crm_client_t *client, const char *qmax)
+{
+    if (is_set(client->flags, crm_client_flag_ipc_privileged)) {
+        int qmax_int = crm_int_helper(qmax, NULL);
+
+        if ((errno == 0) && (qmax_int > 0)) {
+            client->queue_max = qmax_int;
+            return TRUE;
+        }
+    }
+    return FALSE;
 }
 
 int
@@ -471,12 +508,28 @@ crm_ipcs_flush_events_cb(gpointer data)
     return FALSE;
 }
 
+/*!
+ * \internal
+ * \brief Add progressive delay before next event queue flush
+ *
+ * \param[in,out] c          Client connection to add delay to
+ * \param[in]     queue_len  Current event queue length
+ */
+static inline void
+delay_next_flush(crm_client_t *c, unsigned int queue_len)
+{
+    /* Delay a maximum of 5 seconds */
+    guint delay = (queue_len < 40)? (1000 + 100 * queue_len) : 5000;
+
+    c->event_timer = g_timeout_add(delay, crm_ipcs_flush_events_cb, c);
+}
+
 ssize_t
 crm_ipcs_flush_events(crm_client_t * c)
 {
-    int sent = 0;
     ssize_t rc = 0;
-    int queue_len = 0;
+    unsigned int sent = 0;
+    unsigned int queue_len = 0;
 
     if (c == NULL) {
         return pcmk_ok;
@@ -515,24 +568,38 @@ crm_ipcs_flush_events(crm_client_t * c)
     }
 
     queue_len -= sent;
-    if (sent > 0 || c->event_queue) {
+    if (sent > 0 || queue_len) {
         crm_trace("Sent %d events (%d remaining) for %p[%d]: %s (%lld)",
                   sent, queue_len, c->ipcs, c->pid,
                   pcmk_strerror(rc < 0 ? rc : 0), (long long) rc);
     }
 
-    if (c->event_queue) {
-        if (queue_len % 100 == 0 && queue_len > 99) {
-            crm_warn("Event queue for %p[%d] has grown to %d", c->ipcs, c->pid, queue_len);
+    if (queue_len) {
 
-        } else if (queue_len > 500) {
-            crm_err("Evicting slow client %p[%d]: event queue reached %d entries",
-                    c->ipcs, c->pid, queue_len);
-            qb_ipcs_disconnect(c->ipcs);
-            return rc;
+        /* Allow clients to briefly fall behind on processing incoming messages,
+         * but drop completely unresponsive clients so the connection doesn't
+         * consume resources indefinitely.
+         */
+        if (queue_len > QB_MAX(c->queue_max, PCMK_IPC_DEFAULT_QUEUE_MAX)) {
+            if ((c->queue_backlog <= 1) || (queue_len < c->queue_backlog)) {
+                /* Don't evict for a new or shrinking backlog */
+                crm_warn("Client with process ID %u has a backlog of %u messages "
+                         CRM_XS " %p", c->pid, queue_len, c->ipcs);
+            } else {
+                crm_err("Evicting client with process ID %u due to backlog of %u messages "
+                         CRM_XS " %p", c->pid, queue_len, c->ipcs);
+                c->queue_backlog = 0;
+                qb_ipcs_disconnect(c->ipcs);
+                return rc;
+            }
         }
 
-        c->event_timer = g_timeout_add(1000 + 100 * queue_len, crm_ipcs_flush_events_cb, c);
+        c->queue_backlog = queue_len;
+        delay_next_flush(c, queue_len);
+
+    } else {
+        /* Event queue is empty, there is no backlog */
+        c->queue_backlog = 0;
     }
 
     return rc;
@@ -910,9 +977,18 @@ crm_ipc_connected(crm_ipc_t * client)
     return rc;
 }
 
+/*!
+ * \brief Check whether an IPC connection is ready to be read
+ *
+ * \param[in] client  Connection to check
+ *
+ * \return Positive value if ready to be read, 0 if not ready, -errno on error
+ */
 int
-crm_ipc_ready(crm_ipc_t * client)
+crm_ipc_ready(crm_ipc_t *client)
 {
+    int rc;
+
     CRM_ASSERT(client != NULL);
 
     if (crm_ipc_connected(client) == FALSE) {
@@ -920,7 +996,8 @@ crm_ipc_ready(crm_ipc_t * client)
     }
 
     client->pfd.revents = 0;
-    return poll(&(client->pfd), 1, 0);
+    rc = poll(&(client->pfd), 1, 0);
+    return (rc < 0)? -errno : rc;
 }
 
 static int

@@ -37,6 +37,8 @@ gboolean shuttingdown = FALSE;
 crm_graph_t *transition_graph;
 crm_trigger_t *transition_trigger = NULL;
 
+static unsigned long int stonith_max_attempts = 10;
+
 /* #define rsc_op_template "//"XML_TAG_DIFF_ADDED"//"XML_TAG_CIB"//"XML_CIB_TAG_STATE"[@uname='%s']"//"XML_LRM_TAG_RSC_OP"[@id='%s]" */
 #define rsc_op_template "//"XML_TAG_DIFF_ADDED"//"XML_TAG_CIB"//"XML_LRM_TAG_RSC_OP"[@id='%s']"
 
@@ -53,6 +55,16 @@ get_node_id(xmlNode * rsc_op)
     return ID(node);
 }
 
+void
+update_stonith_max_attempts(const char* value)
+{
+    if (safe_str_eq(value, INFINITY_S)) {
+       stonith_max_attempts = node_score_infinity;
+    }
+    else {
+       stonith_max_attempts = crm_int_helper(value, NULL);
+    }
+}
 static void
 te_legacy_update_diff(const char *event, xmlNode * diff)
 {
@@ -320,7 +332,9 @@ static char *extract_node_uuid(const char *xpath)
     return node_uuid;
 }
 
-static void abort_unless_down(const char *xpath, const char *op, xmlNode *change, const char *reason) 
+static void
+abort_unless_down(const char *xpath, const char *op, xmlNode *change,
+                  const char *reason)
 {
     char *node_uuid = NULL;
     crm_action_t *down = NULL;
@@ -337,7 +351,7 @@ static void abort_unless_down(const char *xpath, const char *op, xmlNode *change
         return;
     }
 
-    down = match_down_event(node_uuid, FALSE);
+    down = match_down_event(node_uuid, TRUE);
     if(down == NULL || down->executed == false) {
         crm_trace("Not expecting %s to be down (%s)", node_uuid, xpath);
         abort_transition(INFINITY, tg_restart, reason, change);
@@ -425,24 +439,30 @@ te_update_diff(const char *event, xmlNode * msg)
         }
 
         if(match) {
+            if (match->type == XML_COMMENT_NODE) {
+                crm_trace("Ignoring %s operation for comment at %s", op, xpath);
+                continue;
+            }
             name = (const char *)match->name;
         }
 
-        crm_trace("Handling %s operation for %s %p, %s", op, xpath, match, name);
+        crm_trace("Handling %s operation for %s%s%s",
+                  op, (xpath? xpath : "CIB"),
+                  (name? " matched by " : ""), (name? name : ""));
         if(xpath == NULL) {
             /* Version field, ignore */
 
         } else if(strstr(xpath, "/cib/configuration")) {
-            abort_transition(INFINITY, tg_restart, "Non-status change", change);
-            break; /* Wont be packaged with any resource operations we may be waiting for */
+            abort_transition(INFINITY, tg_restart, "Configuration change", change);
+            break; /* Won't be packaged with any resource operations we may be waiting for */
 
         } else if(strstr(xpath, "/"XML_CIB_TAG_TICKETS) || safe_str_eq(name, XML_CIB_TAG_TICKETS)) {
             abort_transition(INFINITY, tg_restart, "Ticket attribute change", change);
-            break; /* Wont be packaged with any resource operations we may be waiting for */
+            break; /* Won't be packaged with any resource operations we may be waiting for */
 
         } else if(strstr(xpath, "/"XML_TAG_TRANSIENT_NODEATTRS"[") || safe_str_eq(name, XML_TAG_TRANSIENT_NODEATTRS)) {
             abort_unless_down(xpath, op, change, "Transient attribute change");
-            break; /* Wont be packaged with any resource operations we may be waiting for */
+            break; /* Won't be packaged with any resource operations we may be waiting for */
 
         } else if(strstr(xpath, "/"XML_LRM_TAG_RSC_OP"[") && safe_str_eq(op, "delete")) {
             crm_action_t *cancel = NULL;
@@ -502,7 +522,7 @@ te_update_diff(const char *event, xmlNode * msg)
             }
 
             if(config) {
-                abort_transition(INFINITY, tg_restart, "Non-status change", change);
+                abort_transition(INFINITY, tg_restart, "Non-status-only change", change);
             }
 
         } else if(strcmp(name, XML_CIB_TAG_STATUS) == 0) {
@@ -613,11 +633,10 @@ process_te_message(xmlNode * msg, xmlNode * xml_data)
 GHashTable *stonith_failures = NULL;
 struct st_fail_rec {
     int count;
-    int last_rc;
 };
 
-gboolean
-too_many_st_failures(void)
+static gboolean
+too_many_st_failures(const char *target)
 {
     GHashTableIter iter;
     const char *key = NULL;
@@ -627,42 +646,68 @@ too_many_st_failures(void)
         return FALSE;
     }
 
-    g_hash_table_iter_init(&iter, stonith_failures);
-    while (g_hash_table_iter_next(&iter, (gpointer *) & key, (gpointer *) & value)) {
-        if (value->count > 10) {
-            crm_notice("Too many failures to fence %s (%d), giving up", key, value->count);
-            return TRUE;
-        } else if (value->last_rc == -ENODEV) {
-            crm_notice("No devices found in cluster to fence %s, giving up", key);
-            return TRUE;
+    if (target == NULL) {
+        g_hash_table_iter_init(&iter, stonith_failures);
+        while (g_hash_table_iter_next(&iter, (gpointer *) & key, (gpointer *) & value)) {
+            if (value->count >= stonith_max_attempts) {
+                target = (const char*)key;
+                goto too_many;
+            }
+        }
+    } else {
+        value = g_hash_table_lookup(stonith_failures, target);
+        if ((value != NULL) && (value->count >= stonith_max_attempts)) {
+            goto too_many;
         }
     }
     return FALSE;
+
+too_many:
+    crm_warn("Too many failures (%d) to fence %s, giving up",
+             value->count, target);
+    return TRUE;
 }
 
+/*!
+ * \internal
+ * \brief Reset a stonith fail count
+ *
+ * \param[in] target  Name of node to reset, or NULL for all
+ */
 void
 st_fail_count_reset(const char *target)
 {
-    struct st_fail_rec *rec = NULL;
-
-    if (stonith_failures) {
-        rec = g_hash_table_lookup(stonith_failures, target);
+    if (stonith_failures == NULL) {
+        return;
     }
 
-    if (rec) {
-        rec->count = 0;
-        rec->last_rc = 0;
+    if (target) {
+        struct st_fail_rec *rec = NULL;
+
+        rec = g_hash_table_lookup(stonith_failures, target);
+        if (rec) {
+            rec->count = 0;
+        }
+    } else {
+        GHashTableIter iter;
+        const char *key = NULL;
+        struct st_fail_rec *rec = NULL;
+
+        g_hash_table_iter_init(&iter, stonith_failures);
+        while (g_hash_table_iter_next(&iter, (gpointer *) &key,
+                                      (gpointer *) &rec)) {
+            rec->count = 0;
+        }
     }
 }
 
-static void
-st_fail_count_increment(const char *target, int rc)
+void
+st_fail_count_increment(const char *target)
 {
     struct st_fail_rec *rec = NULL;
 
     if (stonith_failures == NULL) {
-        stonith_failures =
-            g_hash_table_new_full(crm_str_hash, g_str_equal, g_hash_destroy_str, free);
+        stonith_failures = crm_str_table_new();
     }
 
     rec = g_hash_table_lookup(stonith_failures, target);
@@ -677,8 +722,27 @@ st_fail_count_increment(const char *target, int rc)
         rec->count = 1;
         g_hash_table_insert(stonith_failures, strdup(target), rec);
     }
-    rec->last_rc = rc;
+}
 
+/*!
+ * \internal
+ * \brief Abort transition due to stonith failure
+ *
+ * \param[in] abort_action  Whether to restart or stop transition
+ * \param[in] target  Don't restart if this (NULL for any) has too many failures
+ * \param[in] reason  Log this stonith action XML as abort reason (or NULL)
+ */
+void
+abort_for_stonith_failure(enum transition_action abort_action,
+                          const char *target, xmlNode *reason)
+{
+    /* If stonith repeatedly fails, we eventually give up on starting a new
+     * transition for that reason.
+     */
+    if ((abort_action != tg_stop) && too_many_st_failures(target)) {
+        abort_action = tg_stop;
+    }
+    abort_transition(INFINITY, abort_action, "Stonith failed", reason);
 }
 
 void
@@ -724,16 +788,28 @@ tengine_stonith_callback(stonith_t * stonith, stonith_callback_data_t * data)
     }
 
     stop_te_timer(action->timer);
-
     if (rc == pcmk_ok) {
         const char *target = crm_element_value(action->xml, XML_LRM_ATTR_TARGET);
         const char *uuid = crm_element_value(action->xml, XML_LRM_ATTR_TARGET_UUID);
         const char *op = crm_meta_value(action->params, "stonith_action"); 
 
-        crm_debug("Stonith operation %d for %s passed", call_id, target);
+        crm_info("Stonith operation %d for %s passed", call_id, target);
         if (action->confirmed == FALSE) {
             te_action_confirmed(action);
-            if (action->sent_update == FALSE && safe_str_neq("on", op)) {
+            if (safe_str_eq("on", op)) {
+                const char *value = NULL;
+                char *now = crm_itoa(time(NULL));
+
+                update_attrd(target, CRM_ATTR_UNFENCED, now, NULL, FALSE);
+                free(now);
+
+                value = crm_meta_value(action->params, XML_OP_ATTR_DIGESTS_ALL);
+                update_attrd(target, CRM_ATTR_DIGESTS_ALL, value, NULL, FALSE);
+
+                value = crm_meta_value(action->params, XML_OP_ATTR_DIGESTS_SECURE);
+                update_attrd(target, CRM_ATTR_DIGESTS_SECURE, value, NULL, FALSE);
+
+            } else if (action->sent_update == FALSE) {
                 send_stonith_update(action, target, uuid);
                 action->sent_update = TRUE;
             }
@@ -742,12 +818,26 @@ tengine_stonith_callback(stonith_t * stonith, stonith_callback_data_t * data)
 
     } else {
         const char *target = crm_element_value_const(action->xml, XML_LRM_ATTR_TARGET);
+        enum transition_action abort_action = tg_restart;
 
         action->failed = TRUE;
         crm_notice("Stonith operation %d for %s failed (%s): aborting transition.",
                    call_id, target, pcmk_strerror(rc));
-        abort_transition(INFINITY, tg_restart, "Stonith failed", NULL);
-        st_fail_count_increment(target, rc);
+
+        /* If no fence devices were available, there's no use in immediately
+         * checking again, so don't start a new transition in that case.
+         */
+        if (rc == -ENODEV) {
+            crm_warn("No devices found in cluster to fence %s, giving up",
+                     target);
+            abort_action = tg_stop;
+        }
+
+        /* Increment the fail count now, so abort_for_stonith_failure() can
+         * check it. Non-DC nodes will increment it in tengine_stonith_notify().
+         */
+        st_fail_count_increment(target);
+        abort_for_stonith_failure(abort_action, target, NULL);
     }
 
     update_graph(transition_graph, action);

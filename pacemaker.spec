@@ -56,7 +56,7 @@
 Name:          pacemaker
 Summary:       Scalable High-Availability cluster resource manager
 Version:       1.1.14
-Release:       %{pcmk_release}%{?dist}
+Release:       %{pcmk_release}%{?dist}.1
 License:       GPLv2+ and LGPLv2+
 Url:           http://www.clusterlabs.org
 Group:         System Environment/Daemons
@@ -93,6 +93,7 @@ Patch117:      0117-scalability-regression.patch
 Patch118:      0118-remote-attributes.patch
 Patch119:      0119-crm_report-sanitize-logfiles.patch
 Patch120:      0120-fencing-unseen-nodes.patch
+Patch121:      0121-skip-cman-option.patch
 
 BuildRoot:     %(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
 AutoReqProv:   on
@@ -316,6 +317,7 @@ cp extra/rgmanager/README README_RGManager_porting
 %patch118 -p1
 %patch119 -p1
 %patch120 -p1
+%patch121 -p1
 
 # Force the local time
 #
@@ -637,6 +639,11 @@ exit 0
 %doc AUTHORS
 
 %changelog
+* Fri Jul 15 2016 Ken Gaillot <kgaillot@redhat.com> - 1.1.14-8.1
+ - add --skip-cman option when stopping pacemaker
+
+  Resolves: rhbz#1355738
+
 * Thu Mar 24 2016 Ken Gaillot <kgaillot@redhat.com> - 1.1.14-8
  - fenced unseen nodes should not be considered unclean
 

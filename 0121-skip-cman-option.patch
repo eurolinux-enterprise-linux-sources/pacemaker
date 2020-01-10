@@ -1,0 +1,34 @@
+From b2fa1dc49cc29c975e6459bd5b75b6d9347438b7 Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Thu, 7 Jul 2016 15:21:38 -0500
+Subject: [PATCH] Feature: mcp: allow stopping Pacemaker without stopping CMAN
+ in init script
+
+If "stop --skip-cman" is specified, the pacemaker init script will never
+stop CMAN. This allows higher-level tools to preserve quorum for DLM-based
+resources while stopping pacemaker on all nodes, then stop CMAN on all nodes.
+---
+ mcp/pacemaker.in | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/mcp/pacemaker.in b/mcp/pacemaker.in
+index c677322..6e90645 100644
+--- a/mcp/pacemaker.in
++++ b/mcp/pacemaker.in
+@@ -270,7 +270,12 @@ stop)
+ 	[ "$PCMK_STACK" = cman ] && cman_pre_stop
+ 	stop
+ 	[ "x$SBD_SERVICE" != x ] && service $SBD_SERVICE stop
+-	[ "$PCMK_STACK" = cman ] && service cman stop
++
++	# Stop cman if needed, unless --skip-cman is specified (which allows
++	# higher-level tooling to stop pacemaker on all nodes, then stop cman
++	# on all nodes, to maintain quorum for DLM-based resources while
++	# pacemaker shuts down).
++	[ "$PCMK_STACK" = cman ] && [ "$2" != "--skip-cman" ] && service cman stop
+ ;;
+ *)
+ 	echo "usage: $0 {start|stop|restart|reload|force-reload|condrestart|try-restart|status}"
+-- 
+1.8.3.1
+

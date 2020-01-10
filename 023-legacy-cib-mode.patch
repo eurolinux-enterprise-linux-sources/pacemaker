@@ -1,0 +1,64 @@
+From df497ff980a95e2833856b8204f3d191e0613641 Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Thu, 19 Jan 2017 10:20:07 -0600
+Subject: [PATCH 1/2] Log: cib: improve warning when legacy diff fails
+
+---
+ cib/messages.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/cib/messages.c b/cib/messages.c
+index 4e704dc..65f57b1 100644
+--- a/cib/messages.c
++++ b/cib/messages.c
+@@ -383,7 +383,8 @@ cib_server_process_diff(const char *op, int options, const char *section, xmlNod
+         }
+ 
+     } else if(rc != pcmk_ok && cib_legacy_mode()) {
+-        crm_warn("Something went wrong in compatibility mode, requesting full refresh");
++        crm_warn("Requesting full CIB refresh because update failed: %s"
++                 CRM_XS " rc=%d", pcmk_strerror(rc), rc);
+         xml_log_patchset(LOG_INFO, __FUNCTION__, input);
+         free_xml(*result_cib);
+         *result_cib = NULL;
+-- 
+1.8.3.1
+
+
+From de5c6c73ad207eebe08d863455ac7cb5aa3c25c2 Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Thu, 19 Jan 2017 10:23:45 -0600
+Subject: [PATCH 2/2] Low: cib: never disable legacy mode with corosync 1
+ stacks
+
+---
+ cib/main.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/cib/main.c b/cib/main.c
+index cc3a463..1e7fb00 100644
+--- a/cib/main.c
++++ b/cib/main.c
+@@ -422,7 +422,10 @@ cib_peer_update_callback(enum crm_status_type type, crm_node_t * node, const voi
+ {
+     switch (type) {
+         case crm_status_processes:
+-            if (legacy_mode && is_not_set(node->processes, crm_get_cluster_proc())) {
++#if !SUPPORT_PLUGIN
++            if (cib_legacy_mode()
++                && is_not_set(node->processes, crm_get_cluster_proc())) {
++
+                 uint32_t old = data? *(const uint32_t *)data : 0;
+ 
+                 if ((node->processes ^ old) & crm_proc_cpg) {
+@@ -431,6 +434,7 @@ cib_peer_update_callback(enum crm_status_type type, crm_node_t * node, const voi
+                     legacy_mode = FALSE;
+                 }
+             }
++#endif
+             break;
+ 
+         case crm_status_uname:
+-- 
+1.8.3.1
+

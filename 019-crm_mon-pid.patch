@@ -1,0 +1,50 @@
+From 7b303943a82e3181c2a57260e222a89661fd8fa5 Mon Sep 17 00:00:00 2001
+From: Oyvind Albrigtsen <oalbrigt@redhat.com>
+Date: Fri, 23 Sep 2016 12:06:05 +0200
+Subject: [PATCH] ClusterMon: fix to avoid matching other process with the same
+ PID
+
+---
+ extra/resources/ClusterMon | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/extra/resources/ClusterMon b/extra/resources/ClusterMon
+index 5d1472d..e88a318 100644
+--- a/extra/resources/ClusterMon
++++ b/extra/resources/ClusterMon
+@@ -131,9 +131,9 @@ ClusterMon_start() {
+     cmd_prefix=""
+     cmd_suffix=""
+     if [ ! -z $OCF_RESKEY_user ]; then
+-	su - $OCF_RESKEY_user -c "${HA_SBIN_DIR}/crm_mon -p $OCF_RESKEY_pidfile -d -i $OCF_RESKEY_update $OCF_RESKEY_extra_options -h $OCF_RESKEY_htmlfile"
++	su - $OCF_RESKEY_user -c "$CMON_CMD"
+     else
+-	${HA_SBIN_DIR}/crm_mon -p $OCF_RESKEY_pidfile -d -i $OCF_RESKEY_update $OCF_RESKEY_extra_options -h $OCF_RESKEY_htmlfile
++	$CMON_CMD
+     fi
+     ClusterMon_exit $?
+ }
+@@ -153,7 +153,10 @@ ClusterMon_monitor() {
+     if [ -f $OCF_RESKEY_pidfile ]; then
+ 	pid=`cat $OCF_RESKEY_pidfile`
+ 	if [ ! -z $pid ]; then
+-	    kill -s 0 $pid >/dev/null 2>&1; rc=$?
++	    str=$(echo "su - $OCF_RESKEY_user -c \"$CMON_CMD\"" | tr 'crmon, \t' 'xxxxxxxx')
++	    ps -o "args=${str}" -p $pid 2>/dev/null | \
++		grep -qE "[c]rm_mon.*${OCF_RESKEY_pidfile}"
++	    rc=$?
+ 	    case $rc in
+ 		0) exit $OCF_SUCCESS;;
+ 		1) exit $OCF_NOT_RUNNING;;
+@@ -244,6 +247,8 @@ fi
+ 
+ OCF_RESKEY_update=`expr $OCF_RESKEY_update / 1000`
+ 
++CMON_CMD="${HA_SBIN_DIR}/crm_mon -p $OCF_RESKEY_pidfile -d -i $OCF_RESKEY_update $OCF_RESKEY_extra_options -h $OCF_RESKEY_htmlfile"
++
+ case $__OCF_ACTION in
+ meta-data)	meta_data
+ 		exit $OCF_SUCCESS
+-- 
+1.8.3.1
+

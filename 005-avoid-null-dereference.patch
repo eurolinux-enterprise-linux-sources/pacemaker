@@ -1,0 +1,26 @@
+From 8eb3c07119fec6da0712b3940706a14ad3a66483 Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Tue, 26 Jul 2016 14:16:32 -0500
+Subject: [PATCH] Fix: pengine: avoid null dereference in new same-node
+ ordering option
+
+---
+ pengine/graph.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/pengine/graph.c b/pengine/graph.c
+index a713c71..9b55a4e 100644
+--- a/pengine/graph.c
++++ b/pengine/graph.c
+@@ -510,7 +510,7 @@ update_action(action_t * then)
+         }
+ 
+         /* Disable constraint if it only applies when on same node, but isn't */
+-        if (is_set(other->type, pe_order_same_node)
++        if (is_set(other->type, pe_order_same_node) && first_node && then_node
+             && (first_node->details != then_node->details)) {
+ 
+             crm_trace("Disabled constraint %s on %s -> %s on %s",
+-- 
+1.8.3.1
+

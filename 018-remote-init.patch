@@ -1,0 +1,48 @@
+From 1d713ab5d33fa2305ea627f35a5121305827a5bc Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Wed, 31 Aug 2016 17:48:53 -0500
+Subject: [PATCH] Fix: lrmd: make pacemaker_remote init script stop always
+ return 0
+
+Regression introduced in e8f8410e returned 1 when sbd is not configured.
+
+Also, if stopping when already stopped, print some identifying text rather than
+just the status.
+---
+ lrmd/pacemaker_remote.in | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/lrmd/pacemaker_remote.in b/lrmd/pacemaker_remote.in
+index a356510..92fe125 100644
+--- a/lrmd/pacemaker_remote.in
++++ b/lrmd/pacemaker_remote.in
+@@ -115,7 +115,7 @@ start()
+ 	fi
+ 	echo
+ 
+-	[ "x$SBD_SERVICE" != x ] && service $SBD_SERVICE start
++	[ "x$SBD_SERVICE" = "x" ] || service $SBD_SERVICE start
+ }
+ 
+ stop()
+@@ -131,6 +131,8 @@ stop()
+ 		sleep 1
+ 		echo -n "."
+ 	    done
++	else
++		echo -n "$desc is already stopped"
+ 	fi
+ 
+ 	rm -f "$LOCK_FILE"
+@@ -138,7 +140,7 @@ stop()
+ 	success
+ 	echo
+ 
+-	[ "x$SBD_SERVICE" != x ] && service $SBD_SERVICE stop
++	[ "x$SBD_SERVICE" = "x" ] || service $SBD_SERVICE stop
+ }
+ 
+ rtrn=0
+-- 
+1.8.3.1
+

@@ -1,0 +1,26 @@
+From 443816c624635ffbddfad4ccd26e216fc080a1e9 Mon Sep 17 00:00:00 2001
+From: Klaus Wenninger <klaus.wenninger@aon.at>
+Date: Fri, 24 Jun 2016 11:39:15 +0200
+Subject: [PATCH] fix: extra: correct quoting of timestamp-format in
+ alert-snmp-example
+
+---
+ extra/alerts/alert_snmp.sh.sample | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/extra/alerts/alert_snmp.sh.sample b/extra/alerts/alert_snmp.sh.sample
+index 3e7ee6c..fcdcd7e 100644
+--- a/extra/alerts/alert_snmp.sh.sample
++++ b/extra/alerts/alert_snmp.sh.sample
+@@ -34,7 +34,7 @@
+ #         <nvpair id="trap_node_states" name="trap_node_states" value="all"/>
+ #       </instance_attributes>
+ #       <meta_attributes id="config_for_timestamp">
+-#         <nvpair id="ts_fmt" name="timestamp-format" value=""%Y-%m-%d,%H:%M:%S.%01N""/>
++#         <nvpair id="ts_fmt" name="timestamp-format" value="%Y-%m-%d,%H:%M:%S.%01N"/>
+ #       </meta_attributes>
+ #       <recipient id="snmp_destination" value="192.168.1.2"/>
+ #     </alert>
+-- 
+1.8.3.1
+

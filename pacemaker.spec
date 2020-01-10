@@ -2,10 +2,18 @@
 %global uname hacluster
 %global pcmk_docdir %{_docdir}/%{name}
 
-%global specversion 8
-# 1.1.14
-%global commit f0b585a6ad5ad0db5f6a0faabcf2872fff152d55 
-%global shortcommit %(c=%{commit}; echo ${c:0:7})
+%global specversion 5
+%global pcmkversion 1.1.15
+# set following to the actual commit or, for final release, concatenate
+# "pcmkversion" macro to "Pacemaker-" (will yield a tag per the convention)
+%global commit e174ec84857e087210b9dacee3318f8203176129
+%global lparen (
+%global rparen )
+%global shortcommit %(c=%{commit}; case ${c} in
+                      Pacemaker-*%{rparen} echo ${c:10};;
+                      *%{rparen} echo ${c:0:7};; esac)
+%global pre_release %(s=%{shortcommit}; [ ${s: -4:3} != -rc ]; echo $?)
+%global post_release %([ %{commit} = Pacemaker-%{shortcommit} ]; echo $?)
 %global github_owner ClusterLabs
 
 # Turn off the auto compilation of python files not in the site-packages directory
@@ -14,7 +22,20 @@
 
 %global rawhide  %(test ! -e /etc/yum.repos.d/fedora-rawhide.repo; echo $?)
 %global cs_version %(pkg-config corosync --modversion  | awk -F . '{print $1}')
-%global py_site %(python -c "from distutils.sysconfig import get_python_lib; print(get_python_lib(1))")
+%global py_site    %{?python_sitearch}%{!?python_sitearch:%(python -c "from distutils.sysconfig import get_python_lib; print(get_python_lib(1))")}
+%global cman_native 0%{?el6} || (0%{?fedora} > 0 && 0%{?fedora} < 17)
+
+# It's desired to apply "license" macro uniformly in "files" sections below,
+# but RPM versions not aware of this new classification normally (re)define it
+# to the value of "License:", so following is to ensure the macro definition
+# is per expectation only after that tag; solution courtesy of Jason Tibbitts:
+# https://pkgs.fedoraproject.org/cgit/rpms/epel-rpm-macros.git/tree/macros.zzz-epel?h=el6&id=e1adcb77b0c05a6c29bc0eb0c4e82113180a0a99#n12
+%if !%{defined _licensedir}
+%define description %{lua:
+    rpm.define("license %doc")
+    print("%description")
+}
+%endif
 
 # Conditionals
 # Invoke "rpmbuild --without <feature>" or "rpmbuild --with <feature>"
@@ -30,7 +51,8 @@
 %bcond_with coverage
 
 # We generate docs using Publican, Asciidoc and Inkscape, but they're not available everywhere
-%bcond_without doc
+# For RHEL, disable docs by default, but provide --with-doc rpm build option
+%bcond_with doc
 
 # Use a different versioning scheme
 %bcond_with pre_release
@@ -41,64 +63,77 @@
 # Turn off cman support on platforms that normally ship with it
 %bcond_without cman
 
+# Turn off hardening of libraries and daemon executables
+%bcond_without hardening
+
 %if %{with profiling}
 # This disables -debuginfo package creation and also the stripping binaries/libraries
 # Useful if you want sane profiling data
 %global debug_package %{nil}
 %endif
 
-%if %{with pre_release}
-%global pcmk_release 0.%{specversion}.%{upstream_version}.git
+%if %{with pre_release} || 0%{pre_release}
+%if 0%{pre_release}
+%global pcmk_release 0.%{specversion}.%(s=%{shortcommit}; echo ${s: -3})
+%else
+%global pcmk_release 0.%{specversion}.%{shortcommit}.git
+%endif
 %else
 %global pcmk_release %{specversion}
 %endif
 
 Name:          pacemaker
 Summary:       Scalable High-Availability cluster resource manager
-Version:       1.1.14
-Release:       %{pcmk_release}%{?dist}.2
+Version:       %{pcmkversion}
+Release:       %{pcmk_release}%{?dist}
+%if %{defined _unitdir}
 License:       GPLv2+ and LGPLv2+
+%else
+# initscript is Revised BSD
+License:       GPLv2+ and LGPLv2+ and BSD
+%endif
 Url:           http://www.clusterlabs.org
 Group:         System Environment/Daemons
 
-Source0:        https://github.com/%{github_owner}/%{name}/archive/%{commit}/%{name}-%{commit}.tar.gz
+# eg. https://github.com/ClusterLabs/pacemaker/archive/8ae45302394b039fb098e150f156df29fc0cb576/pacemaker-8ae4530.tar.gz
+Source0:       https://github.com/%{github_owner}/%{name}/archive/%{commit}/%{name}-%{shortcommit}.tar.gz
 
-# patches that aren't upstream commits
-Patch1:        pcmk-plugin-warning.patch
-Patch2:        pacemaker-no-doxygen.patch
-Patch3:        README_RGManager_porting.patch
-Patch4:        pacemaker-sbd-start.patch
-Patch5:        CVE-2016-7035.patch
+# upstream commits
+Patch1:        001-makefile-cleanup.patch
+Patch2:        002-build-cleanup.patch
+Patch3:        003-harden-toolchain.patch
+Patch4:        004-bz1290592.patch
+Patch5:        005-avoid-null-dereference.patch
+Patch6:        006-alert-snmp-quoting.patch
+Patch7:        007-cib-callback-unregistration.patch
+Patch8:        008-crm_mon-headings.patch
+Patch9:        009-crm_mon-schema.patch
+Patch10:       010-memory-checks.patch
+Patch11:       011-resend-shutdown.patch
+Patch12:       012-invalid-config-loop.patch
+Patch13:       013-clear-remote-history.patch
+Patch14:       014-crm_report.patch
+Patch15:       015-skip-cman.patch
+Patch16:       016-lsb-return.patch
+Patch17:       017-start-sbd.patch
+Patch18:       018-remote-init.patch
+Patch19:       019-crm_mon-pid.patch
+Patch20:       020-attrd_updater.patch
+Patch21:       021-crm_report-grep.patch
+Patch22:       022-xml-info-message.patch
+Patch23:       023-legacy-cib-mode.patch
+Patch24:       024-cib-resync.patch
 
-# graceful stops of pacemaker_remote
-Patch100:      0100-Refactor-lrmd-handle-shutdown-a-little-more-cleanly.patch
-Patch101:      0101-Refactor-lrmd-make-proxied-IPC-providers-clients-opa.patch
-Patch102:      0102-Refactor-crmd-lrmd-liblrmd-use-defined-constants-for.patch
-Patch103:      0103-Test-cts-simulate-pacemaker_remote-failure-with-kill.patch
-Patch104:      0104-Feature-lrmd-liblrmd-add-lrmd-IPC-operations-for-req.patch
-Patch105:      0105-Feature-crmd-support-graceful-pacemaker_remote-stops.patch
-Patch106:      0106-Feature-pacemaker_remote-support-graceful-stops.patch
-Patch107:      0107-Feature-PE-Honor-the-shutdown-transient-attributes-f.patch
-Patch108:      0108-Feature-crmd-Set-the-shutdown-transient-attribute-in.patch
-Patch109:      0109-Fix-attrd-Hook-up-the-client-name-so-we-can-track-re.patch
-Patch110:      0110-Fix-attrd-Correctly-implement-mass-removal-of-a-node.patch
-Patch111:      0111-Log-crmd-Graceful-proxy-shutdown-is-now-tested.patch
-Patch112:      0112-Fix-crmd-set-remote-flag.patch
-Patch113:      0113-Fix-attrd-correct-peer-cache.patch
-
-# other upstream commits
-Patch114:      0114-Fix-PACKAGE_URL.patch
-Patch115:      0115-unexpected-remote-client.patch
-Patch116:      0116-notify-clients-after-handshake.patch
-Patch117:      0117-scalability-regression.patch
-Patch118:      0118-remote-attributes.patch
-Patch119:      0119-crm_report-sanitize-logfiles.patch
-Patch120:      0120-fencing-unseen-nodes.patch
-Patch121:      0121-skip-cman-option.patch
+# patches that aren't from upstream
+Patch100:      pcmk-plugin-warning.patch
+Patch101:      pacemaker-no-doxygen.patch
+Patch102:      README_RGManager_porting.patch
+Patch103:      CVE-2016-7035.patch
+Patch104:      lrmd-protocol-version.patch
 
 BuildRoot:     %(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
 AutoReqProv:   on
-Requires:      python >= 2.4
+Requires:      python >= 2.6
 Requires:      resource-agents
 Requires:      %{name}-libs = %{version}-%{release}
 Requires:      %{name}-cluster-libs = %{version}-%{release}
@@ -112,10 +147,10 @@ Requires:      %{name}-cli = %{version}-%{release}
 ExclusiveArch: i686 x86_64
 %endif
 
-# Required for core functionality
-BuildRequires: automake autoconf libtool pkgconfig python libtool-ltdl-devel
+# Required for core functionality (python-devel depends on python)
+BuildRequires: automake autoconf libtool pkgconfig libtool-ltdl-devel
 BuildRequires: pkgconfig(glib-2.0) libxml2-devel libxslt-devel libuuid-devel
-BuildRequires: pkgconfig python-devel gcc-c++ bzip2-devel pam-devel
+BuildRequires: python-devel bzip2-devel pam-devel
 
 # Required for agent_config.h which specifies the correct scratch directory
 BuildRequires: resource-agents
@@ -132,20 +167,11 @@ BuildRequires: bison byacc flex help2man gnutls-devel
 BuildRequires: systemd-devel
 %endif
 
-%if %{with cman}
-
-%if 0%{?fedora} > 0
-%if 0%{?fedora} < 17
+%if %{with cman} && %{cman_native}
 BuildRequires: clusterlib-devel
-%endif
-%endif
-
-%if 0%{?rhel} > 0
-%if 0%{?rhel} < 7
-BuildRequires: clusterlib-devel
-%endif
-%endif
-
+# pacemaker initscript: cman initscript, fence_tool (+ some soft-dependencies)
+# "post" scriptlet: ccs_update_schema
+Requires:      cman
 %endif
 
 Requires:      corosync
@@ -159,10 +185,7 @@ BuildRequires: cluster-glue-libs-devel
 # More often than not, inkscape is busted on rawhide, don't even bother
 
 %if %{with doc}
-%ifarch %{ix86} x86_64
-# BuildRequires: publican
-BuildRequires: inkscape asciidoc
-%endif
+BuildRequires: publican inkscape asciidoc
 %endif
 
 %endif
@@ -179,14 +202,14 @@ when related resources fail and can be configured to periodically check
 resource health.
 
 Available rpmbuild rebuild options:
-  --with(out) : cman stonithd doc coverage profiling pre_release upstart_job
+  --with(out) : cman stonithd doc coverage profiling pre_release hardening
 
 %package cli
-License:      GPLv2+ and LGPLv2+
-Summary:      Command line tools for controlling Pacemaker clusters
-Group:        System Environment/Daemons
-Requires:     %{name}-libs = %{version}-%{release}
-Requires:     perl-TimeDate
+License:       GPLv2+ and LGPLv2+
+Summary:       Command line tools for controlling Pacemaker clusters
+Group:         System Environment/Daemons
+Requires:      %{name}-libs = %{version}-%{release}
+Requires:      perl-TimeDate
 
 %description cli
 Pacemaker is an advanced, scalable High-Availability cluster resource
@@ -197,9 +220,9 @@ to query and control the cluster from machines that may, or may not,
 be part of the cluster.
 
 %package -n %{name}-libs
-License:      GPLv2+ and LGPLv2+
-Summary:      Core Pacemaker libraries
-Group:        System Environment/Daemons
+License:       GPLv2+ and LGPLv2+
+Summary:       Core Pacemaker libraries
+Group:         System Environment/Daemons
 Requires(pre): shadow-utils
 Requires:      glib2 >= 2.28 
 
@@ -211,10 +234,10 @@ The %{name}-libs package contains shared libraries needed for cluster
 nodes and those just running the CLI tools.
 
 %package -n %{name}-cluster-libs
-License:      GPLv2+ and LGPLv2+
-Summary:      Cluster Libraries used by Pacemaker
-Group:        System Environment/Daemons
-Requires:     %{name}-libs = %{version}-%{release}
+License:       GPLv2+ and LGPLv2+
+Summary:       Cluster Libraries used by Pacemaker
+Group:         System Environment/Daemons
+Requires:      %{name}-libs = %{version}-%{release}
 
 %description -n %{name}-cluster-libs
 Pacemaker is an advanced, scalable High-Availability cluster resource
@@ -224,10 +247,15 @@ The %{name}-cluster-libs package contains cluster-aware shared
 libraries needed for nodes that will form part of the cluster nodes.
 
 %package remote
-License:      GPLv2+ and LGPLv2+
-Summary:      Pacemaker remote daemon for non-cluster nodes
-Group:        System Environment/Daemons
-Requires:     %{name}-libs = %{version}-%{release}
+%if %{defined _unitdir}
+License:       GPLv2+ and LGPLv2+
+%else
+# initscript is Revised BSD
+License:       GPLv2+ and LGPLv2+ and BSD
+%endif
+Summary:       Pacemaker remote daemon for non-cluster nodes
+Group:         System Environment/Daemons
+Requires:      %{name}-libs = %{version}-%{release}
 Requires:      %{name}-cli = %{version}-%{release}
 Requires:      resource-agents
 %if %{defined systemd_requires}
@@ -243,15 +271,15 @@ which is capable of extending pacemaker functionality to remote
 nodes not running the full corosync/cluster stack.
 
 %package -n %{name}-libs-devel
-License:      GPLv2+ and LGPLv2+
-Summary:      Pacemaker development package
-Group:        Development/Libraries
-Requires:     %{name}-cts = %{version}-%{release}
-Requires:     %{name}-libs = %{version}-%{release}
-Requires:     %{name}-cluster-libs = %{version}-%{release}
-Requires:     libtool-ltdl-devel libqb-devel libuuid-devel
-Requires:     libxml2-devel libxslt-devel bzip2-devel glib2-devel
-Requires:     corosynclib-devel
+License:       GPLv2+ and LGPLv2+
+Summary:       Pacemaker development package
+Group:         Development/Libraries
+Requires:      %{name}-cts = %{version}-%{release}
+Requires:      %{name}-libs = %{version}-%{release}
+Requires:      %{name}-cluster-libs = %{version}-%{release}
+Requires:      libtool-ltdl-devel libqb-devel libuuid-devel
+Requires:      libxml2-devel libxslt-devel bzip2-devel glib2-devel
+Requires:      corosynclib-devel
 
 %description -n %{name}-libs-devel
 Pacemaker is an advanced, scalable High-Availability cluster resource
@@ -260,25 +288,35 @@ manager for Corosync, CMAN and/or Linux-HA.
 The %{name}-libs-devel package contains headers and shared libraries
 for developing tools for Pacemaker.
 
-%package      cts
-License:      GPLv2+ and LGPLv2+
-Summary:      Test framework for cluster-related technologies like Pacemaker
-Group:        System Environment/Daemons
-Requires:     python
-Requires:     %{name}-libs = %{version}-%{release}
+%package       cts
+License:       GPLv2+ and LGPLv2+
+Summary:       Test framework for cluster-related technologies like Pacemaker
+Group:         System Environment/Daemons
+Requires:      python
+Requires:      %{name}-libs = %{version}-%{release}
+
+# systemd python bindings are separate package in some distros
 %if %{defined systemd_requires}
+
+%if 0%{?fedora} > 20
 Requires:      systemd-python
 %endif
 
-%description  cts
+%if 0%{?rhel} > 6
+Requires:      systemd-python
+%endif
+
+%endif
+
+%description   cts
 Test framework for cluster-related technologies like Pacemaker
 
-%package      doc
-License:      GPLv2+ and LGPLv2+
-Summary:      Documentation for Pacemaker
-Group:        Documentation
+%package       doc
+License:       GPLv2+ and LGPLv2+
+Summary:       Documentation for Pacemaker
+Group:         Documentation
 
-%description  doc
+%description   doc
 Documentation for Pacemaker.
 
 Pacemaker is an advanced, scalable High-Availability cluster resource
@@ -286,40 +324,39 @@ manager for Corosync, CMAN and/or Linux-HA.
 
 
 %prep
-# autosetup is particularly useful when backporting patches
-#autosetup -n %{name}-%{commit} -p1 -S git
-
 %setup -q -n %{name}-%{commit}
 cp extra/rgmanager/README README_RGManager_porting
 
 %patch1 -p1
 %patch2 -p1
-%patch3 -p0
-%patch4 -p0
+%patch3 -p1
+%patch4 -p1
 %patch5 -p1
+%patch6 -p1
+%patch7 -p1
+%patch8 -p1
+%patch9 -p1
+%patch10 -p1
+%patch11 -p1
+%patch12 -p1
+%patch13 -p1
+%patch14 -p1
+%patch15 -p1
+%patch16 -p1
+%patch17 -p1
+%patch18 -p1
+%patch19 -p1
+%patch20 -p1
+%patch21 -p1
+%patch22 -p1
+%patch23 -p1
+%patch24 -p1
 
 %patch100 -p1
 %patch101 -p1
-%patch102 -p1
+%patch102 -p0
 %patch103 -p1
 %patch104 -p1
-%patch105 -p1
-%patch106 -p1
-%patch107 -p1
-%patch108 -p1
-%patch109 -p1
-%patch110 -p1
-%patch111 -p1
-%patch112 -p1
-%patch113 -p1
-%patch114 -p1
-%patch115 -p1
-%patch116 -p1
-%patch117 -p1
-%patch118 -p1
-%patch119 -p1
-%patch120 -p1
-%patch121 -p1
 
 # Force the local time
 #
@@ -330,17 +367,34 @@ cp extra/rgmanager/README README_RGManager_porting
 find . -exec touch \{\} \;
 
 %build
+
+# Early versions of autotools (e.g. RHEL <= 5) do not support --docdir
+export docdir=%{pcmk_docdir}
+
+%if %{with hardening}
+# prefer distro-provided hardening flags in case they are defined
+# through _hardening_{c,ld}flags macros, configure script will
+# use its own defaults otherwise; if such hardenings are completely
+# undesired, rpmbuild using "--without hardening"
+# (or "--define '_without_hardening 1'")
+export CFLAGS_HARDENED_EXE="%{?_hardening_cflags}"
+export CFLAGS_HARDENED_LIB="%{?_hardening_cflags}"
+export LDFLAGS_HARDENED_EXE="%{?_hardening_ldflags}"
+export LDFLAGS_HARDENED_LIB="%{?_hardening_ldflags}"
+%endif
+
 ./autogen.sh
 
-# RHEL <= 5 does not support --docdir
-docdir=%{pcmk_docdir} %{configure}                 \
+%{configure}                                       \
         %{?with_profiling:   --with-profiling}     \
         %{?with_coverage:    --with-coverage}      \
         %{!?with_cman:       --without-cman}       \
-        --disable-systemd --disable-upstart        \
         --without-heartbeat                        \
+        %{!?with_doc:        --with-brand=}        \
+        %{!?with_hardening:  --disable-hardening}  \
         --with-initdir=%{_initrddir}               \
         --localstatedir=%{_var}                    \
+        --disable-systemd --disable-upstart        \
         --with-version=%{version}-%{release}
 
 %if 0%{?suse_version} >= 1200
@@ -349,14 +403,13 @@ sed -i 's|^hardcode_libdir_flag_spec=.*|hardcode_libdir_flag_spec=""|g' libtool
 sed -i 's|^runpath_var=LD_RUN_PATH|runpath_var=DIE_RPATH_DIE|g' libtool
 %endif
 
-make %{_smp_mflags} V=1 docdir=%{pcmk_docdir} all
+make %{_smp_mflags} V=1 all
 
 %install
 rm -rf %{buildroot}
 make DESTDIR=%{buildroot} docdir=%{pcmk_docdir} V=1 install
 
 mkdir -p ${RPM_BUILD_ROOT}%{_sysconfdir}/sysconfig
-mkdir -p ${RPM_BUILD_ROOT}%{_var}/lib/pacemaker/cores
 install -m 644 mcp/pacemaker.sysconfig ${RPM_BUILD_ROOT}%{_sysconfdir}/sysconfig/pacemaker
 install -m 644 tools/crm_mon.sysconfig ${RPM_BUILD_ROOT}%{_sysconfdir}/sysconfig/crm_mon
 
@@ -372,9 +425,6 @@ chmod a+x %{buildroot}/%{_datadir}/pacemaker/tests/cts/CTSlab.py
 
 # These are not actually scripts
 find %{buildroot} -name '*.xml' -type f -print0 | xargs -0 chmod a-x
-find %{buildroot} -name '*.xsl' -type f -print0 | xargs -0 chmod a-x
-find %{buildroot} -name '*.rng' -type f -print0 | xargs -0 chmod a-x
-find %{buildroot} -name '*.dtd' -type f -print0 | xargs -0 chmod a-x
 
 # Don't package static libs
 find %{buildroot} -name '*.a' -type f -print0 | xargs -0 rm -f
@@ -382,12 +432,17 @@ find %{buildroot} -name '*.la' -type f -print0 | xargs -0 rm -f
 
 # Do not package these either
 rm -f %{buildroot}/%{_libdir}/service_crm.so
-find %{buildroot} -name 'o2cb*' -type f -print0 | xargs -0 rm -f
+find %{buildroot} -name '*o2cb*' -type f -print0 | xargs -0 rm -f
 
 # Don't ship init scripts for systemd based platforms
 %if %{defined _unitdir}
 rm -f %{buildroot}/%{_initrddir}/pacemaker
 rm -f %{buildroot}/%{_initrddir}/pacemaker_remote
+%endif
+
+# Don't ship fence_pcmk where it has no use
+%if %{without cman}
+rm -f %{buildroot}/%{_sbindir}/fence_pcmk
 %endif
 
 %if %{with coverage}
@@ -412,7 +467,7 @@ rm -rf %{buildroot}
 %systemd_preun pacemaker.service
 
 %postun
-%systemd_postun_with_restart pacemaker.service 
+%systemd_postun_with_restart pacemaker.service
 
 %post remote
 %systemd_post pacemaker_remote.service
@@ -421,15 +476,21 @@ rm -rf %{buildroot}
 %systemd_preun pacemaker_remote.service
 
 %postun remote
-%systemd_postun_with_restart pacemaker_remote.service 
+%systemd_postun_with_restart pacemaker_remote.service
 
 %else
 
 %post
 /sbin/chkconfig --add pacemaker || :
+%if %{with cman} && %{cman_native}
+# make fence_pcmk in cluster.conf valid instantly otherwise tools like ccs may
+# choke (until schema gets auto-regenerated on the next start of cluster),
+# per the protocol shared with other packages contributing to cluster.rng
+/usr/sbin/ccs_update_schema >/dev/null 2>&1 || :
+%endif
 
 %preun
-/sbin/service pacemaker stop  &>/dev/null || :
+/sbin/service pacemaker stop &>/dev/null || :
 if [ $1 -eq 0 ]; then
     # Package removal, not upgrade
     /sbin/chkconfig --del pacemaker || :
@@ -465,10 +526,7 @@ exit 0
 ###########################################################
 %defattr(-,root,root)
 
-%exclude %{_datadir}/pacemaker/tests
-
 %config(noreplace) %{_sysconfdir}/sysconfig/pacemaker
-%config(noreplace) %{_sysconfdir}/logrotate.d/pacemaker
 %{_sbindir}/pacemakerd
 
 %if %{defined _unitdir}
@@ -477,11 +535,6 @@ exit 0
 %{_initrddir}/pacemaker
 %endif
 
-%exclude %{_datadir}/pacemaker/report.common
-%exclude %{_datadir}/pacemaker/report.collector
-%{_datadir}/pacemaker
-%{_datadir}/snmp/mibs/PCMK-MIB.txt
-
 %exclude %{_libexecdir}/pacemaker/lrmd_test
 %exclude %{_sbindir}/pacemaker_remoted
 %{_libexecdir}/pacemaker/*
@@ -489,44 +542,43 @@ exit 0
 %{_sbindir}/crm_attribute
 %{_sbindir}/crm_master
 %{_sbindir}/crm_node
-%{_sbindir}/attrd_updater
 %{_sbindir}/fence_legacy
+%if %{with cman}
 %{_sbindir}/fence_pcmk
+%endif
 %{_sbindir}/stonith_admin
 
-%if %{with cman}
-%if 0
-%{_bindir}/ccs2cib
-%{_bindir}/ccs_flatten
-%{_bindir}/disable_rgmanager
-%else
 %doc README_RGManager_porting
+%doc %{_mandir}/man7/crmd.*
+%doc %{_mandir}/man7/pengine.*
+%doc %{_mandir}/man7/stonithd.*
+%if %{without cman} || !%{cman_native}
+%doc %{_mandir}/man7/ocf_pacemaker_controld.*
 %endif
-%endif
-
-%doc %{_mandir}/man7/*
-%doc %{_mandir}/man8/attrd_updater.*
+%doc %{_mandir}/man7/ocf_pacemaker_remote.*
 %doc %{_mandir}/man8/crm_attribute.*
 %doc %{_mandir}/man8/crm_node.*
 %doc %{_mandir}/man8/crm_master.*
+%if %{with cman}
 %doc %{_mandir}/man8/fence_pcmk.*
+%endif
 %doc %{_mandir}/man8/fence_legacy.*
 %doc %{_mandir}/man8/pacemakerd.*
 %doc %{_mandir}/man8/stonith_admin.*
 
-%doc COPYING
+%doc %{_datadir}/pacemaker/alerts
+
+%license COPYING
 %doc AUTHORS
 %doc ChangeLog
 
-%dir %attr (750, %{uname}, %{gname}) %{_var}/lib/pacemaker
 %dir %attr (750, %{uname}, %{gname}) %{_var}/lib/pacemaker/cib
-%dir %attr (750, %{uname}, %{gname}) %{_var}/lib/pacemaker/cores
 %dir %attr (750, %{uname}, %{gname}) %{_var}/lib/pacemaker/pengine
-%dir %attr (750, %{uname}, %{gname}) %{_var}/lib/pacemaker/blackbox
 %ghost %dir %attr (750, %{uname}, %{gname}) %{_var}/run/crm
-%dir /usr/lib/ocf
-%dir /usr/lib/ocf/resource.d
-/usr/lib/ocf/resource.d/pacemaker
+%if %{without cman} || !%{cman_native}
+/usr/lib/ocf/resource.d/pacemaker/controld
+%endif
+/usr/lib/ocf/resource.d/pacemaker/remote
 /usr/lib/ocf/resource.d/.isolation
 
 %if "%{?cs_version}" != "UNKNOWN"
@@ -542,12 +594,19 @@ exit 0
 
 %files cli
 %defattr(-,root,root)
+
+%config(noreplace) %{_sysconfdir}/logrotate.d/pacemaker
 %config(noreplace) %{_sysconfdir}/sysconfig/crm_mon
+
+%if %{defined _unitdir}
+%{_unitdir}/crm_mon.service
+%endif
 
 %if %{with upstart_job}
 %config(noreplace) %{_sysconfdir}/init/crm_mon.conf
 %endif
 
+%{_sbindir}/attrd_updater
 %{_sbindir}/cibadmin
 %{_sbindir}/crm_diff
 %{_sbindir}/crm_error
@@ -562,10 +621,25 @@ exit 0
 %{_sbindir}/crm_simulate
 %{_sbindir}/crm_report
 %{_sbindir}/crm_ticket
-%{_datadir}/pacemaker/report.common
-%{_datadir}/pacemaker/report.collector
+%exclude %{_datadir}/pacemaker/alerts
+%exclude %{_datadir}/pacemaker/tests
+%{_datadir}/pacemaker
+%{_datadir}/snmp/mibs/PCMK-MIB.txt
+
+%exclude /usr/lib/ocf/resource.d/pacemaker/controld
+%exclude /usr/lib/ocf/resource.d/pacemaker/remote
+
+%dir /usr/lib/ocf
+%dir /usr/lib/ocf/resource.d
+/usr/lib/ocf/resource.d/pacemaker
+
+%doc %{_mandir}/man7/*
+%exclude %{_mandir}/man7/crmd.*
+%exclude %{_mandir}/man7/pengine.*
+%exclude %{_mandir}/man7/stonithd.*
+%exclude %{_mandir}/man7/ocf_pacemaker_controld.*
+%exclude %{_mandir}/man7/ocf_pacemaker_remote.*
 %doc %{_mandir}/man8/*
-%exclude %{_mandir}/man8/attrd_updater.*
 %exclude %{_mandir}/man8/crm_attribute.*
 %exclude %{_mandir}/man8/crm_node.*
 %exclude %{_mandir}/man8/crm_master.*
@@ -575,9 +649,13 @@ exit 0
 %exclude %{_mandir}/man8/pacemaker_remoted.*
 %exclude %{_mandir}/man8/stonith_admin.*
 
-%doc COPYING
+%license COPYING
 %doc AUTHORS
 %doc ChangeLog
+
+%dir %attr (750, %{uname}, %{gname}) %{_var}/lib/pacemaker
+%dir %attr (750, %{uname}, %{gname}) %{_var}/lib/pacemaker/blackbox
+%dir %attr (750, %{uname}, %{gname}) %{_var}/lib/pacemaker/cores
 
 %files -n %{name}-libs
 %defattr(-,root,root)
@@ -591,13 +669,13 @@ exit 0
 %{_libdir}/libpengine.so.*
 %{_libdir}/libstonithd.so.*
 %{_libdir}/libtransitioner.so.*
-%doc COPYING.LIB
+%license COPYING.LIB
 %doc AUTHORS
 
 %files -n %{name}-cluster-libs
 %defattr(-,root,root)
 %{_libdir}/libcrmcluster.so.*
-%doc COPYING.LIB
+%license COPYING.LIB
 %doc AUTHORS
 
 %files remote
@@ -612,7 +690,7 @@ exit 0
 
 %{_sbindir}/pacemaker_remoted
 %{_mandir}/man8/pacemaker_remoted.*
-%doc COPYING.LIB
+%license COPYING
 %doc AUTHORS
 
 %files doc
@@ -624,7 +702,7 @@ exit 0
 %{py_site}/cts
 %{_datadir}/pacemaker/tests/cts
 %{_libexecdir}/pacemaker/lrmd_test
-%doc COPYING.LIB
+%license COPYING
 %doc AUTHORS
 
 %files -n %{name}-libs-devel
@@ -637,19 +715,46 @@ exit 0
 %{_var}/lib/pacemaker/gcov
 %endif
 %{_libdir}/pkgconfig/*.pc
-%doc COPYING.LIB
+%license COPYING.LIB
 %doc AUTHORS
 
 %changelog
-* Mon Oct 24 2016 Ken Gaillot <kgaillot@redhat.com> - 1.1.14-8.2
-- Fix CVE-2016-7035
+* Wed Jan 25 2017 Ken Gaillot <kgaillot@redhat.com> - 1.1.15-5
+ - Avoid unnecessary CIB re-syncs
 
-  Resolves: rhbz#1374774
+  Resolves: rhbz#1410110
 
-* Fri Jul 15 2016 Ken Gaillot <kgaillot@redhat.com> - 1.1.14-8.1
- - add --skip-cman option when stopping pacemaker
+* Mon Dec 19 2016 Ken Gaillot <kgaillot@redhat.com> - 1.1.15-4
+ - crm_report should avoid grep on binary logs
+ - document that clufter is now supported
 
-  Resolves: rhbz#1355738
+  Resolves: rhbz#1405205
+
+* Mon Nov 7 2016 Ken Gaillot <kgaillot@redhat.com> - 1.1.15-3
+ - Show correct help and error messages in attrd_updater
+ - Preserve rolling upgrades involving Pacemaker Remote nodes
+ - Update status of clufter in README_RGManager_porting
+
+  Resolves: rhbz#1388558
+  Resolves: rhbz#1389028
+
+* Thu Oct 20 2016 Ken Gaillot <kgaillot@redhat.com> - 1.1.15-2
+ - Include upstream fixes to init scripts
+ - ClusterMon resource should verify pid is crm_mon's
+ - Fix CVE-2016-7035
+
+  Resolves: rhbz#1322595
+  Resolves: rhbz#1360234
+  Resolves: rhbz#1374775
+
+* Mon Sep 26 2016 Ken Gaillot <kgaillot@redhat.com> - 1.1.15-1
+ - Rebase to upstream e174ec84857e087210b9dacee3318f8203176129 (1.1.15)
+
+  Resolves: rhbz#1253325
+  Resolves: rhbz#1312040
+  Resolves: rhbz#1322595
+  Resolves: rhbz#1326350
+  Resolves: rhbz#1356727
 
 * Thu Mar 24 2016 Ken Gaillot <kgaillot@redhat.com> - 1.1.14-8
  - fenced unseen nodes should not be considered unclean

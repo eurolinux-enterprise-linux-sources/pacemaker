@@ -1,0 +1,25 @@
+From e2c7f8d987f090a3bb2ba3ec0e007a6dbf138ad2 Mon Sep 17 00:00:00 2001
+From: Andrew Beekhof <andrew@beekhof.net>
+Date: Mon, 11 Jan 2016 08:28:24 +1100
+Subject: [PATCH] Log: crmd: Graceful proxy shutdown is now tested
+
+---
+ crmd/lrm_state.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/crmd/lrm_state.c b/crmd/lrm_state.c
+index 7833ebb..62e1c76 100644
+--- a/crmd/lrm_state.c
++++ b/crmd/lrm_state.c
+@@ -485,7 +485,7 @@ remote_proxy_cb(lrmd_t *lrmd, void *userdata, xmlNode *msg)
+         char *now_s = NULL;
+         time_t now = time(NULL);
+ 
+-        crm_warn("Graceful proxy shutdown of %s not yet tested", lrm_state->node_name);
++        crm_notice("Graceful proxy shutdown of %s", lrm_state->node_name);
+ 
+         now_s = crm_itoa(now);
+         update_attrd(lrm_state->node_name, XML_CIB_ATTR_SHUTDOWN, now_s, NULL, FALSE);
+-- 
+1.8.3.1
+

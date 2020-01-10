@@ -1,0 +1,12 @@
+diff --git a/configure.ac b/configure.ac
+index baae454..155a85a 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1724,7 +1724,6 @@ AC_SUBST(PCMK_FEATURES)
+ 
+ dnl The Makefiles and shell scripts we output
+ AC_CONFIG_FILES(Makefile				        \
+-Doxyfile							\
+ coverage.sh							\
+ cts/Makefile					        	\
+ 	cts/CTSvars.py						\

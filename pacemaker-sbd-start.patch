@@ -1,0 +1,49 @@
+--- mcp/pacemaker.in.orig	2016-03-17 09:48:43.000000000 +0100
++++ mcp/pacemaker.in	2016-03-18 12:46:09.710035396 +0100
+@@ -73,6 +73,7 @@
+ 	[ -f @INITDIR@/functions ] && . @INITDIR@/functions
+ set -a
+ 	[ -f @sysconfdir@/sysconfig/pacemaker ] && . @sysconfdir@/sysconfig/pacemaker
++	[ -f @sysconfdir@/sysconfig/sbd ] && . @sysconfdir@/sysconfig/sbd
+ set +a
+ 	[ -z "$LOCK_FILE" ] && LOCK_FILE="@localstatedir@/lock/subsys/pacemaker"
+ fi
+@@ -81,6 +82,7 @@
+ if [ -d @sysconfdir@/default ]; then
+ set -a
+ 	[ -f @sysconfdir@/default/pacemaker ] && . @sysconfdir@/default/pacemaker
++	[ -f @sysconfdir@/default/sbd ] && . @sysconfdir@/default/sbd
+ set +a
+ 	[ -z "$LOCK_FILE" ] && LOCK_FILE="@localstatedir@/lock/pacemaker"
+ fi
+@@ -90,6 +92,13 @@
+     PCMK_STACK=cman
+ fi
+ 
++# Check if there is a valid watchdog-device configured in sbd config
++if [ x != "x$SBD_WATCHDOG_DEV" -a "/dev/null" != "$SBD_WATCHDOG_DEV" -a -c "$SBD_WATCHDOG_DEV" ]; then
++	if chkconfig --list sbd_helper 2>/dev/null | grep -q ":on"; then
++		SBD_SERVICE=sbd_helper
++	fi
++fi
++
+ start()
+ {
+ 	notify "Starting $desc"
+@@ -134,7 +143,7 @@
+     fi
+ 
+     # start cman's friends if they're not running but were configured to start automatically
+-    for cservice in cmirrord clvmd gfs2; do
++    for cservice in cmirrord clvmd gfs2 $SBD_SERVICE; do
+ 	chkconfig --list $cservice 2>/dev/null | grep -q ":on"
+ 	if [ $? -eq 0 ]; then
+ 	    service $cservice status >/dev/null 2>&1
+@@ -271,6 +280,7 @@
+ 	#
+ 	[ "$PCMK_STACK" = cman ] && cman_pre_stop
+ 	stop
++	[ "x$SBD_SERVICE" != x ] && service $SBD_SERVICE stop
+ 	[ "$PCMK_STACK" = cman ] && service cman stop
+ ;;
+ *)

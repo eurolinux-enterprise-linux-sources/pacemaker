@@ -1,0 +1,14 @@
+diff --git a/lib/ais/plugin.c b/lib/ais/plugin.c
+index fb1e89d..040a72e 100644
+--- a/lib/ais/plugin.c
++++ b/lib/ais/plugin.c
+@@ -314,6 +314,9 @@ process_ais_conf(void)
+     hdb_handle_t local_handle = 0;
+ 
+     ais_info("Reading configure");
++    ais_err("You have configured a cluster using the Pacemaker plugin for Corosync."
++            " The plugin is not supported in this environment and will be removed very soon.");
++    ais_err(" Please see Chapter 8 of 'Clusters from Scratch' (http://www.clusterlabs.org/doc) for details on using Pacemaker with CMAN");
+     top_handle = config_find_init(pcmk_api, "logging");
+     local_handle = config_find_next(pcmk_api, "logging", top_handle);
+ 

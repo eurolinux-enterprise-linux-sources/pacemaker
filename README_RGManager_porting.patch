@@ -1,0 +1,35 @@
+--- README	2016-01-07 15:42:38.930904224 +0100
++++ README_RGManager_porting	2016-01-07 15:42:21.264986065 +0100
+@@ -1,6 +1,6 @@
+ # Legacy: Linux-cluster cluster.conf to Pacemaker CIB translation utility
+ 
+-This directory used contain several parts related to the procedure of
++Pacemaker used to contain several tools related to the procedure of
+ cluster stacks/configuration migration, in particular and as the directory
+ name suggests: from (CMAN+RGManager)-based stack of HA components to
+ the (Corosync+Pacemaker)-based one.
+@@ -12,19 +12,14 @@
+ In case any dependencies on previously offered bits arose as time was
+ passing by, a mapping to the clufter-provided alternatives is provided:
+ 
+-* `ccs2cib.in` resulting in `ccs2cib` conversion launcher
++* `ccs2cib` conversion launcher
+   - use `clufter ccs2pcs` (perhaps with some switches) and wrap it with
+     some usage-specific script if suitable
+-* `ccs_flatten.c` and the rest of C-files resulting in `ccs_flatten` binary
++* `ccs_flatten` binary
+   - you can find the same modulo few modifications in `ccs-flatten`
+     subdirectory within the released tarballs or repo itself
+     and the resulting binary is a crucial part of clufter installation
+-* `cluconf2cib.xsl`
+-  - deprecated in favor of multiple, sequentially chained XSL stylesheets
+-    decomposed into tree-like structure (refer to `filters/cluster`
+-    subdirectory but beware, it is accompanied with transformations for
+-    various other purposes)
+-* `disable_rgmanager.c` resulting in `disable_rgmanager` utility
++* `disable_rgmanager` utility
+   - use `clufter ccs-disable-rg` (since `clufter-0.12.0`)
+-* `tests` subdirectory
+-  - configs have been put under `tests/cluster.conf/orig` in clufter repo
++
++Clufter is currently provided as tech preview in RHEL-6.8.

@@ -1,0 +1,111 @@
+From 68e7bb19d69a999443524ba79203979b35f54e83 Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Tue, 22 Dec 2015 11:41:56 -0600
+Subject: [PATCH 101/105] Refactor: lrmd: make proxied IPC providers/clients
+ opaque
+
+This removes an unused extern declaration in crmd.h,
+makes the ipc_providers and ipc_clients tables static to ipc_proxy.c,
+and adds an ipc_proxy_get_provider() function for future use.
+---
+ crmd/crmd.h         |  1 -
+ lrmd/ipc_proxy.c    | 48 ++++++++++++++++++++++++++++++------------------
+ lrmd/lrmd_private.h |  1 +
+ 3 files changed, 31 insertions(+), 19 deletions(-)
+
+diff --git a/crmd/crmd.h b/crmd/crmd.h
+index 031f414..6039c85 100644
+--- a/crmd/crmd.h
++++ b/crmd/crmd.h
+@@ -24,7 +24,6 @@
+ #  define DAEMON_DEBUG DEVEL_DIR"/"SYS_NAME".debug"
+ 
+ extern GMainLoop *crmd_mainloop;
+-extern GHashTable *ipc_clients;
+ extern bool no_quorum_suicide_escalation;
+ 
+ extern void crmd_metadata(void);
+diff --git a/lrmd/ipc_proxy.c b/lrmd/ipc_proxy.c
+index 84fb3ec..d95a396 100644
+--- a/lrmd/ipc_proxy.c
++++ b/lrmd/ipc_proxy.c
+@@ -42,34 +42,46 @@ static qb_ipcs_service_t *crmd_ipcs = NULL;
+ static qb_ipcs_service_t *stonith_ipcs = NULL;
+ 
+ /* ipc providers == crmd clients connecting from cluster nodes */
+-GHashTable *ipc_providers;
++static GHashTable *ipc_providers = NULL;
+ /* ipc clients == things like cibadmin, crm_resource, connecting locally */
+-GHashTable *ipc_clients;
++static GHashTable *ipc_clients = NULL;
++
++/*!
++ * \internal
++ * \brief Get an IPC proxy provider
++ *
++ * \return Pointer to a provider if one exists, NULL otherwise
++ *
++ * \note Grab the first provider available; any provider will work, and usually
++ *       there will be only one. These are client connections originating from a
++ *       cluster node's crmd.
++ */
++crm_client_t *
++ipc_proxy_get_provider()
++{
++    if (ipc_providers) {
++        GHashTableIter iter;
++        gpointer key = NULL;
++        gpointer value = NULL;
++
++        g_hash_table_iter_init(&iter, ipc_providers);
++        if (g_hash_table_iter_next(&iter, &key, &value)) {
++            return (crm_client_t*)value;
++        }
++    }
++    return NULL;
++}
+ 
+ static int32_t
+ ipc_proxy_accept(qb_ipcs_connection_t * c, uid_t uid, gid_t gid, const char *ipc_channel)
+ {
+-    void *key = NULL;
+-    void *value = NULL;
+     crm_client_t *client;
+-    crm_client_t *ipc_proxy = NULL;
+-    GHashTableIter iter;
++    crm_client_t *ipc_proxy = ipc_proxy_get_provider();
+     xmlNode *msg;
+ 
+     crm_trace("Connection %p on channel %s", c, ipc_channel);
+ 
+-    if (g_hash_table_size(ipc_providers) == 0) {
+-        crm_err("No ipc providers available for uid %d gid %d", uid, gid);
+-        return -EREMOTEIO;
+-    }
+-
+-    g_hash_table_iter_init(&iter, ipc_providers);
+-    if (g_hash_table_iter_next(&iter, (gpointer *) & key, (gpointer *) & value)) {
+-        /* grab the first provider available, any provider in this
+-         * table will work. Usually there will only be one. These are
+-         * lrmd client connections originating for a cluster node's crmd. */
+-        ipc_proxy = value;
+-    } else {
++    if (ipc_proxy == NULL) {
+         crm_err("No ipc providers available for uid %d gid %d", uid, gid);
+         return -EREMOTEIO;
+     }
+diff --git a/lrmd/lrmd_private.h b/lrmd/lrmd_private.h
+index ddb1506..52f79b8 100644
+--- a/lrmd/lrmd_private.h
++++ b/lrmd/lrmd_private.h
+@@ -103,6 +103,7 @@ void ipc_proxy_cleanup(void);
+ void ipc_proxy_add_provider(crm_client_t *client);
+ void ipc_proxy_remove_provider(crm_client_t *client);
+ void ipc_proxy_forward_client(crm_client_t *client, xmlNode *xml);
++crm_client_t *ipc_proxy_get_provider(void);
+ #endif
+ 
+ #endif
+-- 
+1.8.3.1
+

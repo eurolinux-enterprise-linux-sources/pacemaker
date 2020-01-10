@@ -1,0 +1,263 @@
+From c83dc10b975aa70a3da85dc2e63cec99a0b729b2 Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Wed, 23 Dec 2015 15:19:28 -0600
+Subject: [PATCH] Feature: pacemaker_remote: support graceful stops
+
+When pacemaker_remote gets an interrupt signal, if there are any connected
+proxy providers, it will send an lrmd IPC op for a shutdown request,
+and stop accepting new provider connections. If the provider acknowledges the
+request, pacemaker_remote will wait until all providers disconnect before
+exiting itself. This gives the cluster the opportunity to stop any resources
+running on the node that is shutting down.
+
+If the provider is an older version that does not support graceful stops,
+pacemaker_remote will time out waiting for the ack, then exit immediately.
+
+Since we are now waiting for resources to exit, the systemd stop timeout
+for pacemaker_remote has been raised to match pacemaker's.
+---
+ lrmd/ipc_proxy.c                 |  12 +++-
+ lrmd/lrmd_private.h              |   4 +-
+ lrmd/main.c                      | 121 +++++++++++++++++++++++++++++++++++++--
+ lrmd/pacemaker_remote.service.in |   4 +-
+ lrmd/tls_backend.c               |   3 +-
+ 5 files changed, 135 insertions(+), 9 deletions(-)
+
+diff --git a/lrmd/ipc_proxy.c b/lrmd/ipc_proxy.c
+index 9633a67..07c13ab 100644
+--- a/lrmd/ipc_proxy.c
++++ b/lrmd/ipc_proxy.c
+@@ -152,9 +152,19 @@ ipc_proxy_forward_client(crm_client_t *ipc_proxy, xmlNode *xml)
+     const char *session = crm_element_value(xml, F_LRMD_IPC_SESSION);
+     const char *msg_type = crm_element_value(xml, F_LRMD_IPC_OP);
+     xmlNode *msg = get_message_xml(xml, F_LRMD_IPC_MSG);
+-    crm_client_t *ipc_client = crm_client_get_by_id(session);
++    crm_client_t *ipc_client;
+     int rc = 0;
+ 
++    /* If the IPC provider is acknowledging our shutdown request,
++     * defuse the short exit timer to give the cluster time to
++     * stop any resources we're running.
++     */
++    if (safe_str_eq(msg_type, LRMD_IPC_OP_SHUTDOWN_ACK)) {
++        handle_shutdown_ack();
++        return;
++    }
++
++    ipc_client = crm_client_get_by_id(session);
+     if (ipc_client == NULL) {
+         xmlNode *msg = create_xml_node(NULL, T_LRMD_IPC_PROXY);
+         crm_xml_add(msg, F_LRMD_IPC_OP, LRMD_IPC_OP_DESTROY);
+diff --git a/lrmd/lrmd_private.h b/lrmd/lrmd_private.h
+index 78f14c9..29146f5 100644
+--- a/lrmd/lrmd_private.h
++++ b/lrmd/lrmd_private.h
+@@ -80,7 +80,9 @@ void process_lrmd_message(crm_client_t * client, uint32_t id, xmlNode * request)
+ 
+ void free_rsc(gpointer data);
+ 
+-void lrmd_shutdown(int nsig);
++void handle_shutdown_ack(void);
++
++void lrmd_client_destroy(crm_client_t *client);
+ 
+ void client_disconnect_cleanup(const char *client_id);
+ 
+diff --git a/lrmd/main.c b/lrmd/main.c
+index 73519e2..98a1412 100644
+--- a/lrmd/main.c
++++ b/lrmd/main.c
+@@ -40,6 +40,16 @@ static qb_ipcs_service_t *ipcs = NULL;
+ stonith_t *stonith_api = NULL;
+ int lrmd_call_id = 0;
+ 
++#ifdef ENABLE_PCMK_REMOTE
++/* whether shutdown request has been sent */
++static volatile sig_atomic_t shutting_down = FALSE;
++
++/* timer for waiting for acknowledgment of shutdown request */
++static volatile guint shutdown_ack_timer = 0;
++
++static gboolean lrmd_exit(gpointer data);
++#endif
++
+ static void
+ stonith_connection_destroy_cb(stonith_t * st, stonith_event_t * e)
+ {
+@@ -151,6 +161,27 @@ lrmd_ipc_dispatch(qb_ipcs_connection_t * c, void *data, size_t size)
+     return 0;
+ }
+ 
++/*!
++ * \internal
++ * \brief Free a client connection, and exit if appropriate
++ *
++ * \param[in] client  Client connection to free
++ */
++void
++lrmd_client_destroy(crm_client_t *client)
++{
++    crm_client_destroy(client);
++
++#ifdef ENABLE_PCMK_REMOTE
++    /* If we were waiting to shut down, we can now safely do so
++     * if there are no more proxied IPC providers
++     */
++    if (shutting_down && (ipc_proxy_get_provider() == NULL)) {
++        lrmd_exit(NULL);
++    }
++#endif
++}
++
+ static int32_t
+ lrmd_ipc_closed(qb_ipcs_connection_t * c)
+ {
+@@ -165,7 +196,7 @@ lrmd_ipc_closed(qb_ipcs_connection_t * c)
+ #ifdef ENABLE_PCMK_REMOTE
+     ipc_proxy_remove_provider(client);
+ #endif
+-    crm_client_destroy(client);
++    lrmd_client_destroy(client);
+     return 0;
+ }
+ 
+@@ -227,8 +258,17 @@ lrmd_server_send_notify(crm_client_t * client, xmlNode * msg)
+     return -1;
+ }
+ 
+-void
+-lrmd_shutdown(int nsig)
++/*!
++ * \internal
++ * \brief Clean up and exit immediately
++ *
++ * \param[in] data  Ignored
++ *
++ * \return Doesn't return
++ * \note   This can be used as a timer callback.
++ */
++static gboolean
++lrmd_exit(gpointer data)
+ {
+     crm_info("Terminating with  %d clients", crm_hash_table_size(client_connections));
+ 
+@@ -249,6 +289,79 @@ lrmd_shutdown(int nsig)
+     crm_client_cleanup();
+     g_hash_table_destroy(rsc_list);
+     crm_exit(pcmk_ok);
++    return FALSE;
++}
++
++/*!
++ * \internal
++ * \brief Request cluster shutdown if appropriate, otherwise exit immediately
++ *
++ * \param[in] nsig  Signal that caused invocation (ignored)
++ */
++static void
++lrmd_shutdown(int nsig)
++{
++#ifdef ENABLE_PCMK_REMOTE
++    crm_client_t *ipc_proxy = ipc_proxy_get_provider();
++
++    /* If there are active proxied IPC providers, then we may be running
++     * resources, so notify the cluster that we wish to shut down.
++     */
++    if (ipc_proxy) {
++        if (shutting_down) {
++            crm_trace("Shutdown already in progress");
++            return;
++        }
++
++        crm_info("Sending shutdown request to cluster");
++        if (ipc_proxy_shutdown_req(ipc_proxy) < 0) {
++            crm_crit("Shutdown request failed, exiting immediately");
++
++        } else {
++            /* We requested a shutdown. Now, we need to wait for an
++             * acknowledgement from the proxy host (which ensures the proxy host
++             * supports shutdown requests), then wait for all proxy hosts to
++             * disconnect (which ensures that all resources have been stopped).
++             */
++            shutting_down = TRUE;
++
++            /* Stop accepting new proxy connections */
++            lrmd_tls_server_destroy();
++
++            /* Older crmd versions will never acknowledge our request, so set a
++             * fairly short timeout to exit quickly in that case. If we get the
++             * ack, we'll defuse this timer.
++             */
++            shutdown_ack_timer = g_timeout_add_seconds(20, lrmd_exit, NULL);
++
++            /* Currently, we let the OS kill us if the clients don't disconnect
++             * in a reasonable time. We could instead set a long timer here
++             * (shorter than what the OS is likely to use) and exit immediately
++             * if it pops.
++             */
++            return;
++        }
++    }
++#endif
++    lrmd_exit(NULL);
++}
++
++/*!
++ * \internal
++ * \brief Defuse short exit timer if shutting down
++ */
++void handle_shutdown_ack()
++{
++#ifdef ENABLE_PCMK_REMOTE
++    if (shutting_down) {
++        crm_info("Received shutdown ack");
++        if (shutdown_ack_timer > 0) {
++            g_source_remove(shutdown_ack_timer);
++        }
++        return;
++    }
++#endif
++    crm_debug("Ignoring unexpected shutdown ack");
+ }
+ 
+ /* *INDENT-OFF* */
+@@ -363,6 +476,6 @@ main(int argc, char **argv)
+     g_main_run(mainloop);
+ 
+     /* should never get here */
+-    lrmd_shutdown(SIGTERM);
++    lrmd_exit(NULL);
+     return pcmk_ok;
+ }
+diff --git a/lrmd/pacemaker_remote.service.in b/lrmd/pacemaker_remote.service.in
+index 15e61fb..7252976 100644
+--- a/lrmd/pacemaker_remote.service.in
++++ b/lrmd/pacemaker_remote.service.in
+@@ -13,7 +13,9 @@ EnvironmentFile=-/etc/sysconfig/pacemaker
+ 
+ ExecStart=@sbindir@/pacemaker_remoted
+ 
+-TimeoutStopSec=30s
++# Pacemaker Remote can exit only after all managed services have shut down;
++# an HA database could conceivably take even longer than this 
++TimeoutStopSec=30min
+ TimeoutStartSec=30s
+ 
+ # Restart options include: no, on-success, on-failure, on-abort or always
+diff --git a/lrmd/tls_backend.c b/lrmd/tls_backend.c
+index df5387f..7b8ef9d 100644
+--- a/lrmd/tls_backend.c
++++ b/lrmd/tls_backend.c
+@@ -163,8 +163,7 @@ lrmd_remote_client_destroy(gpointer user_data)
+         close(csock);
+     }
+ 
+-    crm_client_destroy(client);
+-
++    lrmd_client_destroy(client);
+     return;
+ }
+ 
+-- 
+1.8.3.1
+

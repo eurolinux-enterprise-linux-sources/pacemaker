@@ -160,7 +160,7 @@
 Name:          pacemaker
 Summary:       Scalable High-Availability cluster resource manager
 Version:       %{pcmkversion}
-Release:       %{pcmk_release}%{?dist}.4
+Release:       %{pcmk_release}%{?dist}.5
 %if %{defined _unitdir}
 License:       GPLv2+ and LGPLv2+
 %else
@@ -193,6 +193,10 @@ Patch14:       014-cli-test.patch
 Patch15:       015-remote-ordering.patch
 Patch16:       016-regression-tests.patch.gz
 Patch17:       017-cleanup-pending-op.patch
+Patch18:       018-security.patch
+Patch19:       019-security-log.patch
+Patch20:       020-security-active.patch
+Patch21:       021-security-return.patch
 
 # patches that aren't from upstream
 Patch100:      lrmd-protocol-version.patch
@@ -877,6 +881,14 @@ exit 0
 %attr(0644,root,root) %{_datadir}/pacemaker/nagios/plugins-metadata/*
 
 %changelog
+* Tue Apr 30 2019 Ken Gaillot <kgaillot@redhat.com> - 1.1.19-8.5
+- Improve clients' authentication of IPC servers (CVE-2018-16877)
+- Fix use-after-free with potential information disclosure (CVE-2019-3885)
+- Improve pacemakerd authentication of running subdaemons (CVE-2018-16878)
+- Resolves: rhbz#1694555
+- Resolves: rhbz#1700704
+- Resolves: rhbz#1700705
+
 * Mon Jan 14 2019 Ken Gaillot <kgaillot@redhat.com> - 1.1.19-8.4
 - Fix regression in resource clean-up/refresh when an operation is pending
 - Resolves: rhbz#1665816

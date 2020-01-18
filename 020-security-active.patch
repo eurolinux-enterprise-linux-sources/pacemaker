@@ -1,0 +1,26 @@
+From d0c12d98e01bc6228fc254456927d79a46554448 Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Thu, 25 Apr 2019 11:37:24 -0500
+Subject: [PATCH] Fix: libcrmcommon: avoid use-of-NULL when checking whether
+ process is active
+
+---
+ lib/common/utils.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/common/utils.c b/lib/common/utils.c
+index 2ac7901..87f8d8e 100644
+--- a/lib/common/utils.c
++++ b/lib/common/utils.c
+@@ -743,7 +743,7 @@ crm_pid_active(long pid, const char *daemon)
+     } else if (rc == 0 && (daemon == NULL || have_proc_pid == -1)) {
+         return 1;  /* kill as the only indicator, cannot double check */
+ 
+-    } else {
++    } else if (daemon != NULL) {
+         /* make sure PID hasn't been reused by another process
+            XXX: might still be just a zombie, which could confuse decisions */
+         bool checked_through_kill = (rc == 0);
+-- 
+1.8.3.1
+

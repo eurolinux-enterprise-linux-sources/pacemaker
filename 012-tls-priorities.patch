@@ -1,0 +1,189 @@
+From 7c3bc762a9cede20a0193f64ca1a36f507aeeeb3 Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Fri, 20 Apr 2018 13:23:10 -0500
+Subject: [PATCH 1/2] Build: libcrmcommon: configure option to specify GnuTLS
+ cipher priorities
+
+Default to current behavior, i.e. "NORMAL". Spec file overrides with "@SYSTEM"
+on distros that have it.
+
+Pacemaker does not use option value as-is; it adds "+ANON-DH" for CIB remote
+commands and "+DHE-PSK:+PSK" for Pacemaker Remote connections. In the longer
+term, we could consider moving to certificate-based connections in both cases,
+but that has backward compatibility issues as well as additional administrative
+burden.
+---
+ configure.ac        | 9 +++++++++
+ lib/common/remote.c | 4 ++--
+ pacemaker.spec.in   | 4 ++++
+ 3 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/configure.ac b/configure.ac
+index ce02777..a7084e2 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -290,6 +290,12 @@ AC_ARG_WITH(cibsecrets,
+     [ SUPPORT_CIBSECRETS=no ],
+ )
+ 
++AC_ARG_WITH(gnutls-priorities,
++    [  --with-gnutls-priorities  GnuTLS cipher priorities @<:@NORMAL@:>@ ],
++    [ PCMK_GNUTLS_PRIORITIES="$withval" ],
++    [ PCMK_GNUTLS_PRIORITIES="NORMAL" ],
++)
++
+ CSPREFIX=""
+ AC_ARG_WITH(ais-prefix,
+     [  --with-ais-prefix=DIR  Prefix used when Corosync was installed [$prefix]],
+@@ -453,6 +459,9 @@ if test x"${BUG_URL}" = x""; then
+ fi
+ AC_SUBST(BUG_URL)
+ 
++AC_DEFINE_UNQUOTED([PCMK_GNUTLS_PRIORITIES], ["$PCMK_GNUTLS_PRIORITIES"],
++		   [GnuTLS cipher priorities])
++
+ for j in prefix exec_prefix bindir sbindir libexecdir datadir sysconfdir \
+     sharedstatedir localstatedir libdir includedir oldincludedir infodir \
+     mandir INITDIR docdir CONFIGDIR
+diff --git a/lib/common/remote.c b/lib/common/remote.c
+index 12d25fa..1e4f8d8 100644
+--- a/lib/common/remote.c
++++ b/lib/common/remote.c
+@@ -244,9 +244,9 @@ pcmk__new_tls_session(int csock, unsigned int conn_type,
+ #  ifdef HAVE_GNUTLS_PRIORITY_SET_DIRECT
+     if (cred_type == GNUTLS_CRD_ANON) {
+         // http://www.manpagez.com/info/gnutls/gnutls-2.10.4/gnutls_81.php#Echo-Server-with-anonymous-authentication
+-        prio = "NORMAL:+ANON-DH";
++        prio = PCMK_GNUTLS_PRIORITIES ":+ANON-DH";
+     } else {
+-        prio = "NORMAL:+DHE-PSK:+PSK";
++        prio = PCMK_GNUTLS_PRIORITIES ":+DHE-PSK:+PSK";
+     }
+ #  endif
+ 
+diff --git a/pacemaker.spec.in b/pacemaker.spec.in
+index 3a26572..fd0e3c8 100644
+--- a/pacemaker.spec.in
++++ b/pacemaker.spec.in
+@@ -80,6 +80,9 @@
+   } || %{?__transaction_systemd_inhibit:1}%{!?__transaction_systemd_inhibit:0}%{nil \
+   } || %(test -f /usr/lib/os-release; test $? -ne 0; echo $?))
+ 
++%if 0%{?fedora} > 20 || 0%{?rhel} > 7
++%global gnutls_priorities @SYSTEM
++%endif
+ 
+ # Definitions for backward compatibility with older RPM versions
+ 
+@@ -403,6 +406,7 @@ export LDFLAGS_HARDENED_LIB="%{?_hardening_ldflags}"
+         --without-heartbeat                        \
+         %{!?with_doc:        --with-brand=}        \
+         %{!?with_hardening:  --disable-hardening}  \
++        %{?gnutls_priorities: --with-gnutls-priorities="%{gnutls_priorities}"} \
+         --with-initdir=%{_initrddir}               \
+         --localstatedir=%{_var}                    \
+         --with-version=%{version}-%{release}
+-- 
+1.8.3.1
+
+
+From 99a83b172544102ec32585514e5808585f2ce31c Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Mon, 8 Jul 2019 17:39:12 -0500
+Subject: [PATCH 2/2] Feature: remote: allow run-time configurable TLS
+ priorities
+
+This also restores compilability with GnuTLS <2.1.7 (not that anyone is still
+using that ...), unintentionally broken in 5bded36 (1.1.20).
+---
+ lib/common/remote.c     | 34 +++++++++++++++++++++++++++-------
+ mcp/pacemaker.sysconfig |  9 +++++++++
+ 2 files changed, 36 insertions(+), 7 deletions(-)
+
+diff --git a/lib/common/remote.c b/lib/common/remote.c
+index 1e4f8d8..ccd0342 100644
+--- a/lib/common/remote.c
++++ b/lib/common/remote.c
+@@ -237,17 +237,25 @@ pcmk__new_tls_session(int csock, unsigned int conn_type,
+ {
+     int rc = GNUTLS_E_SUCCESS;
+ #  ifdef HAVE_GNUTLS_PRIORITY_SET_DIRECT
+-    const char *prio = NULL;
++    const char *prio_base = NULL;
++    char *prio = NULL;
+ #  endif
+     gnutls_session_t *session = NULL;
+ 
+ #  ifdef HAVE_GNUTLS_PRIORITY_SET_DIRECT
+-    if (cred_type == GNUTLS_CRD_ANON) {
+-        // http://www.manpagez.com/info/gnutls/gnutls-2.10.4/gnutls_81.php#Echo-Server-with-anonymous-authentication
+-        prio = PCMK_GNUTLS_PRIORITIES ":+ANON-DH";
+-    } else {
+-        prio = PCMK_GNUTLS_PRIORITIES ":+DHE-PSK:+PSK";
++    /* Determine list of acceptable ciphers, etc. Pacemaker always adds the
++     * values required for its functionality.
++     *
++     * For an example of anonymous authentication, see:
++     * http://www.manpagez.com/info/gnutls/gnutls-2.10.4/gnutls_81.php#Echo-Server-with-anonymous-authentication
++     */
++
++    prio_base = getenv("PCMK_tls_priorities");
++    if (prio_base == NULL) {
++        prio_base = PCMK_GNUTLS_PRIORITIES;
+     }
++    prio = crm_strdup_printf("%s:%s", prio_base,
++                             (cred_type == GNUTLS_CRD_ANON)? "+ANON-DH" : "+DHE-PSK:+PSK");
+ #  endif
+ 
+     session = gnutls_malloc(sizeof(gnutls_session_t));
+@@ -285,6 +293,9 @@ pcmk__new_tls_session(int csock, unsigned int conn_type,
+     if (rc != GNUTLS_E_SUCCESS) {
+         goto error;
+     }
++#  ifdef HAVE_GNUTLS_PRIORITY_SET_DIRECT
++    free(prio);
++#  endif
+     return session;
+ 
+ error:
+@@ -292,7 +303,16 @@ error:
+             CRM_XS " rc=%d priority='%s'",
+             (cred_type == GNUTLS_CRD_ANON)? "anonymous" : "PSK",
+             (conn_type == GNUTLS_SERVER)? "server" : "client",
+-            gnutls_strerror(rc), rc, prio);
++            gnutls_strerror(rc), rc,
++#  ifdef HAVE_GNUTLS_PRIORITY_SET_DIRECT
++            prio
++#  else
++            "default"
++#  endif
++            );
++#  ifdef HAVE_GNUTLS_PRIORITY_SET_DIRECT
++    free(prio);
++#  endif
+     if (session != NULL) {
+         gnutls_free(session);
+     }
+diff --git a/mcp/pacemaker.sysconfig b/mcp/pacemaker.sysconfig
+index a983011..0da401e 100644
+--- a/mcp/pacemaker.sysconfig
++++ b/mcp/pacemaker.sysconfig
+@@ -101,6 +101,15 @@
+ # value must be the same on all nodes. The default is "3121".
+ # PCMK_remote_port=3121
+ 
++# Use these GnuTLS cipher priorities for TLS connections. See:
++#
++#   https://gnutls.org/manual/html_node/Priority-Strings.html
++#
++# Pacemaker will append ":+ANON-DH" for remote CIB access (when enabled) and
++# ":+DHE-PSK:+PSK" for Pacemaker Remote connections, as they are required for
++# the respective functionality.
++# PCMK_tls_priorities="NORMAL"
++
+ # Set bounds on the bit length of the prime number generated for Diffie-Hellman
+ # parameters needed by TLS connections. The default is not to set any bounds.
+ #
+-- 
+1.8.3.1
+

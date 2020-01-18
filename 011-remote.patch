@@ -1,0 +1,786 @@
+From a81ca9625e8d1ccd7f79fbe464b9f4221e8671f2 Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Thu, 9 May 2019 20:26:08 -0500
+Subject: [PATCH 1/6] Refactor: libpe_status: functionize unfencing digest code
+ more
+
+... for readability, reusability, and avoiding unnecessary function calls or
+memory allocation.
+---
+ lib/pengine/utils.c | 159 ++++++++++++++++++++++++++++++++++++++--------------
+ 1 file changed, 118 insertions(+), 41 deletions(-)
+
+diff --git a/lib/pengine/utils.c b/lib/pengine/utils.c
+index d09b0d8..b6a31d1 100644
+--- a/lib/pengine/utils.c
++++ b/lib/pengine/utils.c
+@@ -2091,57 +2091,134 @@ rsc_action_digest_cmp(resource_t * rsc, xmlNode * xml_op, node_t * node,
+     return data;
+ }
+ 
++/*!
++ * \internal
++ * \brief Create an unfencing summary for use in special node attribute
++ *
++ * Create a string combining a fence device's resource ID, agent type, and
++ * parameter digest (whether for all parameters or just non-private parameters).
++ * This can be stored in a special node attribute, allowing us to detect changes
++ * in either the agent type or parameters, to know whether unfencing must be
++ * redone or can be safely skipped when the device's history is cleaned.
++ *
++ * \param[in] rsc_id        Fence device resource ID
++ * \param[in] agent_type    Fence device agent
++ * \param[in] param_digest  Fence device parameter digest
++ *
++ * \return Newly allocated string with unfencing digest
++ * \note The caller is responsible for freeing the result.
++ */
++static inline char *
++create_unfencing_summary(const char *rsc_id, const char *agent_type,
++                         const char *param_digest)
++{
++    return crm_strdup_printf("%s:%s:%s", rsc_id, agent_type, param_digest);
++}
++
++/*!
++ * \internal
++ * \brief Check whether a node can skip unfencing
++ *
++ * Check whether a fence device's current definition matches a node's
++ * stored summary of when it was last unfenced by the device.
++ *
++ * \param[in] rsc_id        Fence device's resource ID
++ * \param[in] agent         Fence device's agent type
++ * \param[in] digest_calc   Fence device's current parameter digest
++ * \param[in] node_summary  Value of node's special unfencing node attribute
++ *                          (a comma-separated list of unfencing summaries for
++ *                          all devices that have unfenced this node)
++ *
++ * \return TRUE if digest matches, FALSE otherwise
++ */
++static bool
++unfencing_digest_matches(const char *rsc_id, const char *agent,
++                         const char *digest_calc, const char *node_summary)
++{
++    bool matches = FALSE;
++
++    if (rsc_id && agent && digest_calc && node_summary) {
++        char *search_secure = create_unfencing_summary(rsc_id, agent,
++                                                       digest_calc);
++
++        /* The digest was calculated including the device ID and agent,
++         * so there is no risk of collision using strstr().
++         */
++        matches = (strstr(node_summary, search_secure) != NULL);
++        crm_trace("Calculated unfencing digest '%s' %sfound in '%s'",
++                  search_secure, matches? "" : "not ", node_summary);
++        free(search_secure);
++    }
++    return matches;
++}
++
++/* Magic string to use as action name for digest cache entries used for
++ * unfencing checks. This is not a real action name (i.e. "on"), so
++ * check_action_definition() won't confuse these entries with real actions.
++ */
+ #define STONITH_DIGEST_TASK "stonith-on"
+ 
++/*!
++ * \internal
++ * \brief Calculate fence device digests and digest comparison result
++ *
++ * \param[in] rsc       Fence device resource
++ * \param[in] agent     Fence device's agent type
++ * \param[in] node      Node with digest cache to use
++ * \param[in] data_set  Cluster working set
++ *
++ * \return Node's digest cache entry
++ */
+ static op_digest_cache_t *
+-fencing_action_digest_cmp(resource_t * rsc, node_t * node, pe_working_set_t * data_set)
++fencing_action_digest_cmp(pe_resource_t *rsc, const char *agent,
++                          pe_node_t *node, pe_working_set_t *data_set)
+ {
+-    char *key = generate_op_key(rsc->id, STONITH_DIGEST_TASK, 0);
+-    op_digest_cache_t *data = rsc_action_digest(rsc, STONITH_DIGEST_TASK, key, node, NULL, data_set);
++    const char *node_summary = NULL;
+ 
+-    const char *digest_all = pe_node_attribute_raw(node, CRM_ATTR_DIGESTS_ALL);
+-    const char *digest_secure = pe_node_attribute_raw(node, CRM_ATTR_DIGESTS_SECURE);
++    // Calculate device's current parameter digests
++    char *key = generate_op_key(rsc->id, STONITH_DIGEST_TASK, 0);
++    op_digest_cache_t *data = rsc_action_digest(rsc, STONITH_DIGEST_TASK, key,
++                                                node, NULL, data_set);
+ 
+-    /* No 'reloads' for fencing device changes
+-     *
+-     * We use the resource id + agent + digest so that we can detect
+-     * changes to the agent and/or the parameters used
+-     */
+-    char *search_all = crm_strdup_printf("%s:%s:%s", rsc->id, (const char*)g_hash_table_lookup(rsc->meta, XML_ATTR_TYPE), data->digest_all_calc);
+-    char *search_secure = crm_strdup_printf("%s:%s:%s", rsc->id, (const char*)g_hash_table_lookup(rsc->meta, XML_ATTR_TYPE), data->digest_secure_calc);
++    free(key);
+ 
+-    data->rc = RSC_DIGEST_ALL;
+-    if (digest_all == NULL) {
+-        /* it is unknown what the previous op digest was */
++    // Check whether node has special unfencing summary node attribute
++    node_summary = pe_node_attribute_raw(node, CRM_ATTR_DIGESTS_ALL);
++    if (node_summary == NULL) {
+         data->rc = RSC_DIGEST_UNKNOWN;
++        return data;
++    }
+ 
+-    } else if (strstr(digest_all, search_all)) {
++    // Check whether full parameter digest matches
++    if (unfencing_digest_matches(rsc->id, agent, data->digest_all_calc,
++                                 node_summary)) {
+         data->rc = RSC_DIGEST_MATCH;
++        return data;
++    }
+ 
+-    } else if(digest_secure && data->digest_secure_calc) {
+-        if(strstr(digest_secure, search_secure)) {
+-            if (is_set(data_set->flags, pe_flag_stdout)) {
+-                printf("Only 'private' parameters to %s for unfencing %s changed\n",
+-                       rsc->id, node->details->uname);
+-            }
+-            data->rc = RSC_DIGEST_MATCH;
++    // Check whether secure parameter digest matches
++    node_summary = pe_node_attribute_raw(node, CRM_ATTR_DIGESTS_SECURE);
++    if (unfencing_digest_matches(rsc->id, agent, data->digest_secure_calc,
++                                 node_summary)) {
++        data->rc = RSC_DIGEST_MATCH;
++        if (is_set(data_set->flags, pe_flag_stdout)) {
++            printf("Only 'private' parameters to %s for unfencing %s changed\n",
++                   rsc->id, node->details->uname);
+         }
++        return data;
+     }
+ 
+-    if (is_set(data_set->flags, pe_flag_sanitized)
+-        && is_set(data_set->flags, pe_flag_stdout)
+-        && (data->rc == RSC_DIGEST_ALL)
++    // Parameters don't match
++    data->rc = RSC_DIGEST_ALL;
++    if (is_set(data_set->flags, (pe_flag_sanitized|pe_flag_stdout))
+         && data->digest_secure_calc) {
+-        printf("Parameters to %s for unfencing %s changed, try '%s:%s:%s'\n",
+-               rsc->id, node->details->uname, rsc->id,
+-               (const char *) g_hash_table_lookup(rsc->meta, XML_ATTR_TYPE),
+-               data->digest_secure_calc);
+-    }
+-
+-    free(key);
+-    free(search_all);
+-    free(search_secure);
++        char *digest = create_unfencing_summary(rsc->id, agent,
++                                                data->digest_secure_calc);
+ 
++        printf("Parameters to %s for unfencing %s changed, try '%s'\n",
++               rsc->id, node->details->uname, digest);
++        free(digest);
++    }
+     return data;
+ }
+ 
+@@ -2228,9 +2305,6 @@ pe_fence_op(node_t * node, const char *op, bool optional, const char *reason, pe
+              *
+              * We may do this for all nodes in the future, but for now
+              * the check_action_definition() based stuff works fine.
+-             *
+-             * Use "stonith-on" to avoid creating cache entries for
+-             * operations check_action_definition() would look for.
+              */
+             long max = 1024;
+             long digests_all_offset = 0;
+@@ -2242,8 +2316,11 @@ pe_fence_op(node_t * node, const char *op, bool optional, const char *reason, pe
+ 
+             for (GListPtr gIter = matches; gIter != NULL; gIter = gIter->next) {
+                 resource_t *match = gIter->data;
+-                op_digest_cache_t *data = fencing_action_digest_cmp(match, node, data_set);
++                const char *agent = g_hash_table_lookup(match->meta,
++                                                        XML_ATTR_TYPE);
++                op_digest_cache_t *data = NULL;
+ 
++                data = fencing_action_digest_cmp(match, agent, node, data_set);
+                 if(data->rc == RSC_DIGEST_ALL) {
+                     optional = FALSE;
+                     crm_notice("Unfencing %s (remote): because the definition of %s changed", node->details->uname, match->id);
+@@ -2254,11 +2331,11 @@ pe_fence_op(node_t * node, const char *op, bool optional, const char *reason, pe
+ 
+                 digests_all_offset += snprintf(
+                     digests_all+digests_all_offset, max-digests_all_offset,
+-                    "%s:%s:%s,", match->id, (const char*)g_hash_table_lookup(match->meta, XML_ATTR_TYPE), data->digest_all_calc);
++                    "%s:%s:%s,", match->id, agent, data->digest_all_calc);
+ 
+                 digests_secure_offset += snprintf(
+                     digests_secure+digests_secure_offset, max-digests_secure_offset,
+-                    "%s:%s:%s,", match->id, (const char*)g_hash_table_lookup(match->meta, XML_ATTR_TYPE), data->digest_secure_calc);
++                    "%s:%s:%s,", match->id, agent, data->digest_secure_calc);
+             }
+             g_hash_table_insert(stonith_op->meta,
+                                 strdup(XML_OP_ATTR_DIGESTS_ALL),
+-- 
+1.8.3.1
+
+
+From be34a73f9cfb6abdb3e2799593cb0358c01c2521 Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Fri, 10 May 2019 11:57:31 -0500
+Subject: [PATCH 2/6] Fix: libpe_status: calculate secure digests for unfencing
+ ops
+
+The calculation of digests for detection of when unfencing is needed reused
+rsc_action_digest(). However that would only add secure digests when the
+pe_flag_sanitized flag was set, which is only set by crm_simulate, so secure
+digests would never be added in normal cluster operation. This led to
+node attributes like name="#digests-secure"
+value="stonith-fence_compute-fence-nova:fence_compute:(null),".
+
+Now, rsc_action_digest() takes a new argument to select whether secure digests
+are added, which is always set to TRUE when calculating unfencing digests.
+---
+ lib/pengine/utils.c | 27 ++++++++++++++++++++++-----
+ 1 file changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/lib/pengine/utils.c b/lib/pengine/utils.c
+index b6a31d1..f52f1c7 100644
+--- a/lib/pengine/utils.c
++++ b/lib/pengine/utils.c
+@@ -1948,9 +1948,24 @@ append_versioned_params(xmlNode *versioned_params, const char *ra_version, xmlNo
+ }
+ #endif
+ 
++/*!
++ * \internal
++ * \brief Calculate action digests and store in node's digest cache
++ *
++ * \param[in] rsc          Resource that action was for
++ * \param[in] task         Name of action performed
++ * \param[in] key          Action's task key
++ * \param[in] node         Node action was performed on
++ * \param[in] xml_op       XML of operation in CIB status (if available)
++ * \param[in] calc_secure  Whether to calculate secure digest
++ * \param[in] data_set     Cluster working set
++ *
++ * \return Pointer to node's digest cache entry
++ */
+ static op_digest_cache_t *
+-rsc_action_digest(resource_t * rsc, const char *task, const char *key,
+-                  node_t * node, xmlNode * xml_op, pe_working_set_t * data_set) 
++rsc_action_digest(pe_resource_t *rsc, const char *task, const char *key,
++                  pe_node_t *node, xmlNode *xml_op, bool calc_secure,
++                  pe_working_set_t *data_set)
+ {
+     op_digest_cache_t *data = NULL;
+ 
+@@ -2018,7 +2033,7 @@ rsc_action_digest(resource_t * rsc, const char *task, const char *key,
+ 
+         data->digest_all_calc = calculate_operation_digest(data->params_all, op_version);
+ 
+-        if (is_set(data_set->flags, pe_flag_sanitized)) {
++        if (calc_secure) {
+             data->params_secure = copy_xml(data->params_all);
+             if(secure_list) {
+                 filter_parameters(data->params_secure, secure_list, FALSE);
+@@ -2064,7 +2079,9 @@ rsc_action_digest_cmp(resource_t * rsc, xmlNode * xml_op, node_t * node,
+ 
+     interval = crm_parse_int(interval_s, "0");
+     key = generate_op_key(rsc->id, task, interval);
+-    data = rsc_action_digest(rsc, task, key, node, xml_op, data_set);
++    data = rsc_action_digest(rsc, task, key, node, xml_op,
++                             is_set(data_set->flags, pe_flag_sanitized),
++                             data_set);
+ 
+     data->rc = RSC_DIGEST_MATCH;
+     if (digest_restart && data->digest_restart_calc && strcmp(data->digest_restart_calc, digest_restart) != 0) {
+@@ -2178,7 +2195,7 @@ fencing_action_digest_cmp(pe_resource_t *rsc, const char *agent,
+     // Calculate device's current parameter digests
+     char *key = generate_op_key(rsc->id, STONITH_DIGEST_TASK, 0);
+     op_digest_cache_t *data = rsc_action_digest(rsc, STONITH_DIGEST_TASK, key,
+-                                                node, NULL, data_set);
++                                                node, NULL, TRUE, data_set);
+ 
+     free(key);
+ 
+-- 
+1.8.3.1
+
+
+From 8819c2f96f74ab4b4979df5ed04c16dd6bdad5f1 Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Sat, 8 Jun 2019 16:25:04 -0500
+Subject: [PATCH 3/6] Refactor: libpe_status: add function for checking
+ shutdown attribute
+
+... to reduce code duplication and allow further reuse
+---
+ include/crm/pengine/internal.h |  2 ++
+ lib/pengine/unpack.c           |  8 ++------
+ lib/pengine/utils.c            | 20 ++++++++++++++++++++
+ 3 files changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/include/crm/pengine/internal.h b/include/crm/pengine/internal.h
+index c40b075..c3f9f70 100644
+--- a/include/crm/pengine/internal.h
++++ b/include/crm/pengine/internal.h
+@@ -362,4 +362,6 @@ void pe__foreach_param_check(pe_working_set_t *data_set,
+                                         enum pe_check_parameters,
+                                         pe_working_set_t*));
+ void pe__free_param_checks(pe_working_set_t *data_set);
++
++bool pe__shutdown_requested(pe_node_t *node);
+ #endif
+diff --git a/lib/pengine/unpack.c b/lib/pengine/unpack.c
+index 619ccbf..cf725a1 100644
+--- a/lib/pengine/unpack.c
++++ b/lib/pengine/unpack.c
+@@ -1013,7 +1013,6 @@ unpack_handle_remote_attrs(node_t *this_node, xmlNode *state, pe_working_set_t *
+     const char *resource_discovery_enabled = NULL;
+     xmlNode *attrs = NULL;
+     resource_t *rsc = NULL;
+-    const char *shutdown = NULL;
+ 
+     if (crm_str_eq((const char *)state->name, XML_CIB_TAG_STATE, TRUE) == FALSE) {
+         return;
+@@ -1035,8 +1034,7 @@ unpack_handle_remote_attrs(node_t *this_node, xmlNode *state, pe_working_set_t *
+     attrs = find_xml_node(state, XML_TAG_TRANSIENT_NODEATTRS, FALSE);
+     add_node_attrs(attrs, this_node, TRUE, data_set);
+ 
+-    shutdown = pe_node_attribute_raw(this_node, XML_CIB_ATTR_SHUTDOWN);
+-    if (shutdown != NULL && safe_str_neq("0", shutdown)) {
++    if (pe__shutdown_requested(this_node)) {
+         crm_info("Node %s is shutting down", this_node->details->uname);
+         this_node->details->shutdown = TRUE;
+         if (rsc) {
+@@ -1512,7 +1510,6 @@ gboolean
+ determine_online_status(xmlNode * node_state, node_t * this_node, pe_working_set_t * data_set)
+ {
+     gboolean online = FALSE;
+-    const char *shutdown = NULL;
+     const char *exp_state = crm_element_value(node_state, XML_NODE_EXPECTED);
+ 
+     if (this_node == NULL) {
+@@ -1522,9 +1519,8 @@ determine_online_status(xmlNode * node_state, node_t * this_node, pe_working_set
+ 
+     this_node->details->shutdown = FALSE;
+     this_node->details->expected_up = FALSE;
+-    shutdown = pe_node_attribute_raw(this_node, XML_CIB_ATTR_SHUTDOWN);
+ 
+-    if (shutdown != NULL && safe_str_neq("0", shutdown)) {
++    if (pe__shutdown_requested(this_node)) {
+         this_node->details->shutdown = TRUE;
+ 
+     } else if (safe_str_eq(exp_state, CRMD_JOINSTATE_MEMBER)) {
+diff --git a/lib/pengine/utils.c b/lib/pengine/utils.c
+index f52f1c7..8eac2ce 100644
+--- a/lib/pengine/utils.c
++++ b/lib/pengine/utils.c
+@@ -2522,3 +2522,23 @@ void pe_action_set_reason(pe_action_t *action, const char *reason, bool overwrit
+         }
+     }
+ }
++
++/*!
++ * \internal
++ * \brief Check whether shutdown has been requested for a node
++ *
++ * \param[in] node  Node to check
++ *
++ * \return TRUE if node has shutdown attribute set and nonzero, FALSE otherwise
++ * \note This differs from simply using node->details->shutdown in that it can
++ *       be used before that has been determined (and in fact to determine it),
++ *       and it can also be used to distinguish requested shutdown from implicit
++ *       shutdown of remote nodes by virtue of their connection stopping.
++ */
++bool
++pe__shutdown_requested(pe_node_t *node)
++{
++    const char *shutdown = pe_node_attribute_raw(node, XML_CIB_ATTR_SHUTDOWN);
++
++    return shutdown && strcmp(shutdown, "0");
++}
+-- 
+1.8.3.1
+
+
+From 938e99f29ed5faaeb4015247e363ddc7e77208a3 Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Wed, 5 Jun 2019 16:37:26 -0500
+Subject: [PATCH 4/6] Fix: scheduler: remote state is failed if node is
+ shutting down with connection failure
+
+When determining remote state, if the connection resource is failed and not
+being started again, we consider the state to be unknown if the connection has
+a reconnect interval, because we won't know whether the connection can be
+recovered until the interval expires and we re-attempt connection.
+
+However, if the node is shutting down at the time, we won't re-attempt
+connection, so consider the state failed in that case. (Note that we check the
+actual shutdown node attribute, rather than node->details->shutdown, since that
+is set for remote nodes whenever the connection is stopping.)
+
+This avoids a situation where actions that cannot succeed can be scheduled on a
+remote node that's shutting down.
+---
+ pengine/allocate.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/pengine/allocate.c b/pengine/allocate.c
+index 578db2f..c9877a4 100644
+--- a/pengine/allocate.c
++++ b/pengine/allocate.c
+@@ -1998,7 +1998,8 @@ get_remote_node_state(pe_node_t *node)
+ 
+         if ((remote_rsc->next_role == RSC_ROLE_STOPPED)
+             && remote_rsc->remote_reconnect_interval
+-            && node->details->remote_was_fenced) {
++            && node->details->remote_was_fenced
++            && !pe__shutdown_requested(node)) {
+ 
+             /* We won't know whether the connection is recoverable until the
+              * reconnect interval expires and we reattempt connection.
+-- 
+1.8.3.1
+
+
+From c20f8920634f47bbdf699d80dafd50c6a72eac8b Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Wed, 5 Jun 2019 16:43:19 -0500
+Subject: [PATCH 5/6] Fix: libpe_status: don't order implied stops relative to
+ a remote connection
+
+Actions behind a remote connection are ordered relative to any start or stop of
+the remote connection. However, if the action is a stop implied due to fencing,
+it does not require the remote connection, and the ordering should not be done.
+
+This avoids a delay in the remote connection recovery if it is failed, e.g.
+previously the ordering would look like:
+
+   fence remote node -> implied stop of resource on remote -> stop connection
+
+Now, the connection stop can proceed simultaneously with the remote node
+fencing.
+---
+ pengine/allocate.c | 11 +++++------
+ 1 file changed, 5 insertions(+), 6 deletions(-)
+
+diff --git a/pengine/allocate.c b/pengine/allocate.c
+index c9877a4..c7c68f8 100644
+--- a/pengine/allocate.c
++++ b/pengine/allocate.c
+@@ -2091,14 +2091,13 @@ apply_remote_ordering(action_t *action, pe_working_set_t *data_set)
+                                        pe_order_implies_first, data_set);
+ 
+             } else if(state == remote_state_failed) {
+-                /* We would only be here if the resource is
+-                 * running on the remote node.  Since we have no
+-                 * way to stop it, it is necessary to fence the
+-                 * node.
++                /* The resource is active on the node, but since we don't have a
++                 * valid connection, the only way to stop the resource is by
++                 * fencing the node. There is no need to order the stop relative
++                 * to the remote connection, since the stop will become implied
++                 * by the fencing.
+                  */
+                 pe_fence_node(data_set, action->node, "resources are active and the connection is unrecoverable");
+-                order_action_then_stop(action, remote_rsc,
+-                                       pe_order_implies_first, data_set);
+ 
+             } else if(remote_rsc->next_role == RSC_ROLE_STOPPED) {
+                 /* State must be remote_state_unknown or remote_state_stopped.
+-- 
+1.8.3.1
+
+
+From 26a28ee80b7fc110125eedac377dfa4c0a8e8294 Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Fri, 14 Jun 2019 14:08:47 -0500
+Subject: [PATCH 6/6] Test: pengine: update regression tests for remote
+ connection ordering change
+
+---
+ pengine/test10/remote-connection-unrecoverable.dot     | 2 --
+ pengine/test10/remote-connection-unrecoverable.exp     | 6 ------
+ pengine/test10/remote-connection-unrecoverable.summary | 2 +-
+ pengine/test10/remote-fence-before-reconnect.dot       | 1 -
+ pengine/test10/remote-fence-before-reconnect.exp       | 6 +-----
+ pengine/test10/remote-fence-before-reconnect.summary   | 2 +-
+ pengine/test10/remote-recover-all.dot                  | 2 --
+ pengine/test10/remote-recover-all.exp                  | 6 ------
+ pengine/test10/remote-recover-all.summary              | 4 ++--
+ pengine/test10/remote-recover-no-resources.dot         | 1 -
+ pengine/test10/remote-recover-no-resources.exp         | 3 ---
+ pengine/test10/remote-recover-no-resources.summary     | 2 +-
+ pengine/test10/remote-recover-unknown.dot              | 1 -
+ pengine/test10/remote-recover-unknown.exp              | 3 ---
+ pengine/test10/remote-recover-unknown.summary          | 2 +-
+ 15 files changed, 7 insertions(+), 36 deletions(-)
+
+diff --git a/pengine/test10/remote-connection-unrecoverable.dot b/pengine/test10/remote-connection-unrecoverable.dot
+index 0360cd0..b5caca6 100644
+--- a/pengine/test10/remote-connection-unrecoverable.dot
++++ b/pengine/test10/remote-connection-unrecoverable.dot
+@@ -7,14 +7,12 @@ digraph "g" {
+ "remote1_stop_0 node1" [ style=bold color="green" fontcolor="orange"]
+ "rsc1_delete_0 remote1" -> "rsc1_start_0 node2" [ style = dashed]
+ "rsc1_delete_0 remote1" [ style=dashed color="red" fontcolor="black"]
+-"rsc1_monitor_0 node2" -> "remote1_stop_0 node1" [ style = bold]
+ "rsc1_monitor_0 node2" -> "rsc1_start_0 node2" [ style = bold]
+ "rsc1_monitor_0 node2" -> "rsc2-master_demote_0" [ style = bold]
+ "rsc1_monitor_0 node2" [ style=bold color="green" fontcolor="black"]
+ "rsc1_monitor_10000 node2" [ style=bold color="green" fontcolor="black"]
+ "rsc1_start_0 node2" -> "rsc1_monitor_10000 node2" [ style = bold]
+ "rsc1_start_0 node2" [ style=bold color="green" fontcolor="black"]
+-"rsc1_stop_0 remote1" -> "remote1_stop_0 node1" [ style = bold]
+ "rsc1_stop_0 remote1" -> "rsc1_delete_0 remote1" [ style = dashed]
+ "rsc1_stop_0 remote1" -> "rsc1_start_0 node2" [ style = bold]
+ "rsc1_stop_0 remote1" -> "rsc2-master_demote_0" [ style = bold]
+diff --git a/pengine/test10/remote-connection-unrecoverable.exp b/pengine/test10/remote-connection-unrecoverable.exp
+index 73fa7a1..339ad56 100644
+--- a/pengine/test10/remote-connection-unrecoverable.exp
++++ b/pengine/test10/remote-connection-unrecoverable.exp
+@@ -9,12 +9,6 @@
+       <trigger>
+         <crm_event id="1" operation="stonith" operation_key="stonith-node1-reboot" on_node="node1" on_node_uuid="1"/>
+       </trigger>
+-      <trigger>
+-        <pseudo_event id="6" operation="stop" operation_key="rsc1_stop_0"/>
+-      </trigger>
+-      <trigger>
+-        <rsc_op id="8" operation="monitor" operation_key="rsc1_monitor_0" on_node="node2" on_node_uuid="2"/>
+-      </trigger>
+     </inputs>
+   </synapse>
+   <synapse id="1">
+diff --git a/pengine/test10/remote-connection-unrecoverable.summary b/pengine/test10/remote-connection-unrecoverable.summary
+index efeb765..18f7dc7 100644
+--- a/pengine/test10/remote-connection-unrecoverable.summary
++++ b/pengine/test10/remote-connection-unrecoverable.summary
+@@ -24,12 +24,12 @@ Executing cluster transition:
+  * Resource action: killer          stop on node2
+  * Resource action: rsc1            monitor on node2
+  * Fencing node1 (reboot)
++ * Pseudo action:   remote1_stop_0
+  * Fencing remote1 (reboot)
+  * Resource action: killer          start on node2
+  * Resource action: killer          monitor=60000 on node2
+  * Pseudo action:   rsc1_stop_0
+  * Pseudo action:   rsc2-master_demote_0
+- * Pseudo action:   remote1_stop_0
+  * Resource action: rsc1            start on node2
+  * Pseudo action:   rsc2_demote_0
+  * Pseudo action:   rsc2-master_demoted_0
+diff --git a/pengine/test10/remote-fence-before-reconnect.dot b/pengine/test10/remote-fence-before-reconnect.dot
+index 4ced43e..5812b7f 100644
+--- a/pengine/test10/remote-fence-before-reconnect.dot
++++ b/pengine/test10/remote-fence-before-reconnect.dot
+@@ -3,7 +3,6 @@
+ "fake2_monitor_10000 c7auto1" [ style=bold color="green" fontcolor="black"]
+ "fake2_start_0 c7auto1" -> "fake2_monitor_10000 c7auto1" [ style = bold]
+ "fake2_start_0 c7auto1" [ style=bold color="green" fontcolor="black"]
+-"fake2_stop_0 c7auto4" -> "c7auto4_stop_0 c7auto1" [ style = bold]
+ "fake2_stop_0 c7auto4" -> "fake2_start_0 c7auto1" [ style = bold]
+ "fake2_stop_0 c7auto4" [ style=bold color="green" fontcolor="orange"]
+ "stonith 'reboot' c7auto4" -> "fake2_start_0 c7auto1" [ style = bold]
+diff --git a/pengine/test10/remote-fence-before-reconnect.exp b/pengine/test10/remote-fence-before-reconnect.exp
+index f99d9ef..f506f85 100644
+--- a/pengine/test10/remote-fence-before-reconnect.exp
++++ b/pengine/test10/remote-fence-before-reconnect.exp
+@@ -9,11 +9,7 @@
+         </downed>
+       </rsc_op>
+     </action_set>
+-    <inputs>
+-      <trigger>
+-        <pseudo_event id="13" operation="stop" operation_key="fake2_stop_0"/>
+-      </trigger>
+-    </inputs>
++    <inputs/>
+   </synapse>
+   <synapse id="1">
+     <action_set>
+diff --git a/pengine/test10/remote-fence-before-reconnect.summary b/pengine/test10/remote-fence-before-reconnect.summary
+index f61e18b..03eac20 100644
+--- a/pengine/test10/remote-fence-before-reconnect.summary
++++ b/pengine/test10/remote-fence-before-reconnect.summary
+@@ -17,9 +17,9 @@ Transition Summary:
+  * Move       fake2       ( c7auto4 -> c7auto1 )  
+ 
+ Executing cluster transition:
++ * Resource action: c7auto4         stop on c7auto1
+  * Fencing c7auto4 (reboot)
+  * Pseudo action:   fake2_stop_0
+- * Resource action: c7auto4         stop on c7auto1
+  * Resource action: fake2           start on c7auto1
+  * Resource action: fake2           monitor=10000 on c7auto1
+ 
+diff --git a/pengine/test10/remote-recover-all.dot b/pengine/test10/remote-recover-all.dot
+index 1f967c5..b48b04e 100644
+--- a/pengine/test10/remote-recover-all.dot
++++ b/pengine/test10/remote-recover-all.dot
+@@ -19,7 +19,6 @@ digraph "g" {
+ "galera_demote_0 galera-2" -> "galera_stop_0 galera-2" [ style = bold]
+ "galera_demote_0 galera-2" [ style=bold color="green" fontcolor="orange"]
+ "galera_monitor_10000 galera-0" [ style=bold color="green" fontcolor="black"]
+-"galera_stop_0 galera-2" -> "galera-2_stop_0 controller-1" [ style = bold]
+ "galera_stop_0 galera-2" -> "galera-master_stopped_0" [ style = bold]
+ "galera_stop_0 galera-2" [ style=bold color="green" fontcolor="orange"]
+ "haproxy-clone_stop_0" -> "haproxy-clone_stopped_0" [ style = bold]
+@@ -60,7 +59,6 @@ digraph "g" {
+ "rabbitmq_post_notify_stonith_0" -> "rabbitmq_post_notify_stonith_0 messaging-0" [ style = bold]
+ "rabbitmq_post_notify_stonith_0" -> "rabbitmq_post_notify_stonith_0 messaging-2" [ style = bold]
+ "rabbitmq_post_notify_stonith_0" [ style=bold color="green" fontcolor="orange"]
+-"rabbitmq_stop_0 messaging-1" -> "messaging-1_stop_0 controller-1" [ style = bold]
+ "rabbitmq_stop_0 messaging-1" -> "rabbitmq-clone_stopped_0" [ style = bold]
+ "rabbitmq_stop_0 messaging-1" [ style=bold color="green" fontcolor="orange"]
+ "redis-master_confirmed-post_notify_stopped_0" [ style=bold color="green" fontcolor="orange"]
+diff --git a/pengine/test10/remote-recover-all.exp b/pengine/test10/remote-recover-all.exp
+index 900781c..e61ad6a 100644
+--- a/pengine/test10/remote-recover-all.exp
++++ b/pengine/test10/remote-recover-all.exp
+@@ -9,9 +9,6 @@
+       <trigger>
+         <crm_event id="1" operation="stonith" operation_key="stonith-controller-1-reboot" on_node="controller-1" on_node_uuid="2"/>
+       </trigger>
+-      <trigger>
+-        <pseudo_event id="39" operation="stop" operation_key="rabbitmq_stop_0" internal_operation_key="rabbitmq:2_stop_0"/>
+-      </trigger>
+     </inputs>
+   </synapse>
+   <synapse id="1">
+@@ -64,9 +61,6 @@
+       <trigger>
+         <crm_event id="1" operation="stonith" operation_key="stonith-controller-1-reboot" on_node="controller-1" on_node_uuid="2"/>
+       </trigger>
+-      <trigger>
+-        <pseudo_event id="49" operation="stop" operation_key="galera_stop_0" internal_operation_key="galera:1_stop_0"/>
+-      </trigger>
+     </inputs>
+   </synapse>
+   <synapse id="5" priority="1000000">
+diff --git a/pengine/test10/remote-recover-all.summary b/pengine/test10/remote-recover-all.summary
+index 865f39a..cfeac3a 100644
+--- a/pengine/test10/remote-recover-all.summary
++++ b/pengine/test10/remote-recover-all.summary
+@@ -63,6 +63,8 @@ Executing cluster transition:
+  * Resource action: stonith-fence_ipmilan-525400b4f6bd stop on controller-0
+  * Pseudo action:   stonith-fence_ipmilan-5254005bdbb5_stop_0
+  * Fencing controller-1 (reboot)
++ * Pseudo action:   messaging-1_stop_0
++ * Pseudo action:   galera-2_stop_0
+  * Pseudo action:   redis_post_notify_stop_0
+  * Resource action: redis           notify on controller-0
+  * Resource action: redis           notify on controller-2
+@@ -94,7 +96,6 @@ Executing cluster transition:
+  * Resource action: stonith-fence_ipmilan-525400b4f6bd monitor=60000 on controller-0
+  * Resource action: stonith-fence_ipmilan-5254005bdbb5 start on controller-2
+  * Resource action: galera-0        monitor=20000 on controller-2
+- * Pseudo action:   galera-2_stop_0
+  * Resource action: rabbitmq        notify on messaging-2
+  * Resource action: rabbitmq        notify on messaging-0
+  * Pseudo action:   rabbitmq_notified_0
+@@ -107,7 +108,6 @@ Executing cluster transition:
+  * Resource action: ip-172.17.1.17  start on controller-2
+  * Resource action: ip-172.17.4.11  start on controller-2
+  * Resource action: stonith-fence_ipmilan-5254005bdbb5 monitor=60000 on controller-2
+- * Pseudo action:   messaging-1_stop_0
+  * Pseudo action:   redis_notified_0
+  * Resource action: ip-172.17.1.14  monitor=10000 on controller-2
+  * Resource action: ip-172.17.1.17  monitor=10000 on controller-2
+diff --git a/pengine/test10/remote-recover-no-resources.dot b/pengine/test10/remote-recover-no-resources.dot
+index a46c305..a0b1ecc 100644
+--- a/pengine/test10/remote-recover-no-resources.dot
++++ b/pengine/test10/remote-recover-no-resources.dot
+@@ -45,7 +45,6 @@ digraph "g" {
+ "rabbitmq_post_notify_stonith_0" -> "rabbitmq_post_notify_stonith_0 messaging-0" [ style = bold]
+ "rabbitmq_post_notify_stonith_0" -> "rabbitmq_post_notify_stonith_0 messaging-2" [ style = bold]
+ "rabbitmq_post_notify_stonith_0" [ style=bold color="green" fontcolor="orange"]
+-"rabbitmq_stop_0 messaging-1" -> "messaging-1_stop_0 controller-1" [ style = bold]
+ "rabbitmq_stop_0 messaging-1" -> "rabbitmq-clone_stopped_0" [ style = bold]
+ "rabbitmq_stop_0 messaging-1" [ style=bold color="green" fontcolor="orange"]
+ "redis-master_confirmed-post_notify_stopped_0" [ style=bold color="green" fontcolor="orange"]
+diff --git a/pengine/test10/remote-recover-no-resources.exp b/pengine/test10/remote-recover-no-resources.exp
+index 4d82aa4..27f18b5 100644
+--- a/pengine/test10/remote-recover-no-resources.exp
++++ b/pengine/test10/remote-recover-no-resources.exp
+@@ -9,9 +9,6 @@
+       <trigger>
+         <crm_event id="1" operation="stonith" operation_key="stonith-controller-1-reboot" on_node="controller-1" on_node_uuid="2"/>
+       </trigger>
+-      <trigger>
+-        <pseudo_event id="38" operation="stop" operation_key="rabbitmq_stop_0" internal_operation_key="rabbitmq:2_stop_0"/>
+-      </trigger>
+     </inputs>
+   </synapse>
+   <synapse id="1">
+diff --git a/pengine/test10/remote-recover-no-resources.summary b/pengine/test10/remote-recover-no-resources.summary
+index 9527161..c01eb87 100644
+--- a/pengine/test10/remote-recover-no-resources.summary
++++ b/pengine/test10/remote-recover-no-resources.summary
+@@ -60,6 +60,7 @@ Executing cluster transition:
+  * Resource action: stonith-fence_ipmilan-525400b4f6bd stop on controller-0
+  * Pseudo action:   stonith-fence_ipmilan-5254005bdbb5_stop_0
+  * Fencing controller-1 (reboot)
++ * Pseudo action:   messaging-1_stop_0
+  * Pseudo action:   galera-2_stop_0
+  * Pseudo action:   redis_post_notify_stop_0
+  * Resource action: redis           notify on controller-0
+@@ -92,7 +93,6 @@ Executing cluster transition:
+  * Pseudo action:   ip-172.17.1.17_stop_0
+  * Pseudo action:   ip-172.17.4.11_stop_0
+  * Resource action: stonith-fence_ipmilan-5254005bdbb5 monitor=60000 on controller-2
+- * Pseudo action:   messaging-1_stop_0
+  * Resource action: redis           notify on controller-0
+  * Resource action: redis           notify on controller-2
+  * Pseudo action:   redis-master_confirmed-post_notify_stopped_0
+diff --git a/pengine/test10/remote-recover-unknown.dot b/pengine/test10/remote-recover-unknown.dot
+index a883eb4..1d13e50 100644
+--- a/pengine/test10/remote-recover-unknown.dot
++++ b/pengine/test10/remote-recover-unknown.dot
+@@ -46,7 +46,6 @@ digraph "g" {
+ "rabbitmq_post_notify_stonith_0" -> "rabbitmq_post_notify_stonith_0 messaging-0" [ style = bold]
+ "rabbitmq_post_notify_stonith_0" -> "rabbitmq_post_notify_stonith_0 messaging-2" [ style = bold]
+ "rabbitmq_post_notify_stonith_0" [ style=bold color="green" fontcolor="orange"]
+-"rabbitmq_stop_0 messaging-1" -> "messaging-1_stop_0 controller-1" [ style = bold]
+ "rabbitmq_stop_0 messaging-1" -> "rabbitmq-clone_stopped_0" [ style = bold]
+ "rabbitmq_stop_0 messaging-1" [ style=bold color="green" fontcolor="orange"]
+ "redis-master_confirmed-post_notify_stopped_0" [ style=bold color="green" fontcolor="orange"]
+diff --git a/pengine/test10/remote-recover-unknown.exp b/pengine/test10/remote-recover-unknown.exp
+index 65677b4..13bd295 100644
+--- a/pengine/test10/remote-recover-unknown.exp
++++ b/pengine/test10/remote-recover-unknown.exp
+@@ -9,9 +9,6 @@
+       <trigger>
+         <crm_event id="1" operation="stonith" operation_key="stonith-controller-1-reboot" on_node="controller-1" on_node_uuid="2"/>
+       </trigger>
+-      <trigger>
+-        <pseudo_event id="39" operation="stop" operation_key="rabbitmq_stop_0" internal_operation_key="rabbitmq:2_stop_0"/>
+-      </trigger>
+     </inputs>
+   </synapse>
+   <synapse id="1">
+diff --git a/pengine/test10/remote-recover-unknown.summary b/pengine/test10/remote-recover-unknown.summary
+index 78a60d0..64f37cb 100644
+--- a/pengine/test10/remote-recover-unknown.summary
++++ b/pengine/test10/remote-recover-unknown.summary
+@@ -61,6 +61,7 @@ Executing cluster transition:
+  * Resource action: stonith-fence_ipmilan-525400b4f6bd stop on controller-0
+  * Pseudo action:   stonith-fence_ipmilan-5254005bdbb5_stop_0
+  * Fencing controller-1 (reboot)
++ * Pseudo action:   messaging-1_stop_0
+  * Pseudo action:   galera-2_stop_0
+  * Pseudo action:   redis_post_notify_stop_0
+  * Resource action: redis           notify on controller-0
+@@ -94,7 +95,6 @@ Executing cluster transition:
+  * Pseudo action:   ip-172.17.1.17_stop_0
+  * Pseudo action:   ip-172.17.4.11_stop_0
+  * Resource action: stonith-fence_ipmilan-5254005bdbb5 monitor=60000 on controller-2
+- * Pseudo action:   messaging-1_stop_0
+  * Resource action: redis           notify on controller-0
+  * Resource action: redis           notify on controller-2
+  * Pseudo action:   redis-master_confirmed-post_notify_stopped_0
+-- 
+1.8.3.1
+

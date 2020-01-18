@@ -80,6 +80,14 @@
   } || %{?__transaction_systemd_inhibit:1}%{!?__transaction_systemd_inhibit:0}%{nil \
   } || %(test -f /usr/lib/os-release; test $? -ne 0; echo $?))
 
+%if 0%{?fedora} > 20 || 0%{?rhel} > 7
+%global gnutls_priorities @SYSTEM
+%else
+%if 0%{?rhel} > 6
+%global gnutls_priorities NORMAL:-VERS-SSL3.0:-VERS-TLS1.0:-VERS-TLS1.1:-MD5:-3DES-CBC:-ARCFOUR-128:-ARCFOUR-40
+%endif
+%endif
+ 
 ## Upstream commit to use for nagios-agents-metadata package
 %global nagios_hash 105ab8a
 
@@ -160,7 +168,7 @@
 Name:          pacemaker
 Summary:       Scalable High-Availability cluster resource manager
 Version:       %{pcmkversion}
-Release:       %{pcmk_release}%{?dist}
+Release:       %{pcmk_release}%{?dist}.1
 %if %{defined _unitdir}
 License:       GPLv2+ and LGPLv2+
 %else
@@ -186,6 +194,8 @@ Patch7:        007-security.patch
 Patch8:        008-security-log.patch
 Patch9:        009-use-after-free.patch
 Patch10:       010-fork-callback.patch
+Patch11:       011-remote.patch
+Patch12:       012-tls-priorities.patch
 
 # patches that aren't from upstream
 Patch100:      lrmd-protocol-version.patch
@@ -460,6 +470,7 @@ export LDFLAGS_HARDENED_LIB="%{?_hardening_ldflags}"
         --without-heartbeat                        \
         %{!?with_doc:        --with-brand=}        \
         %{!?with_hardening:  --disable-hardening}  \
+        %{?gnutls_priorities: --with-gnutls-priorities="%{gnutls_priorities}"} \
         --with-initdir=%{_initrddir}               \
         --localstatedir=%{_var}                    \
         --with-bug-url=https://bugzilla.redhat.com/ \
@@ -872,6 +883,12 @@ exit 0
 %attr(0644,root,root) %{_datadir}/pacemaker/nagios/plugins-metadata/*
 
 %changelog
+* Tue Jul 23 2019 Ken Gaillot <kgaillot@redhat.com> - 1.1.20-5.1
+- Handle losing remote node while it is shutting down
+- Allow configurable GnuTLS cipher priorities and use stricter default
+- Resolves: rhbz#1732335
+- Resolves: rhbz#1733187
+
 * Fri May 24 2019 Ken Gaillot <kgaillot@redhat.com> - 1.1.20-5
 - Correct memory issue in fence agent output fix
 - Resolves: rhbz#1549366

@@ -37,6 +37,7 @@
 #include <crm/services.h>
 #include <crm/common/mainloop.h>
 #include <crm/common/ipcs.h>
+#include <crm/common/remote_internal.h>
 #include <crm/msg_xml.h>
 
 #include <crm/stonith-ng.h>
@@ -1163,7 +1164,14 @@ lrmd_tcp_connect_cb(void *userdata, int sock)
     gnutls_psk_set_client_credentials(native->psk_cred_c, DEFAULT_REMOTE_USERNAME, &psk_key, GNUTLS_PSK_KEY_RAW);
     gnutls_free(psk_key.data);
 
-    native->remote->tls_session = create_psk_tls_session(sock, GNUTLS_CLIENT, native->psk_cred_c);
+    native->remote->tls_session = pcmk__new_tls_session(sock, GNUTLS_CLIENT,
+                                                        GNUTLS_CRD_PSK,
+                                                        native->psk_cred_c);
+    if (native->remote->tls_session == NULL) {
+        lrmd_tls_connection_destroy(lrmd);
+        report_async_connection_result(lrmd, -EPROTO);
+        return;
+    }
 
     if (crm_initiate_client_tls_handshake(native->remote, LRMD_CLIENT_HANDSHAKE_TIMEOUT) != 0) {
         crm_warn("Disconnecting after TLS handshake with remote LRMD %s:%d failed",
@@ -1244,7 +1252,13 @@ lrmd_tls_connect(lrmd_t * lrmd, int *fd)
     gnutls_psk_set_client_credentials(native->psk_cred_c, DEFAULT_REMOTE_USERNAME, &psk_key, GNUTLS_PSK_KEY_RAW);
     gnutls_free(psk_key.data);
 
-    native->remote->tls_session = create_psk_tls_session(sock, GNUTLS_CLIENT, native->psk_cred_c);
+    native->remote->tls_session = pcmk__new_tls_session(sock, GNUTLS_CLIENT,
+                                                        GNUTLS_CRD_PSK,
+                                                        native->psk_cred_c);
+    if (native->remote->tls_session == NULL) {
+        lrmd_tls_connection_destroy(lrmd);
+        return -EPROTO;
+    }
 
     if (crm_initiate_client_tls_handshake(native->remote, LRMD_CLIENT_HANDSHAKE_TIMEOUT) != 0) {
         crm_err("Session creation for %s:%d failed", native->server, native->port);
@@ -1430,7 +1444,7 @@ lrmd_api_register_rsc(lrmd_t * lrmd,
     if (!class || !type || !rsc_id) {
         return -EINVAL;
     }
-    if (crm_provider_required(class) && !provider) {
+    if (is_set(pcmk_get_ra_caps(class), pcmk_ra_cap_provider) && !provider) {
         return -EINVAL;
     }
 
@@ -1533,7 +1547,8 @@ lrmd_api_get_rsc_info(lrmd_t * lrmd, const char *rsc_id, enum lrmd_call_options 
     if (!class || !type) {
         free_xml(output);
         return NULL;
-    } else if (crm_provider_required(class) && !provider) {
+    } else if (is_set(pcmk_get_ra_caps(class), pcmk_ra_cap_provider)
+               && !provider) {
         free_xml(output);
         return NULL;
     }

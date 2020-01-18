@@ -142,6 +142,14 @@ typedef struct remote_fencing_op_s {
 
 } remote_fencing_op_t;
 
+enum st_callback_flags {
+    st_callback_unknown        = 0x0000,
+    st_callback_notify_fence   = 0x0001,
+    st_callback_device_add     = 0x0004,
+    st_callback_device_del     = 0x0010,
+    st_callback_notify_history = 0x0020
+};
+
 /*
  * Complex fencing requirements are specified via fencing topologies.
  * A topology consists of levels; each level is a list of fencing devices.
@@ -169,6 +177,9 @@ typedef struct stonith_topology_s {
     GListPtr levels[ST_LEVEL_MAX];
 
 } stonith_topology_t;
+
+void free_stonith_remote_op_list(void);
+void init_stonith_remote_op_hash_table(GHashTable **table);
 
 long long get_stonith_flag(const char *name);
 
@@ -209,11 +220,14 @@ int process_remote_stonith_query(xmlNode * msg);
 
 void *create_remote_stonith_op(const char *client, xmlNode * request, gboolean peer);
 
-int stonith_fence_history(xmlNode * msg, xmlNode ** output);
+int stonith_fence_history(xmlNode *msg, xmlNode **output,
+                          const char *remote_peer, int options);
 
 void free_device(gpointer data);
 
 void free_topology_entry(gpointer data);
+
+void stonith_fence_history_trim(void);
 
 bool fencing_peer_active(crm_node_t *peer);
 
@@ -235,12 +249,11 @@ schedule_internal_command(const char *origin,
                           void (*done_cb) (GPid pid, int rc, const char *output,
                                            gpointer user_data));
 
-char *stonith_get_peer_name(unsigned int nodeid);
-
 extern char *stonith_our_uname;
 extern gboolean stand_alone;
 extern GHashTable *device_list;
 extern GHashTable *topology;
 extern long stonith_watchdog_timeout_ms;
 
-extern GHashTable *known_peer_names;
+extern GHashTable *stonith_remote_op_list;
+

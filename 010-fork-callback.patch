@@ -1,0 +1,33 @@
+From b3d9a6e313cb77ef0b22aa0a182f0cabbaa2a70e Mon Sep 17 00:00:00 2001
+From: Klaus Wenninger <klaus.wenninger@aon.at>
+Date: Wed, 22 May 2019 16:34:58 +0200
+Subject: [PATCH] Fix: fence-lib: regression introduced with fork callback
+
+If it is a retry device is already moved from activating_on to
+active_on.
+---
+ fencing/commands.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/fencing/commands.c b/fencing/commands.c
+index d47a5ea..264697e 100644
+--- a/fencing/commands.c
++++ b/fencing/commands.c
+@@ -306,8 +306,13 @@ static void
+ fork_cb(GPid pid, gpointer user_data)
+ {
+     async_command_t *cmd = (async_command_t *) user_data;
+-    stonith_device_t * device = cmd->activating_on;
++    stonith_device_t * device =
++        /* in case of a retry we've done the move from
++         * activating_on to active_on already
++         */
++        cmd->activating_on?cmd->activating_on:cmd->active_on;
+ 
++    CRM_ASSERT(device);
+     crm_debug("Operation %s%s%s on %s now running with pid=%d, timeout=%ds",
+                   cmd->action, cmd->victim ? " for node " : "", cmd->victim ? cmd->victim : "",
+                   device->id, pid, cmd->timeout);
+-- 
+1.8.3.1
+

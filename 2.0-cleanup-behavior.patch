@@ -53,7 +53,7 @@ index 128d075..bbdba25 100644
  
      {"-spacer-", 1, NULL, '-', "\nExamples:", pcmk_option_paragraph},
 @@ -630,15 +624,16 @@ main(int argc, char **argv)
-                 timeout_ms = crm_get_msec(optarg);
+                 require_resource = FALSE;
                  break;
  
 +            case 'P':
@@ -84,7 +84,7 @@ index 128d075..bbdba25 100644
 -         crm_debug("Re-checking the state of %s (%s requested) on %s",
 -                   rsc->id, rsc_id, (host_uname? host_uname: "all nodes"));
 -         rc = cli_resource_delete(crmd_channel, host_uname, rsc,
--                                  NULL, 0, FALSE, &data_set);
+-                                  NULL, 0, FALSE, data_set);
 -
 -         if ((rc == pcmk_ok) && !BE_QUIET) {
 -             // Show any reasons why resource might stay stopped
@@ -99,7 +99,7 @@ index 128d075..bbdba25 100644
 +        crm_debug("Re-checking the state of %s (%s requested) on %s",
 +                  rsc->id, rsc_id, (host_uname? host_uname: "all nodes"));
 +        rc = cli_resource_delete(crmd_channel, host_uname, rsc,
-+                                 NULL, 0, FALSE, &data_set);
++                                 NULL, 0, FALSE, data_set);
 +
 +        if ((rc == pcmk_ok) && !BE_QUIET) {
 +            // Show any reasons why resource might stay stopped

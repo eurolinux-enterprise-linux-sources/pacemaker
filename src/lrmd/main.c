@@ -32,11 +32,16 @@
 #include <crm/common/mainloop.h>
 #include <crm/common/ipc.h>
 #include <crm/common/ipcs.h>
+#include <crm/common/remote_internal.h>
 
 #include <lrmd_private.h>
 
 #if defined(HAVE_GNUTLS_GNUTLS_H) && defined(SUPPORT_REMOTE)
 #  define ENABLE_PCMK_REMOTE
+
+// Hidden in liblrmd
+extern int lrmd_tls_send_msg(crm_remote_t *session, xmlNode *msg, uint32_t id,
+                             const char *msg_type);
 #endif
 
 GMainLoop *mainloop = NULL;
@@ -296,7 +301,7 @@ lrmd_exit(gpointer data)
     g_hash_table_destroy(rsc_list);
 
     if (mainloop) {
-        lrmd_drain_alerts(g_main_loop_get_context(mainloop));
+        lrmd_drain_alerts(mainloop);
     }
 
     crm_exit(pcmk_ok);

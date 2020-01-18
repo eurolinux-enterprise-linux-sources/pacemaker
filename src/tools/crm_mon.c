@@ -49,35 +49,41 @@
 #include <../pengine/pengine.h>
 #include <crm/stonith-ng.h>
 
-extern void cleanup_alloc_calculations(pe_working_set_t * data_set);
-
-void clean_up(int rc);
+void clean_up_connections(void);
+static int clean_up(int rc);
 void crm_diff_update(const char *event, xmlNode * msg);
 gboolean mon_refresh_display(gpointer user_data);
 int cib_connect(gboolean full);
-void mon_st_callback(stonith_t * st, stonith_event_t * e);
+void mon_st_callback_event(stonith_t * st, stonith_event_t * e);
+void mon_st_callback_display(stonith_t * st, stonith_event_t * e);
+void kick_refresh(gboolean data_updated);
 static char *get_node_display_name(node_t *node);
 
 /*
  * Definitions indicating which items to print
  */
 
-#define mon_show_times      (0x0001U)
-#define mon_show_stack      (0x0002U)
-#define mon_show_dc         (0x0004U)
-#define mon_show_count      (0x0008U)
-#define mon_show_nodes      (0x0010U)
-#define mon_show_resources  (0x0020U)
-#define mon_show_attributes (0x0040U)
-#define mon_show_failcounts (0x0080U)
-#define mon_show_operations (0x0100U)
-#define mon_show_tickets    (0x0200U)
-#define mon_show_bans       (0x0400U)
+#define mon_show_times         (0x0001U)
+#define mon_show_stack         (0x0002U)
+#define mon_show_dc            (0x0004U)
+#define mon_show_count         (0x0008U)
+#define mon_show_nodes         (0x0010U)
+#define mon_show_resources     (0x0020U)
+#define mon_show_attributes    (0x0040U)
+#define mon_show_failcounts    (0x0080U)
+#define mon_show_operations    (0x0100U)
+#define mon_show_tickets       (0x0200U)
+#define mon_show_bans          (0x0400U)
+#define mon_show_fence_history (0x0800U)
 
-#define mon_show_headers    (mon_show_times | mon_show_stack | mon_show_dc | mon_show_count)
-#define mon_show_default    (mon_show_headers | mon_show_nodes | mon_show_resources)
-#define mon_show_all        (mon_show_default | mon_show_attributes | mon_show_failcounts \
-                     | mon_show_operations | mon_show_tickets | mon_show_bans)
+#define mon_show_headers       (mon_show_times | mon_show_stack | mon_show_dc \
+                               | mon_show_count)
+#define mon_show_default       (mon_show_headers | mon_show_nodes \
+                               | mon_show_resources)
+#define mon_show_all           (mon_show_default | mon_show_attributes \
+                               | mon_show_failcounts | mon_show_operations \
+                               | mon_show_tickets | mon_show_bans \
+                               | mon_show_fence_history)
 
 unsigned int show = mon_show_default;
 
@@ -98,7 +104,6 @@ enum mon_output_format_e {
 char *output_filename = NULL;   /* if sending output to a file, its name */
 
 /* other globals */
-char *xml_file = NULL;
 char *pid_file = NULL;
 char *snmp_target = NULL;
 char *snmp_community = NULL;
@@ -109,6 +114,8 @@ int reconnect_msec = 5000;
 gboolean daemonize = FALSE;
 GMainLoop *mainloop = NULL;
 guint timer_id = 0;
+mainloop_timer_t *refresh_timer = NULL;
+static pe_working_set_t *mon_data_set = NULL;
 GList *attr_list = NULL;
 
 const char *crm_mail_host = NULL;
@@ -126,9 +133,16 @@ gboolean one_shot = FALSE;
 gboolean has_warnings = FALSE;
 gboolean print_timing = FALSE;
 gboolean watch_fencing = FALSE;
+gboolean fence_history = FALSE;
+gboolean fence_full_history = FALSE;
+gboolean fence_connect = FALSE;
+int fence_history_level = 1;
 gboolean print_brief = FALSE;
 gboolean print_pending = TRUE;
 gboolean print_clone_detail = FALSE;
+#if CURSES_ENABLED
+gboolean curses_console_initialized = FALSE;
+#endif
 
 /* FIXME allow, detect, and correctly interpret glob pattern or regex? */
 const char *print_neg_location_prefix = "";
@@ -160,6 +174,8 @@ crm_trigger_t *refresh_trigger = NULL;
 /* Define exit codes for monitoring-compatible output */
 #define MON_STATUS_OK   (0)
 #define MON_STATUS_WARN (1)
+#define MON_STATUS_CRIT (2)
+#define MON_STATUS_UNKNOWN (3)
 
 /* Convenience macro for prettifying output (e.g. "node" vs "nodes") */
 #define s_if_plural(i) (((i) == 1)? "" : "s")
@@ -217,6 +233,7 @@ mon_timer_popped(gpointer data)
 
     if (timer_id > 0) {
         g_source_remove(timer_id);
+        timer_id = 0;
     }
 
     print_as("Reconnecting...\n");
@@ -231,7 +248,27 @@ mon_timer_popped(gpointer data)
 static void
 mon_cib_connection_destroy(gpointer user_data)
 {
-    print_as("Connection to the CIB terminated\n");
+    print_as("Connection to the cluster-daemons terminated\n");
+    if (refresh_timer != NULL) {
+        /* we'll trigger a refresh after reconnect */
+        mainloop_timer_stop(refresh_timer);
+    }
+    if (timer_id) {
+        /* we'll trigger a new reconnect-timeout at the end */
+        g_source_remove(timer_id);
+        timer_id = 0;
+    }
+    if (st) {
+        /* the client API won't properly reconnect notifications
+         * if they are still in the table - so remove them
+         */
+        st->cmds->remove_notification(st, T_STONITH_NOTIFY_DISCONNECT);
+        st->cmds->remove_notification(st, T_STONITH_NOTIFY_FENCE);
+        st->cmds->remove_notification(st, T_STONITH_NOTIFY_HISTORY);
+        if (st->state != stonith_disconnected) {
+            st->cmds->disconnect(st);
+        }
+    }
     if (cib) {
         cib->cmds->signoff(cib);
         timer_id = g_timeout_add(reconnect_msec, mon_timer_popped, NULL);
@@ -289,16 +326,24 @@ cib_connect(gboolean full)
         need_pass = FALSE;
     }
 
-    if (watch_fencing && st == NULL) {
+    if ((fence_connect) && (st == NULL)) {
         st = stonith_api_new();
     }
 
-    if (watch_fencing && st->state == stonith_disconnected) {
+    if ((fence_connect) && (st->state == stonith_disconnected)) {
         crm_trace("Connecting to stonith");
         rc = st->cmds->connect(st, crm_system_name, NULL);
         if (rc == pcmk_ok) {
             crm_trace("Setting up stonith callbacks");
-            st->cmds->register_notification(st, T_STONITH_NOTIFY_FENCE, mon_st_callback);
+            if (watch_fencing) {
+                st->cmds->register_notification(st, T_STONITH_NOTIFY_DISCONNECT,
+                                                mon_st_callback_event);
+                st->cmds->register_notification(st, T_STONITH_NOTIFY_FENCE, mon_st_callback_event);
+            } else {
+                st->cmds->register_notification(st, T_STONITH_NOTIFY_DISCONNECT,
+                                                mon_st_callback_display);
+                st->cmds->register_notification(st, T_STONITH_NOTIFY_HISTORY, mon_st_callback_display);
+            }
         }
     }
 
@@ -344,7 +389,7 @@ cib_connect(gboolean full)
                 if (output_format == mon_output_console) {
                     sleep(2);
                 }
-                clean_up(-rc);
+                clean_up_connections();
             }
         }
     }
@@ -376,6 +421,10 @@ static struct crm_option long_options[] = {
     {"timing-details", 0, 0, 't', "\tDisplay resource operation history with timing details" },
     {"tickets",        0, 0, 'c', "\t\tDisplay cluster tickets"},
     {"watch-fencing",  0, 0, 'W', "\tListen for fencing events. For use with --external-agent, --mail-to and/or --snmp-traps where supported"},
+    {"fence-history",  2, 0, 'm', "Show fence history\n"
+                                  "\t\t\t\t\t0=off, 1=failures and pending (default without option),\n"
+                                  "\t\t\t\t\t2=add successes (default without value for option),\n"
+                                  "\t\t\t\t\t3=show full history without reduction to most recent of each flavor"},
     {"neg-locations",  2, 0, 'L', "Display negative location constraints [optionally filtered by id prefix]"},
     {"show-node-attributes", 0, 0, 'A', "Display node attributes" },
     {"hide-headers",   0, 0, 'D', "\tHide all headers" },
@@ -430,9 +479,26 @@ get_option_desc(char c)
             continue;
 
         if (long_options[lpc].val == c) {
-            const char * tab = NULL;
-            tab = strrchr(long_options[lpc].desc, '\t');
-            return tab ? ++tab : long_options[lpc].desc;
+            static char *buf = NULL;
+            const char *rv;
+            char *nl;
+
+            /* chop off tabs and cut at newline */
+            free(buf); /* free string from last usage */
+            buf = strdup(long_options[lpc].desc);
+            rv = buf; /* make a copy to keep buf pointer unaltered
+                         for freeing when we come by next time.
+                         Like this the result stays valid until
+                         the next call.
+                       */
+            while(isspace(rv[0])) {
+                rv++;
+            }
+            nl = strchr(rv, '\n');
+            if (nl) {
+                *nl = '\0';
+            }
+            return rv;
         }
     }
 
@@ -454,6 +520,16 @@ detect_user_input(GIOChannel *channel, GIOCondition condition, gpointer unused)
         c = getchar();
 
         switch (c) {
+            case 'm':
+                if (!fence_history_level) {
+                    fence_history = TRUE;
+                    fence_connect = TRUE;
+                    if (st == NULL) {
+                        mon_cib_connection_destroy(NULL);
+                    }
+                }
+                show ^= mon_show_fence_history;
+                break;
             case 'c':
                 show ^= mon_show_tickets;
                 break;
@@ -527,6 +603,7 @@ detect_user_input(GIOChannel *channel, GIOCondition condition, gpointer unused)
         print_option_help('R', print_clone_detail);
         print_option_help('b', print_brief);
         print_option_help('j', print_pending);
+        print_option_help('m', (show & mon_show_fence_history));
         print_as("\n");
         print_as("Toggle fields via field letter, type any other key to return");
     }
@@ -561,6 +638,12 @@ main(int argc, char **argv)
         one_shot = TRUE;
     }
 
+    /* to enable stonith-connection when called via some application like pcs
+     * set environment-variable FENCE_HISTORY to desired level
+     * so you don't have to modify this application
+     */
+    /* fence_history_level = crm_atoi(getenv("FENCE_HISTORY"), "0"); */
+
     while (1) {
         flag = crm_get_option(argc, argv, &option_index);
         if (flag == -1)
@@ -584,6 +667,10 @@ main(int argc, char **argv)
                 break;
             case 'W':
                 watch_fencing = TRUE;
+                fence_connect = TRUE;
+                break;
+            case 'm':
+                fence_history_level = crm_atoi(optarg, "2");
                 break;
             case 'd':
                 daemonize = TRUE;
@@ -631,7 +718,7 @@ main(int argc, char **argv)
                 if(optarg == NULL) {
                     return crm_help(flag, EX_USAGE);
                 }
-                xml_file = strdup(optarg);
+                setenv("CIB_file", optarg, 1);
                 one_shot = TRUE;
                 break;
             case 'h':
@@ -702,11 +789,71 @@ main(int argc, char **argv)
         }
     }
 
+    if (watch_fencing) {
+        /* don't moan as fence_history_level == 1 is default */
+        fence_history_level = 0;
+    }
+
+    /* create the cib-object early to be able to do further
+     * decisions based on the cib-source
+     */
+    cib = cib_new();
+
+    if (cib == NULL) {
+        exit_code = -EINVAL;
+    } else {
+        switch (cib->variant) {
+
+            case cib_native:
+                /* cib & fencing - everything available */
+                break;
+
+            case cib_file:
+                /* Don't try to connect to fencing as we
+                 * either don't have a running cluster or
+                 * the fencing-information would possibly
+                 * not match the cib data from a file.
+                 * As we don't expect cib-updates coming
+                 * in enforce one-shot. */
+                fence_history_level = 0;
+                one_shot = TRUE;
+                break;
+
+            case cib_remote:
+                /* updates coming in but no fencing */
+                fence_history_level = 0;
+                break;
+
+            case cib_undefined:
+            case cib_database:
+            default:
+                /* something is odd */
+                exit_code = -EINVAL;
+                crm_err("Invalid cib-source");
+                break;
+        }
+    }
+
+    switch (fence_history_level) {
+        case 3:
+            fence_full_history = TRUE;
+            /* fall through to next lower level */
+        case 2:
+            show |= mon_show_fence_history;
+            /* fall through to next lower level */
+        case 1:
+            fence_history = TRUE;
+            fence_connect = TRUE;
+            break;
+        default:
+            break;
+    }
+
     /* Extra sanity checks when in CGI mode */
     if (output_format == mon_output_cgi) {
         argerr += (optind < argc);
         argerr += (output_filename != NULL);
-        argerr += (xml_file != NULL);
+        argerr += ((cib) && (cib->variant == cib_file));
         argerr += (snmp_target != NULL);
         argerr += (crm_mail_to != NULL);
         argerr += (external_agent != NULL);
@@ -720,12 +867,7 @@ main(int argc, char **argv)
     }
 
     if (argerr) {
-        if (output_format == mon_output_cgi) {
-            fprintf(stdout, "Content-Type: text/plain\n"
-                            "Status: 500\n\n");
-            return EX_USAGE;
-        }
-        return crm_help('?', EX_USAGE);
+        return clean_up(EX_USAGE);
     }
 
     /* XML output always prints everything */
@@ -747,12 +889,26 @@ main(int argc, char **argv)
 
         if ((output_format != mon_output_html) && (output_format != mon_output_xml)
             && !snmp_target && !crm_mail_to && !external_agent) {
-            printf
-                ("Looks like you forgot to specify one or more of: --as-html, --as-xml, --mail-to, --snmp-target, --external-agent\n");
-            return crm_help('?', EX_USAGE);
+            printf ("Looks like you forgot to specify one or more of: "
+                    "--as-html, --external-agent, --mail-to, --snmp-target\n");
+            return clean_up(EX_USAGE);
         }
 
-        crm_make_daemon(crm_system_name, TRUE, pid_file);
+        if (cib) {
+            /* to be on the safe side don't have cib-object around
+             * when we are forking
+             */
+            cib_delete(cib);
+            cib = NULL;
+            crm_make_daemon(crm_system_name, TRUE, pid_file);
+            cib = cib_new();
+            if (cib == NULL) {
+                exit_code = -EINVAL;
+            }
+            /* otherwise assume we've got the same cib-object we've just destroyed
+             * in our parent
+             */
+        }
 
     } else if (output_format == mon_output_console) {
 #if CURSES_ENABLED
@@ -760,6 +916,7 @@ main(int argc, char **argv)
         cbreak();
         noecho();
         crm_enable_stderr(FALSE);
+        curses_console_initialized = TRUE;
 #else
         one_shot = TRUE;
         output_format = mon_output_plain;
@@ -769,24 +926,17 @@ main(int argc, char **argv)
     }
 
     crm_info("Starting %s", crm_system_name);
-    if (xml_file != NULL) {
-        current_cib = filename2xml(xml_file);
-        mon_refresh_display(NULL);
-        return exit_code;
-    }
 
-    if (current_cib == NULL) {
-        cib = cib_new();
+    if (cib) {
 
         do {
             if (!one_shot) {
-                print_as("Attempting connection to the cluster...\n");
+                print_as("Waiting until cluster is available on this node ...\n");
             }
             exit_code = cib_connect(!one_shot);
 
             if (one_shot) {
                 break;
-
             } else if (exit_code != pcmk_ok) {
                 sleep(reconnect_msec / 1000);
 #if CURSES_ENABLED
@@ -795,26 +945,35 @@ main(int argc, char **argv)
                     refresh();
                 }
 #endif
-            }
-
-        } while (exit_code == -ENOTCONN);
-
-        if (exit_code != pcmk_ok) {
-            if (output_format == mon_output_monitor) {
-                printf("CLUSTER WARN: Connection to cluster failed: %s\n", pcmk_strerror(exit_code));
-                clean_up(MON_STATUS_WARN);
             } else {
-                print_as("\nConnection to cluster failed: %s\n", pcmk_strerror(exit_code));
+                if (output_format == mon_output_html) {
+                    print_as("Writing html to %s ...\n", output_filename);
+                }
             }
-            if (output_format == mon_output_console) {
-                sleep(2);
+        } while (exit_code == -ENOTCONN);
+    }
+
+    if (exit_code != pcmk_ok) {
+        if (output_format == mon_output_monitor) {
+            printf("CLUSTER CRIT: Connection to cluster failed: %s\n",
+                   pcmk_strerror(exit_code));
+            return clean_up(MON_STATUS_CRIT);
+        } else {
+            if (exit_code == -ENOTCONN) {
+                print_as("\nError: cluster is not available on this node\n");
+            } else {
+                print_as("\nConnection to cluster failed: %s\n",
+                         pcmk_strerror(exit_code));
             }
-            clean_up(-exit_code);
         }
+        if (output_format == mon_output_console) {
+            sleep(2);
+        }
+        return clean_up(-exit_code);
     }
 
     if (one_shot) {
-        return exit_code;
+        return clean_up(0);
     }
 
     mainloop = g_main_new(FALSE);
@@ -837,8 +996,7 @@ main(int argc, char **argv)
 
     crm_info("Exiting %s", crm_system_name);
 
-    clean_up(0);
-    return 0;                   /* never reached */
+    return clean_up(0);
 }
 
 #define mon_warn(fmt...) do {			\
@@ -876,12 +1034,14 @@ count_resources(pe_working_set_t * data_set, resource_t * rsc)
  * \brief Print one-line status suitable for use with monitoring software
  *
  * \param[in] data_set  Working set of CIB state
+ * \param[in] history   List of stonith actions
  *
  * \note This function's output (and the return code when the program exits)
  *       should conform to https://www.monitoring-plugins.org/doc/guidelines.html
  */
 static void
-print_simple_status(pe_working_set_t * data_set)
+print_simple_status(pe_working_set_t * data_set,
+                    stonith_history_t *history)
 {
     GListPtr gIter = NULL;
     int nodes_online = 0;
@@ -2001,7 +2161,8 @@ get_node_display_name(node_t *node)
  * \param[in] node       Node affected by constraint
  * \param[in] location   Constraint to print
  */
-static void print_ban(FILE *stream, node_t *node, rsc_to_node_t *location)
+static void
+print_ban(FILE *stream, pe_node_t *node, pe__location_t *location)
 {
     char *node_name = NULL;
 
@@ -2070,7 +2231,7 @@ static void print_neg_locations(FILE *stream, pe_working_set_t *data_set)
 
     /* Print each ban */
     for (gIter = data_set->placement_constraints; gIter != NULL; gIter = gIter->next) {
-        rsc_to_node_t *location = (rsc_to_node_t *) gIter->data;
+        pe__location_t *location = gIter->data;
         if (!g_str_has_prefix(location->id, print_neg_location_prefix))
             continue;
         for (gIter2 = location->node_list_rh; gIter2 != NULL; gIter2 = gIter2->next) {
@@ -2855,12 +3016,13 @@ print_failed_actions(FILE *stream, pe_working_set_t *data_set)
     switch (output_format) {
         case mon_output_plain:
         case mon_output_console:
-            print_as("\nFailed Actions:\n");
+            print_as("\nFailed Resource Actions:\n");
             break;
 
         case mon_output_html:
         case mon_output_cgi:
-            fprintf(stream, " <hr />\n <h2>Failed Actions</h2>\n <ul>\n");
+            fprintf(stream,
+                    " <hr />\n <h2>Failed Resource Actions</h2>\n <ul>\n");
             break;
 
         case mon_output_xml:
@@ -2879,11 +3041,6 @@ print_failed_actions(FILE *stream, pe_working_set_t *data_set)
 
     /* End section */
     switch (output_format) {
-        case mon_output_plain:
-        case mon_output_console:
-            print_as("\n");
-            break;
-
         case mon_output_html:
         case mon_output_cgi:
             fprintf(stream, " </ul>\n");
@@ -2900,15 +3057,444 @@ print_failed_actions(FILE *stream, pe_working_set_t *data_set)
 
 /*!
  * \internal
+ * \brief Reduce the stonith-history
+ *        for successful actions we keep the last of every action-type & target
+ *        for failed actions we record as well who had failed
+ *        for actions in progress we keep full track
+ *
+ * \param[in] history    List of stonith actions
+ *
+ */
+static stonith_history_t *
+reduce_stonith_history(stonith_history_t *history)
+{
+    stonith_history_t *new = NULL, *hp, *np, *tmp;
+
+    for (hp = history; hp; ) {
+        for (np = new; np; np = np->next) {
+            if ((hp->state == st_done) || (hp->state == st_failed)) {
+                /* action not in progress */
+                if (safe_str_eq(hp->target, np->target) &&
+                    safe_str_eq(hp->action, np->action) &&
+                    (hp->state == np->state)) {
+                    if ((hp->state == st_done) ||
+                        safe_str_eq(hp->delegate, np->delegate)) {
+                        /* replace or purge */
+                        if (hp->completed < np->completed) {
+                            /* purge older hp */
+                            tmp = hp->next;
+                            hp->next = NULL;
+                            stonith_history_free(hp);
+                            hp = tmp;
+                            break;
+                        }
+                        /* damn single linked list */
+                        free(hp->target);
+                        free(hp->action);
+                        free(np->origin);
+                        np->origin = hp->origin;
+                        free(np->delegate);
+                        np->delegate = hp->delegate;
+                        free(np->client);
+                        np->client = hp->client;
+                        np->completed = hp->completed;
+                        tmp = hp;
+                        hp = hp->next;
+                        free(tmp);
+                        break;
+                    }
+                }
+                if (np->next) {
+                    continue;
+                }
+            }
+            np = 0; /* let outer loop progress hp */
+            break;
+        }
+        /* simply move hp from history to new */
+        if (np == NULL) {
+            tmp = hp->next;
+            hp->next = new;
+            new = hp;
+            hp = tmp;
+        }
+    }
+    return new;
+}
+
+/*!
+ * \internal
+ * \brief Sort the stonith-history
+ *        sort by competed most current on the top
+ *        pending actions lacking a completed-stamp are gathered at the top
+ *
+ * \param[in] history    List of stonith actions
+ *
+ */
+static stonith_history_t *
+sort_stonith_history(stonith_history_t *history)
+{
+    stonith_history_t *new = NULL, *pending = NULL, *hp, *np, *tmp;
+
+    for (hp = history; hp; ) {
+        tmp = hp->next;
+        if ((hp->state == st_done) || (hp->state == st_failed)) {
+            /* sort into new */
+            if ((!new) || (hp->completed > new->completed)) {
+                hp->next = new;
+                new = hp;
+            } else {
+                np = new;
+                do {
+                    if ((!np->next) || (hp->completed > np->next->completed)) {
+                        hp->next = np->next;
+                        np->next = hp;
+                        break;
+                    }
+                    np = np->next;
+                } while (1);
+            }
+        } else {
+            /* put into pending */
+            hp->next = pending;
+            pending = hp;
+        }
+        hp = tmp;
+    }
+
+    /* pending actions don't have a completed-stamp so make them go front */
+    if (pending) {
+        stonith_history_t *last_pending = pending;
+
+        while (last_pending->next) {
+            last_pending = last_pending->next;
+        }
+
+        last_pending->next = new;
+        new = pending;
+    }
+    return new;
+}
+
+/*!
+ * \internal
+ * \brief Turn stonith action into a better readable string
+ *
+ * \param[in] action     Stonith action
+ */
+static char *
+fence_action_str(const char *action)
+{
+    char *str = NULL;
+
+    if (action == NULL) {
+        str = strdup("fencing");
+    } else if (!strcmp(action, "on")) {
+        str = strdup("unfencing");
+    } else if (!strcmp(action, "off")) {
+        str = strdup("turning off");
+    } else {
+        str = strdup(action);
+    }
+    return str;
+}
+
+/*!
+ * \internal
+ * \brief Print a stonith action
+ *
+ * \param[in] stream     File stream to display output to
+ * \param[in] event      stonith event
+ */
+static void
+print_stonith_action(FILE *stream, stonith_history_t *event)
+{
+    char *action_s = fence_action_str(event->action);
+    time_t completed = event->completed;
+    char *run_at_s = ctime((const time_t *) &completed);
+
+    if ((run_at_s) && (run_at_s[0] != 0)) {
+        run_at_s[strlen(run_at_s)-1] = 0; /* Overwrite the newline */
+    }
+
+    switch(output_format) {
+        case mon_output_xml:
+            fprintf(stream, "        <fence_event target=\"%s\" action=\"%s\"",
+                    event->target, event->action);
+            switch(event->state) {
+                case st_done:
+                    fprintf(stream, " state=\"success\"");
+                    break;
+                case st_failed:
+                    fprintf(stream, " state=\"failed\"");
+                    break;
+                default:
+                    fprintf(stream, " state=\"pending\"");
+            }
+            fprintf(stream, " origin=\"%s\" client=\"%s\"",
+                    event->origin, event->client);
+            if (event->delegate) {
+                fprintf(stream, " delegate=\"%s\"", event->delegate);
+            }
+            switch(event->state) {
+                case st_done:
+                case st_failed:
+                    fprintf(stream, " completed=\"%s\"", run_at_s?run_at_s:"");
+                    break;
+                default:
+                    break;
+            }
+            fprintf(stream, " />\n");
+            break;
+
+        case mon_output_plain:
+        case mon_output_console:
+            switch(event->state) {
+                case st_done:
+                    print_as("* %s of %s successful: delegate=%s, client=%s, origin=%s,\n"
+                             "    %s='%s'\n",
+                             action_s, event->target,
+                             event->delegate ? event->delegate : "",
+                             event->client, event->origin,
+                             fence_full_history?"completed":"last-successful",
+                             run_at_s?run_at_s:"");
+                    break;
+                case st_failed:
+                    print_as("* %s of %s failed: delegate=%s, client=%s, origin=%s,\n"
+                             "    %s='%s'\n",
+                             action_s, event->target,
+                             event->delegate ? event->delegate : "",
+                             event->client, event->origin,
+                             fence_full_history?"completed":"last-failed",
+                             run_at_s?run_at_s:"");
+                    break;
+                default:
+                    print_as("* %s of %s pending: client=%s, origin=%s\n",
+                             action_s, event->target,
+                             event->client, event->origin);
+            }
+            break;
+
+        case mon_output_html:
+        case mon_output_cgi:
+            switch(event->state) {
+                case st_done:
+                    fprintf(stream, "  <li>%s of %s successful: delegate=%s, "
+                                    "client=%s, origin=%s, %s='%s'</li>\n",
+                                    action_s, event->target,
+                                    event->delegate ? event->delegate : "",
+                                    event->client, event->origin,
+                                    fence_full_history?"completed":"last-successful",
+                                    run_at_s?run_at_s:"");
+                    break;
+                case st_failed:
+                    fprintf(stream, "  <li>%s of %s failed: delegate=%s, "
+                                    "client=%s, origin=%s, %s='%s'</li>\n",
+                                    action_s, event->target,
+                                    event->delegate ? event->delegate : "",
+                                    event->client, event->origin,
+                                    fence_full_history?"completed":"last-failed",
+                                    run_at_s?run_at_s:"");
+                    break;
+                default:
+                    fprintf(stream, "  <li>%s of %s pending: client=%s, "
+                                    "origin=%s</li>\n",
+                                    action_s, event->target,
+                                    event->client, event->origin);
+            }
+            break;
+
+        default:
+            /* no support for fence history for other formats so far */
+            break;
+    }
+
+    free(action_s);
+}
+
+/*!
+ * \internal
+ * \brief Print a section for failed stonith actions
+ *
+ * \param[in] stream     File stream to display output to
+ * \param[in] history    List of stonith actions
+ *
+ */
+static void
+print_failed_stonith_actions(FILE *stream, stonith_history_t *history)
+{
+    stonith_history_t *hp;
+
+    for (hp = history; hp; hp = hp->next) {
+        if (hp->state == st_failed) {
+            break;
+        }
+    }
+    if (!hp) {
+        return;
+    }
+
+    /* Print section heading */
+    switch (output_format) {
+        /* no need to take care of xml in here as xml gets full
+         * history anyway
+         */
+        case mon_output_plain:
+        case mon_output_console:
+            print_as("\nFailed Fencing Actions:\n");
+            break;
+
+        case mon_output_html:
+        case mon_output_cgi:
+            fprintf(stream, " <hr />\n <h2>Failed Fencing Actions</h2>\n <ul>\n");
+            break;
+
+        default:
+            break;
+    }
+
+    /* Print each failed stonith action */
+    for (hp = history; hp; hp = hp->next) {
+        if (hp->state == st_failed) {
+            print_stonith_action(stream, hp);
+        }
+    }
+
+    /* End section */
+    switch (output_format) {
+        case mon_output_html:
+        case mon_output_cgi:
+            fprintf(stream, " </ul>\n");
+            break;
+
+        default:
+            break;
+    }
+}
+
+/*!
+ * \internal
+ * \brief Print pending stonith actions
+ *
+ * \param[in] stream     File stream to display output to
+ * \param[in] history    List of stonith actions
+ *
+ */
+static void
+print_stonith_pending(FILE *stream, stonith_history_t *history)
+{
+    /* xml-output always shows the full history
+     * so we'll never have to show pending-actions
+     * separately
+     */
+    if (history && (history->state != st_failed) &&
+        (history->state != st_done)) {
+        stonith_history_t *hp;
+
+        /* Print section heading */
+        switch (output_format) {
+            case mon_output_plain:
+            case mon_output_console:
+                print_as("\nPending Fencing Actions:\n");
+                break;
+
+            case mon_output_html:
+            case mon_output_cgi:
+                fprintf(stream, " <hr />\n <h2>Pending Fencing Actions</h2>\n <ul>\n");
+                break;
+
+            default:
+                break;
+        }
+
+        for (hp = history; hp; hp = hp->next) {
+            if ((hp->state == st_failed) || (hp->state == st_done)) {
+                break;
+            }
+            print_stonith_action(stream, hp);
+        }
+
+        /* End section */
+        switch (output_format) {
+            case mon_output_html:
+            case mon_output_cgi:
+                fprintf(stream, " </ul>\n");
+                break;
+
+        default:
+            break;
+        }
+    }
+}
+
+/*!
+ * \internal
+ * \brief Print a section for stonith-history
+ *
+ * \param[in] stream     File stream to display output to
+ * \param[in] history    List of stonith actions
+ *
+ */
+static void
+print_stonith_history(FILE *stream, stonith_history_t *history)
+{
+    stonith_history_t *hp;
+
+    /* Print section heading */
+    switch (output_format) {
+        case mon_output_plain:
+        case mon_output_console:
+            print_as("\nFencing History:\n");
+            break;
+
+        case mon_output_html:
+        case mon_output_cgi:
+            fprintf(stream, " <hr />\n <h2>Fencing History</h2>\n <ul>\n");
+            break;
+
+        case mon_output_xml:
+            fprintf(stream, "    <fence_history>\n");
+            break;
+
+        default:
+            break;
+    }
+
+    for (hp = history; hp; hp = hp->next) {
+        if ((hp->state != st_failed) || (output_format == mon_output_xml)) {
+            print_stonith_action(stream, hp);
+        }
+    }
+
+    /* End section */
+    switch (output_format) {
+        case mon_output_html:
+        case mon_output_cgi:
+            fprintf(stream, " </ul>\n");
+            break;
+
+        case mon_output_xml:
+            fprintf(stream, "    </fence_history>\n");
+            break;
+
+        default:
+            break;
+    }
+}
+
+/*!
+ * \internal
  * \brief Print cluster status to screen
  *
  * This uses the global display preferences set by command-line options
  * to display cluster status in a human-friendly way.
  *
- * \param[in] data_set   Working set of CIB state
+ * \param[in] data_set          Working set of CIB state
+ * \param[in] stonith_history   List of stonith actions
  */
 static void
-print_status(pe_working_set_t * data_set)
+print_status(pe_working_set_t * data_set,
+             stonith_history_t *stonith_history)
 {
     GListPtr gIter = NULL;
     int print_opts = get_resource_display_options();
@@ -2952,7 +3538,11 @@ print_status(pe_working_set_t * data_set)
 
         } else if (node->details->standby) {
             if (node->details->online) {
-                node_mode = "standby";
+                if (node->details->running_rsc) {
+                    node_mode = "standby (with active resources)";
+                } else {
+                    node_mode = "standby";
+                }
             } else {
                 node_mode = "OFFLINE (standby)";
             }
@@ -3063,6 +3653,11 @@ print_status(pe_working_set_t * data_set)
         print_failed_actions(stdout, data_set);
     }
 
+    /* Print failed stonith actions */
+    if (fence_history) {
+        print_failed_stonith_actions(stdout, stonith_history);
+    }
+
     /* Print tickets if requested */
     if (show & mon_show_tickets) {
         print_cluster_tickets(stdout, data_set);
@@ -3071,6 +3666,15 @@ print_status(pe_working_set_t * data_set)
     /* Print negative location constraints if requested */
     if (show & mon_show_bans) {
         print_neg_locations(stdout, data_set);
+    }
+
+    /* Print stonith history */
+    if (fence_history) {
+        if (show & mon_show_fence_history) {
+            print_stonith_history(stdout, stonith_history);
+        } else {
+            print_stonith_pending(stdout, stonith_history);
+        }
     }
 
 #if CURSES_ENABLED
@@ -3087,7 +3691,8 @@ print_status(pe_working_set_t * data_set)
  * \param[in] data_set   Working set of CIB state
  */
 static void
-print_xml_status(pe_working_set_t * data_set)
+print_xml_status(pe_working_set_t * data_set,
+                 stonith_history_t *stonith_history)
 {
     FILE *stream = stdout;
     GListPtr gIter = NULL;
@@ -3170,6 +3775,11 @@ print_xml_status(pe_working_set_t * data_set)
         print_failed_actions(stream, data_set);
     }
 
+    /* Print stonith history */
+    if (fence_history) {
+        print_stonith_history(stdout, stonith_history);
+    }
+
     /* Print tickets if requested */
     if (show & mon_show_tickets) {
         print_cluster_tickets(stream, data_set);
@@ -3195,7 +3805,9 @@ print_xml_status(pe_working_set_t * data_set)
  * \return 0 on success, -1 on error
  */
 static int
-print_html_status(pe_working_set_t * data_set, const char *filename)
+print_html_status(pe_working_set_t * data_set,
+                  const char *filename,
+                  stonith_history_t *stonith_history)
 {
     FILE *stream;
     GListPtr gIter = NULL;
@@ -3237,7 +3849,9 @@ print_html_status(pe_working_set_t * data_set, const char *filename)
         if (node->details->standby_onfail && node->details->online) {
             fprintf(stream, "<font color=\"orange\">standby (on-fail)</font>\n");
         } else if (node->details->standby && node->details->online) {
-            fprintf(stream, "<font color=\"orange\">standby</font>\n");
+
+            fprintf(stream, "<font color=\"orange\">standby%s</font>\n",
+                node->details->running_rsc?" (with active resources)":"");
         } else if (node->details->standby) {
             fprintf(stream, "<font color=\"red\">OFFLINE (standby)</font>\n");
         } else if (node->details->maintenance && node->details->online) {
@@ -3292,6 +3906,20 @@ print_html_status(pe_working_set_t * data_set, const char *filename)
     /* If there were any failed actions, print them */
     if (xml_has_children(data_set->failed)) {
         print_failed_actions(stream, data_set);
+    }
+
+    /* Print failed stonith actions */
+    if (fence_history) {
+        print_failed_stonith_actions(stream, stonith_history);
+    }
+
+    /* Print stonith history */
+    if (fence_history) {
+        if (show & mon_show_fence_history) {
+            print_stonith_history(stream, stonith_history);
+        } else {
+            print_stonith_pending(stdout, stonith_history);
+        }
     }
 
     /* Print tickets if requested */
@@ -4036,17 +4664,11 @@ void
 crm_diff_update(const char *event, xmlNode * msg)
 {
     int rc = -1;
-    long now = time(NULL);
     static bool stale = FALSE;
-    static int updates = 0;
-    static mainloop_timer_t *refresh_timer = NULL;
+    gboolean cib_updated = FALSE;
     xmlNode *diff = get_message_xml(msg, F_CIB_UPDATE_RESULT);
 
     print_dot();
-
-    if(refresh_timer == NULL) {
-        refresh_timer = mainloop_timer_add("refresh", 2000, FALSE, mon_trigger_refresh, NULL);
-    }
 
     if (current_cib != NULL) {
         rc = xml_apply_patchset(current_cib, diff, TRUE);
@@ -4058,7 +4680,7 @@ crm_diff_update(const char *event, xmlNode * msg)
                 free_xml(current_cib); current_cib = NULL;
                 break;
             case pcmk_ok:
-                updates++;
+                cib_updated = TRUE;
                 break;
             default:
                 crm_notice("[%s] ABORTED: %s (%d)", event, pcmk_strerror(rc), rc);
@@ -4095,31 +4717,14 @@ crm_diff_update(const char *event, xmlNode * msg)
     }
 
     stale = FALSE;
-    /* Refresh
-     * - immediately if the last update was more than 5s ago
-     * - every 10 updates
-     * - at most 2s after the last update
-     */
-    if ((now - last_refresh) > (reconnect_msec / 1000)) {
-        mainloop_set_trigger(refresh_trigger);
-        mainloop_timer_stop(refresh_timer);
-        updates = 0;
-
-    } else if(updates > 10) {
-        mainloop_set_trigger(refresh_trigger);
-        mainloop_timer_stop(refresh_timer);
-        updates = 0;
-
-    } else {
-        mainloop_timer_start(refresh_timer);
-    }
+    kick_refresh(cib_updated);
 }
 
 gboolean
 mon_refresh_display(gpointer user_data)
 {
     xmlNode *cib_copy = copy_xml(current_cib);
-    pe_working_set_t data_set;
+    stonith_history_t *stonith_history = NULL;
 
     last_refresh = time(NULL);
 
@@ -4135,75 +4740,185 @@ mon_refresh_display(gpointer user_data)
         return FALSE;
     }
 
-    set_working_set_defaults(&data_set);
-    data_set.input = cib_copy;
-    cluster_status(&data_set);
+    /* get the stonith-history if there is evidence we need it
+     */
+    while (fence_history) {
+        if (st != NULL) {
+            if (st->cmds->history(st, st_opt_sync_call, NULL, &stonith_history, 120)) {
+                fprintf(stderr, "Critical: Unable to get stonith-history\n");
+                mon_cib_connection_destroy(NULL);
+            } else {
+                if ((!fence_full_history) && (output_format != mon_output_xml)) {
+                    stonith_history = reduce_stonith_history(stonith_history);
+                }
+                stonith_history = sort_stonith_history(stonith_history);
+                break; /* all other cases are errors */
+            }
+        } else {
+            fprintf(stderr, "Critical: No stonith-API\n");
+        }
+        free_xml(cib_copy);
+        print_as("Reading stonith-history failed");
+        if (output_format == mon_output_console) {
+            sleep(2);
+        }
+        return FALSE;
+    }
+
+    if (mon_data_set == NULL) {
+        mon_data_set = pe_new_working_set();
+        CRM_ASSERT(mon_data_set != NULL);
+    }
+
+    mon_data_set->input = cib_copy;
+    cluster_status(mon_data_set);
 
     /* Unpack constraints if any section will need them
      * (tickets may be referenced in constraints but not granted yet,
      * and bans need negative location constraints) */
     if (show & (mon_show_bans | mon_show_tickets)) {
-        xmlNode *cib_constraints = get_object_root(XML_CIB_TAG_CONSTRAINTS, data_set.input);
-        unpack_constraints(cib_constraints, &data_set);
+        xmlNode *cib_constraints = get_object_root(XML_CIB_TAG_CONSTRAINTS,
+                                                   mon_data_set->input);
+        unpack_constraints(cib_constraints, mon_data_set);
     }
 
     switch (output_format) {
         case mon_output_html:
         case mon_output_cgi:
-            if (print_html_status(&data_set, output_filename) != 0) {
+            if (print_html_status(mon_data_set, output_filename, stonith_history) != 0) {
                 fprintf(stderr, "Critical: Unable to output html file\n");
                 clean_up(EX_USAGE);
+                return FALSE;
             }
             break;
 
         case mon_output_xml:
-            print_xml_status(&data_set);
+            print_xml_status(mon_data_set, stonith_history);
             break;
 
         case mon_output_monitor:
-            print_simple_status(&data_set);
+            print_simple_status(mon_data_set, stonith_history);
             if (has_warnings) {
                 clean_up(MON_STATUS_WARN);
+                return FALSE;
             }
             break;
 
         case mon_output_plain:
         case mon_output_console:
-            print_status(&data_set);
+            print_status(mon_data_set, stonith_history);
             break;
 
         case mon_output_none:
             break;
     }
 
-    cleanup_alloc_calculations(&data_set);
+    stonith_history_free(stonith_history);
+    stonith_history = NULL;
+    pe_reset_working_set(mon_data_set);
     return TRUE;
 }
 
 void
-mon_st_callback(stonith_t * st, stonith_event_t * e)
+mon_st_callback_event(stonith_t * st, stonith_event_t * e)
 {
-    char *desc = crm_strdup_printf("Operation %s requested by %s for peer %s: %s (ref=%s)",
+    if (st->state == stonith_disconnected) {
+        /* disconnect cib as well and have everything reconnect */
+        mon_cib_connection_destroy(NULL);
+    } else {
+        char *desc = crm_strdup_printf("Operation %s requested by %s for peer %s: %s (ref=%s)",
                                  e->operation, e->origin, e->target, pcmk_strerror(e->result),
                                  e->id);
 
-    if (snmp_target) {
-        send_snmp_trap(e->target, NULL, e->operation, pcmk_ok, e->result, 0, desc);
+        if (snmp_target) {
+            send_snmp_trap(e->target, NULL, e->operation, pcmk_ok, e->result, 0, desc);
+        }
+        if (crm_mail_to) {
+            send_smtp_trap(e->target, NULL, e->operation, pcmk_ok, e->result, 0, desc);
+        }
+        if (external_agent) {
+            send_custom_trap(e->target, NULL, e->operation, pcmk_ok, e->result, 0, desc);
+        }
+        free(desc);
     }
-    if (crm_mail_to) {
-        send_smtp_trap(e->target, NULL, e->operation, pcmk_ok, e->result, 0, desc);
+}
+
+void kick_refresh(gboolean data_updated)
+{
+    static int updates = 0;
+    long now = time(NULL);
+
+    if (data_updated) {
+        updates++;
     }
-    if (external_agent) {
-        send_custom_trap(e->target, NULL, e->operation, pcmk_ok, e->result, 0, desc);
+
+    if(refresh_timer == NULL) {
+        refresh_timer = mainloop_timer_add("refresh", 2000, FALSE, mon_trigger_refresh, NULL);
     }
-    free(desc);
+
+    /* Refresh
+     * - immediately if the last update was more than 5s ago
+     * - every 10 cib-updates
+     * - at most 2s after the last update
+     */
+    if ((now - last_refresh) > (reconnect_msec / 1000)) {
+        mainloop_set_trigger(refresh_trigger);
+        mainloop_timer_stop(refresh_timer);
+        updates = 0;
+
+    } else if(updates >= 10) {
+        mainloop_set_trigger(refresh_trigger);
+        mainloop_timer_stop(refresh_timer);
+        updates = 0;
+
+    } else {
+        mainloop_timer_start(refresh_timer);
+    }
+}
+
+void
+mon_st_callback_display(stonith_t * st, stonith_event_t * e)
+{
+    if (st->state == stonith_disconnected) {
+        /* disconnect cib as well and have everything reconnect */
+        mon_cib_connection_destroy(NULL);
+    } else {
+        print_dot();
+        kick_refresh(TRUE);
+    }
+}
+
+void
+clean_up_connections(void)
+{
+    if (cib != NULL) {
+        cib->cmds->signoff(cib);
+        cib_delete(cib);
+        cib = NULL;
+    }
+
+    if (st != NULL) {
+        if (st->state != stonith_disconnected) {
+            st->cmds->remove_notification(st, T_STONITH_NOTIFY_DISCONNECT);
+            st->cmds->remove_notification(st, T_STONITH_NOTIFY_FENCE);
+            st->cmds->remove_notification(st, T_STONITH_NOTIFY_HISTORY);
+            st->cmds->disconnect(st);
+        }
+        stonith_api_delete(st);
+        st = NULL;
+    }
 }
 
 /*
- * De-init ncurses, signoff from the CIB and deallocate memory.
+ * De-init ncurses, disconnect from the CIB manager, disconnect fencing,
+ * deallocate memory and show usage-message if requested.
+ *
+ * We don't actually return, but nominally returning crm_exit_t allows a usage
+ * like "return clean_up(exit_code);" which helps static analysis understand the
+ * code flow.
  */
-void
-clean_up(int rc)
+static int
+clean_up(int exit_code)
 {
 #if ENABLE_SNMP
     netsnmp_session *session = crm_snmp_init(NULL, NULL);
@@ -4215,26 +4930,30 @@ clean_up(int rc)
 #endif
 
 #if CURSES_ENABLED
-    if (output_format == mon_output_console) {
+    if (curses_console_initialized) {
         output_format = mon_output_plain;
         echo();
         nocbreak();
         endwin();
+        curses_console_initialized = FALSE;
     }
 #endif
 
-    if (cib != NULL) {
-        cib->cmds->signoff(cib);
-        cib_delete(cib);
-        cib = NULL;
-    }
+    clean_up_connections();
 
     free(output_filename);
-    free(xml_file);
     free(pid_file);
 
-    if (rc >= 0) {
-        crm_exit(rc);
+    pe_free_working_set(mon_data_set);
+    mon_data_set = NULL;
+
+    if (exit_code == EX_USAGE) {
+        if (output_format == mon_output_cgi) {
+            fprintf(stdout, "Content-Type: text/plain\n"
+                            "Status: 500\n\n");
+        } else {
+            return crm_help('?', EX_USAGE);
+        }
     }
-    return;
+    return crm_exit(exit_code);
 }

@@ -167,7 +167,6 @@ create_ip_resource(
 
         // TODO: Other ops? Timeouts and intervals from underlying resource?
 
-        crm_log_xml_trace(xml_ip, "Container-ip");
         if (common_unpack(xml_ip, &tuple->ip, parent, data_set) == false) {
             return FALSE;
         }
@@ -326,7 +325,6 @@ create_docker_resource(
         crm_create_op_xml(xml_obj, ID(xml_docker), "monitor", "60s", NULL);
 
         // TODO: Other ops? Timeouts and intervals from underlying resource?
-        crm_log_xml_trace(xml_docker, "Container-docker");
         if (common_unpack(xml_docker, &tuple->docker, parent, data_set) == FALSE) {
             return FALSE;
         }
@@ -487,7 +485,6 @@ create_rkt_resource(
 
         // TODO: Other ops? Timeouts and intervals from underlying resource?
 
-        crm_log_xml_trace(xml_docker, "Container-rkt");
         if (common_unpack(xml_docker, &tuple->docker, parent, data_set) == FALSE) {
             return FALSE;
         }
@@ -621,7 +618,6 @@ create_remote_resource(
             copy->weight = -INFINITY;
             g_hash_table_insert(tuple->child->parent->allowed_nodes, (gpointer) tuple->node->details->id, copy);
         }
-        crm_log_xml_trace(xml_remote, "Container-remote");
         if (common_unpack(xml_remote, &tuple->remote, parent, data_set) == FALSE) {
             return FALSE;
         }
@@ -780,7 +776,6 @@ container_fix_remote_addr(resource_t *rsc)
     }
 
     for (int lpc = 0; lpc < DIMOF(attr_list); lpc++) {
-        name = attr_list[lpc];
         value = crm_element_value(rsc->xml, attr_list[lpc]);
         if (safe_str_eq(value, value_list[lpc]) == FALSE) {
             return FALSE;
@@ -815,11 +810,12 @@ container_fix_remote_addr_in(resource_t *rsc, xmlNode *xml, const char *field)
     }
 
     if(node == NULL) {
-        crm_trace("Cannot fix address for %s", tuple->remote->id);
+        crm_trace("Cannot determine address for bundle connection %s", rsc->id);
         return NULL;
     }
 
-    crm_trace("Fixing addr for %s on %s", rsc->id, node->details->uname);
+    crm_trace("Setting address for bundle connection %s to bundle host %s",
+              rsc->id, node->details->uname);
     if(xml != NULL && field != NULL) {
         crm_xml_add(xml, field, node->details->uname);
     }

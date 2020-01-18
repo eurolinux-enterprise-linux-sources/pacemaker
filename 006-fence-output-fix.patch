@@ -1,0 +1,143 @@
+From 70577be56d841d2f58545877d36f3c3eaeaaae63 Mon Sep 17 00:00:00 2001
+From: Klaus Wenninger <klaus.wenninger@aon.at>
+Date: Wed, 3 Apr 2019 16:11:20 +0200
+Subject: [PATCH] Fix: service-lib: avoid call-pattern leading to
+ use-after-free
+
+---
+ include/crm/services.h          |  8 +++++++-
+ lib/fencing/st_client.c         | 18 +++++++++++++++---
+ lib/services/services.c         | 13 ++++++++++++-
+ lib/services/services_linux.c   |  5 +++++
+ lib/services/services_private.h |  1 +
+ 5 files changed, 40 insertions(+), 5 deletions(-)
+
+diff --git a/include/crm/services.h b/include/crm/services.h
+index eddafc3..cbb2354 100644
+--- a/include/crm/services.h
++++ b/include/crm/services.h
+@@ -307,11 +307,17 @@ typedef struct svc_action_s {
+  *
+  * \param[in] op services action data
+  * \param[in] action_callback callback for when the action completes
++ * \param[in] action_fork_callback callback for when action forked successfully
+  *
+  * \retval TRUE succesfully started execution
+  * \retval FALSE failed to start execution, no callback will be received
+  */
+-    gboolean services_action_async(svc_action_t * op, void (*action_callback) (svc_action_t *));
++    gboolean services_action_async_fork_notify(svc_action_t * op,
++        void (*action_callback) (svc_action_t *),
++        void (*action_fork_callback) (svc_action_t *));
++
++    gboolean services_action_async(svc_action_t * op,
++                                   void (*action_callback) (svc_action_t *));
+ 
+     gboolean services_action_cancel(const char *name, const char *action, int interval);
+ 
+diff --git a/lib/fencing/st_client.c b/lib/fencing/st_client.c
+index 1c56cf4..0c1eadc 100644
+--- a/lib/fencing/st_client.c
++++ b/lib/fencing/st_client.c
+@@ -827,6 +827,18 @@ stonith_action_async_done(svc_action_t *svc_action)
+     stonith__destroy_action(action);
+ }
+ 
++static void
++stonith_action_async_forked(svc_action_t *svc_action)
++{
++    stonith_action_t *action = (stonith_action_t *) svc_action->cb_data;
++
++    action->pid = svc_action->pid;
++    action->svc_action = svc_action;
++
++    crm_trace("Child process %d performing action '%s' successfully forked",
++              action->pid, action->action);
++}
++
+ static int
+ internal_stonith_action_execute(stonith_action_t * action)
+ {
+@@ -873,12 +885,12 @@ internal_stonith_action_execute(stonith_action_t * action)
+ 
+     if (action->async) {
+         /* async */
+-        if(services_action_async(svc_action, &stonith_action_async_done) == FALSE) {
++        if(services_action_async_fork_notify(svc_action,
++            &stonith_action_async_done,
++            &stonith_action_async_forked) == FALSE) {
+             services_action_free(svc_action);
+             svc_action = NULL;
+         } else {
+-            action->pid = svc_action->pid;
+-            action->svc_action = svc_action;
+             rc = 0;
+         }
+ 
+diff --git a/lib/services/services.c b/lib/services/services.c
+index 60402e7..ef2c5fc 100644
+--- a/lib/services/services.c
++++ b/lib/services/services.c
+@@ -843,12 +843,17 @@ services_untrack_op(svc_action_t *op)
+ }
+ 
+ gboolean
+-services_action_async(svc_action_t * op, void (*action_callback) (svc_action_t *))
++services_action_async_fork_notify(svc_action_t * op,
++                                  void (*action_callback) (svc_action_t *),
++                                  void (*action_fork_callback) (svc_action_t *))
+ {
+     op->synchronous = false;
+     if (action_callback) {
+         op->opaque->callback = action_callback;
+     }
++    if (action_fork_callback) {
++        op->opaque->fork_callback = action_fork_callback;
++    }
+ 
+     if (op->interval > 0) {
+         init_recurring_actions();
+@@ -868,6 +873,12 @@ services_action_async(svc_action_t * op, void (*action_callback) (svc_action_t *
+     return action_exec_helper(op);
+ }
+ 
++gboolean
++services_action_async(svc_action_t * op,
++                      void (*action_callback) (svc_action_t *))
++{
++    return services_action_async_fork_notify(op, action_callback, NULL);
++}
+ 
+ static gboolean processing_blocked_ops = FALSE;
+ 
+diff --git a/lib/services/services_linux.c b/lib/services/services_linux.c
+index d79c16d..705901e 100644
+--- a/lib/services/services_linux.c
++++ b/lib/services/services_linux.c
+@@ -877,6 +877,11 @@ services_os_action_execute(svc_action_t * op)
+         op->opaque->stdin_fd = -1;
+     }
+ 
++    // after fds are setup properly and before we plug anything into mainloop
++    if (op->opaque->fork_callback) {
++        op->opaque->fork_callback(op);
++    }
++
+     if (op->synchronous) {
+         action_synced_wait(op, pmask);
+         sigchld_cleanup();
+diff --git a/lib/services/services_private.h b/lib/services/services_private.h
+index 9735da7..227e17f 100644
+--- a/lib/services/services_private.h
++++ b/lib/services/services_private.h
+@@ -36,6 +36,7 @@ struct svc_action_private_s {
+ 
+     guint repeat_timer;
+     void (*callback) (svc_action_t * op);
++    void (*fork_callback) (svc_action_t * op);
+ 
+     int stderr_fd;
+     mainloop_io_t *stderr_gsource;
+-- 
+1.8.3.1
+

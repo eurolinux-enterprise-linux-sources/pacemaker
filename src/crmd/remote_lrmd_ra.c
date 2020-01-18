@@ -85,6 +85,15 @@ typedef struct remote_ra_data_s {
                               * so we have it signalled back with the
                               * transition from pengine
                               */
+    gboolean controlling_guest; /* Similar for if we are controlling a guest
+                                 * or a bare-metal remote.
+                                 * Fortunately there is a meta-attribute in
+                                 * the transition already and as the
+                                 * situation doesn't change over time we can
+                                 * use the resource start for noting down
+                                 * the information for later use when the
+                                 * attributes aren't at hand.
+                                 */
 } remote_ra_data_t;
 
 static int handle_remote_ra_start(lrm_state_t * lrm_state, remote_ra_cmd_t * cmd, int timeout_ms);
@@ -510,7 +519,7 @@ synthesize_lrmd_success(lrm_state_t *lrm_state, const char *rsc_id, const char *
     op.t_run = time(NULL);
     op.t_rcchange = op.t_run;
     op.call_id = generate_callid();
-    process_lrm_event(lrm_state, &op, NULL);
+    process_lrm_event(lrm_state, &op, NULL, NULL);
 }
 
 void
@@ -521,11 +530,12 @@ remote_lrm_op_callback(lrmd_event_data_t * op)
     remote_ra_data_t *ra_data = NULL;
     remote_ra_cmd_t *cmd = NULL;
 
-    crm_debug("remote connection event - event_type:%s node:%s action:%s rc:%s op_status:%s",
-              lrmd_event_type2str(op->type),
-              op->remote_nodename,
-              op->op_type ? op->op_type : "none",
-              services_ocf_exitcode_str(op->rc), services_lrm_status_str(op->op_status));
+    crm_debug("Processing '%s%s%s' event on remote connection to %s: %s "
+              "(%d) status=%s (%d)",
+              (op->op_type? op->op_type : ""), (op->op_type? " " : ""),
+              lrmd_event_type2str(op->type), op->remote_nodename,
+              services_ocf_exitcode_str(op->rc), op->rc,
+              services_lrm_status_str(op->op_status), op->op_status);
 
     lrm_state = lrm_state_find(op->remote_nodename);
     if (!lrm_state || !lrm_state->remote_ra_data) {
@@ -560,16 +570,21 @@ remote_lrm_op_callback(lrmd_event_data_t * op)
         return;
     }
 
-    if ((op->type == lrmd_event_disconnect) &&
-        (ra_data->cur_cmd == NULL) &&
-        (ra_data->active == TRUE)) {
+    if ((op->type == lrmd_event_disconnect) && (ra_data->cur_cmd == NULL)) {
 
-        if (!remote_ra_is_in_maintenance(lrm_state)) {
-            crm_err("Unexpected disconnect on remote-node %s", lrm_state->node_name);
+        if (ra_data->active == FALSE) {
+            crm_debug("Disconnection from Pacemaker Remote node %s complete",
+                      lrm_state->node_name);
+
+        } else if (!remote_ra_is_in_maintenance(lrm_state)) {
+            crm_err("Lost connection to Pacemaker Remote node %s",
+                    lrm_state->node_name);
             ra_data->recurring_cmds = fail_all_monitor_cmds(ra_data->recurring_cmds);
             ra_data->cmds = fail_all_monitor_cmds(ra_data->cmds);
+
         } else {
-            crm_notice("Disconnect on unmanaged remote-node %s", lrm_state->node_name);
+            crm_notice("Unmanaged Pacemaker Remote node %s disconnected",
+                       lrm_state->node_name);
             /* Do roughly what a 'stop' on the remote-resource would do */
             handle_remote_ra_stop(lrm_state, NULL);
             remote_node_down(lrm_state->node_name, DOWN_KEEP_LRM);
@@ -721,14 +736,17 @@ handle_remote_ra_start(lrm_state_t * lrm_state, remote_ra_cmd_t * cmd, int timeo
     const char *server = NULL;
     lrmd_key_value_t *tmp = NULL;
     int port = 0;
+    remote_ra_data_t *ra_data = lrm_state->remote_ra_data;
     int timeout_used = timeout_ms > MAX_START_TIMEOUT_MS ? MAX_START_TIMEOUT_MS : timeout_ms;
 
     for (tmp = cmd->params; tmp; tmp = tmp->next) {
-        if (safe_str_eq(tmp->key, "addr") || safe_str_eq(tmp->key, "server")) {
+        if (safe_str_eq(tmp->key, XML_RSC_ATTR_REMOTE_RA_ADDR) ||
+            safe_str_eq(tmp->key, XML_RSC_ATTR_REMOTE_RA_SERVER)) {
             server = tmp->value;
-        }
-        if (safe_str_eq(tmp->key, "port")) {
+        } else if (safe_str_eq(tmp->key, XML_RSC_ATTR_REMOTE_RA_PORT)) {
             port = atoi(tmp->value);
+        } else if (safe_str_eq(tmp->key, CRM_META"_"XML_RSC_ATTR_CONTAINER)) {
+            ra_data->controlling_guest = TRUE;
         }
     }
 
@@ -1261,4 +1279,12 @@ remote_ra_is_in_maintenance(lrm_state_t * lrm_state)
     remote_ra_data_t *ra_data = lrm_state->remote_ra_data;
 
     return ra_data->is_maintenance;
+}
+
+gboolean
+remote_ra_controlling_guest(lrm_state_t * lrm_state)
+{
+    remote_ra_data_t *ra_data = lrm_state->remote_ra_data;
+
+    return ra_data->controlling_guest;
 }

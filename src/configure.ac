@@ -1163,7 +1163,7 @@ AC_DEFINE_UNQUOTED(RH_STONITH_PREFIX,"$RH_STONITH_PREFIX", Prefix for Red Hat St
 AC_PATH_PROGS(GIT, git false)
 AC_MSG_CHECKING(build version)
 
-BUILD_VERSION=c3c624ea3d
+BUILD_VERSION=3c4c782f70
 if test $BUILD_VERSION != ":%h$"; then
    AC_MSG_RESULT(archive hash: $BUILD_VERSION)
 
@@ -1713,6 +1713,7 @@ if test -n "$LIBGNUTLS_CONFIG"; then
 fi
 AC_CHECK_LIB(gnutls, gnutls_init)
 AC_CHECK_FUNCS(gnutls_priority_set_direct)
+ AC_CHECK_FUNCS([gnutls_sec_param_to_pk_bits]) dnl since 2.12.0 (2011-03-24)
 
 AC_SUBST(GNUTLSHEAD)
 AC_SUBST(GNUTLSLIBS)
@@ -2067,6 +2068,7 @@ cts/Makefile					        	\
 	cts/benchmark/Makefile					\
 	cts/benchmark/clubench					\
 	cts/lxc_autogen.sh					\
+	cts/pacemaker-cts-dummyd.service			\
 cib/Makefile							\
 attrd/Makefile							\
 crmd/Makefile							\
@@ -2120,6 +2122,7 @@ extra/Makefile							\
 	extra/logrotate/pacemaker				\
 tools/Makefile							\
 	tools/crm_report					\
+        tools/report.collector                                  \
         tools/report.common                                     \
 	tools/cibsecret						\
 	tools/crm_mon.service					\
@@ -2127,6 +2130,8 @@ tools/Makefile							\
 xml/Makefile							\
 lib/gnu/Makefile						\
 		)
+
+AC_CONFIG_FILES([cts/pacemaker-cts-dummyd], [chmod +x cts/pacemaker-cts-dummyd])
 
 dnl Now process the entire list of files added by previous
 dnl  calls to AC_CONFIG_FILES()

@@ -1,0 +1,602 @@
+From d14fb0110208f270491c696bea0072300db2a947 Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Fri, 29 Mar 2019 12:37:13 -0500
+Subject: [PATCH 1/6] Refactor: scheduler: functionize handling of restart
+ ordering
+
+for readability
+---
+ pengine/native.c | 97 +++++++++++++++++++++++++++++++++++---------------------
+ 1 file changed, 60 insertions(+), 37 deletions(-)
+
+diff --git a/pengine/native.c b/pengine/native.c
+index 2f8c011..653a93a 100644
+--- a/pengine/native.c
++++ b/pengine/native.c
+@@ -1942,6 +1942,65 @@ native_action_flags(action_t * action, node_t * node)
+     return action->flags;
+ }
+ 
++static inline bool
++is_primitive_action(pe_action_t *action)
++{
++    return action && action->rsc && (action->rsc->variant == pe_native);
++}
++
++/*!
++ * \internal
++ * \brief Set action bits appropriately when pe_restart_order is used
++ *
++ * \param[in] first   'First' action in an ordering with pe_restart_order
++ * \param[in] then    'Then' action in an ordering with pe_restart_order
++ * \param[in] filter  What ordering flags to care about
++ *
++ * \note pe_restart_order is set for "stop resource before starting it" and
++ *       "stop later group member before stopping earlier group member"
++ */
++static void
++handle_restart_ordering(pe_action_t *first, pe_action_t *then,
++                        enum pe_action_flags filter)
++{
++    const char *reason = NULL;
++
++    CRM_ASSERT(is_primitive_action(first));
++    CRM_ASSERT(is_primitive_action(then));
++
++    if ((filter & pe_action_runnable)
++        && (then->flags & pe_action_runnable) == 0
++        && (then->rsc->flags & pe_rsc_managed)) {
++        reason = "shutdown";
++    }
++
++    if ((filter & pe_action_optional) && (then->flags & pe_action_optional) == 0) {
++        reason = "recover";
++    }
++
++    if (reason && is_set(first->flags, pe_action_optional)) {
++        if (is_set(first->flags, pe_action_runnable)
++            || is_not_set(then->flags, pe_action_optional)) {
++            pe_rsc_trace(first->rsc, "Handling %s: %s -> %s", reason, first->uuid, then->uuid);
++            pe_action_implies(first, then, pe_action_optional);
++        }
++    }
++
++    if (reason && is_not_set(first->flags, pe_action_optional)
++        && is_not_set(first->flags, pe_action_runnable)) {
++        pe_rsc_trace(then->rsc, "Handling %s: %s -> %s", reason, first->uuid, then->uuid);
++        pe_action_implies(then, first, pe_action_runnable);
++    }
++
++    if (reason &&
++        is_not_set(first->flags, pe_action_optional) &&
++        is_set(first->flags, pe_action_migrate_runnable)  &&
++        is_not_set(then->flags, pe_action_migrate_runnable)) {
++
++        pe_action_implies(first, then, pe_action_migrate_runnable);
++    }
++}
++
+ enum pe_graph_flags
+ native_update_actions(action_t * first, action_t * then, node_t * node, enum pe_action_flags flags,
+                       enum pe_action_flags filter, enum pe_ordering type)
+@@ -2069,43 +2128,7 @@ native_update_actions(action_t * first, action_t * then, node_t * node, enum pe_
+     }
+ 
+     if (is_set(type, pe_order_restart)) {
+-        const char *reason = NULL;
+-
+-        CRM_ASSERT(first->rsc && first->rsc->variant == pe_native);
+-        CRM_ASSERT(then->rsc && then->rsc->variant == pe_native);
+-
+-        if ((filter & pe_action_runnable)
+-            && (then->flags & pe_action_runnable) == 0
+-            && (then->rsc->flags & pe_rsc_managed)) {
+-            reason = "shutdown";
+-        }
+-
+-        if ((filter & pe_action_optional) && (then->flags & pe_action_optional) == 0) {
+-            reason = "recover";
+-        }
+-
+-        if (reason && is_set(first->flags, pe_action_optional)) {
+-            if (is_set(first->flags, pe_action_runnable)
+-                || is_not_set(then->flags, pe_action_optional)) {
+-                pe_rsc_trace(first->rsc, "Handling %s: %s -> %s", reason, first->uuid, then->uuid);
+-                pe_action_implies(first, then, pe_action_optional);
+-            }
+-        }
+-
+-        if (reason && is_not_set(first->flags, pe_action_optional)
+-            && is_not_set(first->flags, pe_action_runnable)) {
+-            pe_rsc_trace(then->rsc, "Handling %s: %s -> %s", reason, first->uuid, then->uuid);
+-            pe_action_implies(then, first, pe_action_runnable);
+-        }
+-
+-        if (reason &&
+-            is_not_set(first->flags, pe_action_optional) &&
+-            is_set(first->flags, pe_action_migrate_runnable)  &&
+-            is_not_set(then->flags, pe_action_migrate_runnable)) {
+-
+-            pe_action_implies(first, then, pe_action_migrate_runnable);
+-        }
+-
++        handle_restart_ordering(first, then, filter);
+     }
+ 
+     if (then_flags != then->flags) {
+-- 
+1.8.3.1
+
+
+From dda6a0eb480c8a3079b5c15176e27ed62f98a6ac Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Fri, 29 Mar 2019 17:46:44 -0500
+Subject: [PATCH 2/6] Refactor: scheduler: use is_set()/is_not_set() in restart
+ ordering
+
+instead of direct bit comparisons, for readability and consistency
+---
+ pengine/native.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/pengine/native.c b/pengine/native.c
+index 653a93a..f43d3cf 100644
+--- a/pengine/native.c
++++ b/pengine/native.c
+@@ -1968,13 +1968,14 @@ handle_restart_ordering(pe_action_t *first, pe_action_t *then,
+     CRM_ASSERT(is_primitive_action(first));
+     CRM_ASSERT(is_primitive_action(then));
+ 
+-    if ((filter & pe_action_runnable)
+-        && (then->flags & pe_action_runnable) == 0
+-        && (then->rsc->flags & pe_rsc_managed)) {
++    if (is_set(filter, pe_action_runnable)
++        && is_not_set(then->flags, pe_action_runnable)
++        && is_set(then->rsc->flags, pe_rsc_managed)) {
+         reason = "shutdown";
+     }
+ 
+-    if ((filter & pe_action_optional) && (then->flags & pe_action_optional) == 0) {
++    if (is_set(filter, pe_action_optional)
++        && is_not_set(then->flags, pe_action_optional)) {
+         reason = "recover";
+     }
+ 
+-- 
+1.8.3.1
+
+
+From 69951375e4af9d1d1152980afddc94bb5881af5a Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Fri, 29 Mar 2019 17:49:10 -0500
+Subject: [PATCH 3/6] Log: scheduler: improve restart ordering trace logs
+
+---
+ pengine/native.c | 28 ++++++++++++++++++----------
+ 1 file changed, 18 insertions(+), 10 deletions(-)
+
+diff --git a/pengine/native.c b/pengine/native.c
+index f43d3cf..dfcc910 100644
+--- a/pengine/native.c
++++ b/pengine/native.c
+@@ -1968,33 +1968,41 @@ handle_restart_ordering(pe_action_t *first, pe_action_t *then,
+     CRM_ASSERT(is_primitive_action(first));
+     CRM_ASSERT(is_primitive_action(then));
+ 
++    // We need to update the action in two cases:
++
++    // ... if 'then' is required
++    if (is_set(filter, pe_action_optional)
++        && is_not_set(then->flags, pe_action_optional)) {
++        reason = "restart";
++    }
++
++    // ... if 'then' is managed but unrunnable
+     if (is_set(filter, pe_action_runnable)
+         && is_not_set(then->flags, pe_action_runnable)
+         && is_set(then->rsc->flags, pe_rsc_managed)) {
+-        reason = "shutdown";
++        reason = "stop";
+     }
+ 
+-    if (is_set(filter, pe_action_optional)
+-        && is_not_set(then->flags, pe_action_optional)) {
+-        reason = "recover";
++    if (reason == NULL) {
++        return;
+     }
+ 
+-    if (reason && is_set(first->flags, pe_action_optional)) {
++    pe_rsc_trace(first->rsc, "Handling %s -> %s for %s",
++                 first->uuid, then->uuid, reason);
++
++    if (is_set(first->flags, pe_action_optional)) {
+         if (is_set(first->flags, pe_action_runnable)
+             || is_not_set(then->flags, pe_action_optional)) {
+-            pe_rsc_trace(first->rsc, "Handling %s: %s -> %s", reason, first->uuid, then->uuid);
+             pe_action_implies(first, then, pe_action_optional);
+         }
+     }
+ 
+-    if (reason && is_not_set(first->flags, pe_action_optional)
++    if (is_not_set(first->flags, pe_action_optional)
+         && is_not_set(first->flags, pe_action_runnable)) {
+-        pe_rsc_trace(then->rsc, "Handling %s: %s -> %s", reason, first->uuid, then->uuid);
+         pe_action_implies(then, first, pe_action_runnable);
+     }
+ 
+-    if (reason &&
+-        is_not_set(first->flags, pe_action_optional) &&
++    if (is_not_set(first->flags, pe_action_optional) &&
+         is_set(first->flags, pe_action_migrate_runnable)  &&
+         is_not_set(then->flags, pe_action_migrate_runnable)) {
+ 
+-- 
+1.8.3.1
+
+
+From 32da90e58a89d7f9f3cd6d1e3f961c24b646d734 Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Fri, 29 Mar 2019 17:50:07 -0500
+Subject: [PATCH 4/6] Refactor: scheduler: simplify handling of restart
+ ordering
+
+Don't condition pe_action_implies() on the desired state not being already
+present, because pe_action_implies() handles that.
+
+Don't condition clearing first's pe_action_migrate_runnable on first being
+required, because if it's optional it doesn't matter, and if (now or in the
+future) optional can be changed to required later, it will actually be
+important.
+---
+ pengine/native.c | 27 +++++++++++++++------------
+ 1 file changed, 15 insertions(+), 12 deletions(-)
+
+diff --git a/pengine/native.c b/pengine/native.c
+index dfcc910..8912aa1 100644
+--- a/pengine/native.c
++++ b/pengine/native.c
+@@ -1980,6 +1980,7 @@ handle_restart_ordering(pe_action_t *first, pe_action_t *then,
+     if (is_set(filter, pe_action_runnable)
+         && is_not_set(then->flags, pe_action_runnable)
+         && is_set(then->rsc->flags, pe_rsc_managed)) {
++        // If a resource should restart but can't start, we still want to stop
+         reason = "stop";
+     }
+ 
+@@ -1990,24 +1991,26 @@ handle_restart_ordering(pe_action_t *first, pe_action_t *then,
+     pe_rsc_trace(first->rsc, "Handling %s -> %s for %s",
+                  first->uuid, then->uuid, reason);
+ 
+-    if (is_set(first->flags, pe_action_optional)) {
+-        if (is_set(first->flags, pe_action_runnable)
+-            || is_not_set(then->flags, pe_action_optional)) {
+-            pe_action_implies(first, then, pe_action_optional);
+-        }
++    // Make 'first' required if it is runnable
++    if (is_set(first->flags, pe_action_runnable)) {
++        pe_action_implies(first, then, pe_action_optional);
+     }
+ 
+-    if (is_not_set(first->flags, pe_action_optional)
+-        && is_not_set(first->flags, pe_action_runnable)) {
+-        pe_action_implies(then, first, pe_action_runnable);
++    // Make 'first' required if 'then' is required
++    if (is_not_set(then->flags, pe_action_optional)) {
++        pe_action_implies(first, then, pe_action_optional);
+     }
+ 
+-    if (is_not_set(first->flags, pe_action_optional) &&
+-        is_set(first->flags, pe_action_migrate_runnable)  &&
+-        is_not_set(then->flags, pe_action_migrate_runnable)) {
+-
++    // Make 'first' unmigratable if 'then' is unmigratable
++    if (is_not_set(then->flags, pe_action_migrate_runnable)) {
+         pe_action_implies(first, then, pe_action_migrate_runnable);
+     }
++
++    // Make 'then' unrunnable if 'first' is required but unrunnable
++    if (is_not_set(first->flags, pe_action_optional)
++        && is_not_set(first->flags, pe_action_runnable)) {
++        pe_action_implies(then, first, pe_action_runnable);
++    }
+ }
+ 
+ enum pe_graph_flags
+-- 
+1.8.3.1
+
+
+From 8cfe743d4373fad6b4e50ee64894a16f7f24afa1 Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Fri, 29 Mar 2019 19:11:25 -0500
+Subject: [PATCH 5/6] Fix: scheduler: one group stop shouldn't make another
+ required
+
+1.1.7's 8d2f237d reused pe_order_restart ("stop resource before stopping it")
+for "stop later group member before stopping earlier group member".
+
+pe_order_restart includes a check for an unrunnable 'then', because in a
+restart, even if the start is unrunnable, we still want to perform the stop.
+However this check does not make sense for group stop ordering, and as of
+1.1.10, this caused a regression where a group member could be unnecessarily
+stopped.
+
+Example scenario: if a resource is ordered after a group member, and the
+resource failed with on-fail=block, that would make the group member's
+(optional) stop blocked as well, and that blocked stop would unnecessarily make
+stops of later group members required.
+
+This commit fixes the issue by only applying the check when the 'then' action
+is a start. (RHBZ#1609453)
+---
+ pengine/native.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/pengine/native.c b/pengine/native.c
+index 8912aa1..747cb10 100644
+--- a/pengine/native.c
++++ b/pengine/native.c
+@@ -1976,11 +1976,13 @@ handle_restart_ordering(pe_action_t *first, pe_action_t *then,
+         reason = "restart";
+     }
+ 
+-    // ... if 'then' is managed but unrunnable
++    /* ... if 'then' is unrunnable start of managed resource (if a resource
++     * should restart but can't start, we still want to stop)
++     */
+     if (is_set(filter, pe_action_runnable)
+         && is_not_set(then->flags, pe_action_runnable)
+-        && is_set(then->rsc->flags, pe_rsc_managed)) {
+-        // If a resource should restart but can't start, we still want to stop
++        && is_set(then->rsc->flags, pe_rsc_managed)
++        && safe_str_eq(then->task, RSC_START)) {
+         reason = "stop";
+     }
+ 
+-- 
+1.8.3.1
+
+
+From b8e388eff56143632ef848d52eddad9560aad2cf Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Fri, 29 Mar 2019 19:44:39 -0500
+Subject: [PATCH 6/6] Test: scheduler: one group stop shouldn't make another
+ required
+
+---
+ pengine/regression.sh                      |   1 +
+ pengine/test10/group-stop-ordering.dot     |   2 +
+ pengine/test10/group-stop-ordering.exp     |   1 +
+ pengine/test10/group-stop-ordering.scores  |  17 ++++
+ pengine/test10/group-stop-ordering.summary |  25 ++++++
+ pengine/test10/group-stop-ordering.xml     | 132 +++++++++++++++++++++++++++++
+ 6 files changed, 178 insertions(+)
+ create mode 100644 pengine/test10/group-stop-ordering.dot
+ create mode 100644 pengine/test10/group-stop-ordering.exp
+ create mode 100644 pengine/test10/group-stop-ordering.scores
+ create mode 100644 pengine/test10/group-stop-ordering.summary
+ create mode 100644 pengine/test10/group-stop-ordering.xml
+
+diff --git a/pengine/regression.sh b/pengine/regression.sh
+index e25990d..504de46 100755
+--- a/pengine/regression.sh
++++ b/pengine/regression.sh
+@@ -68,6 +68,7 @@ do_test group-fail "Ensure stop order is preserved for partially active groups"
+ do_test group-unmanaged "No need to restart r115 because r114 is unmanaged"
+ do_test group-unmanaged-stopped "Make sure r115 is stopped when r114 fails"
+ do_test group-dependents "Account for the location preferences of things colocated with a group"
++do_test group-stop-ordering "Ensure blocked group member stop does not force other member stops"
+ 
+ echo ""
+ do_test rsc_dep1 "Must not     "
+diff --git a/pengine/test10/group-stop-ordering.dot b/pengine/test10/group-stop-ordering.dot
+new file mode 100644
+index 0000000..4b30191
+--- /dev/null
++++ b/pengine/test10/group-stop-ordering.dot
+@@ -0,0 +1,2 @@
++digraph "g" {
++}
+diff --git a/pengine/test10/group-stop-ordering.exp b/pengine/test10/group-stop-ordering.exp
+new file mode 100644
+index 0000000..56e315f
+--- /dev/null
++++ b/pengine/test10/group-stop-ordering.exp
+@@ -0,0 +1 @@
++<transition_graph cluster-delay="60s" stonith-timeout="60s" failed-stop-offset="INFINITY" failed-start-offset="INFINITY"  transition_id="0"/>
+diff --git a/pengine/test10/group-stop-ordering.scores b/pengine/test10/group-stop-ordering.scores
+new file mode 100644
+index 0000000..5f144d2
+--- /dev/null
++++ b/pengine/test10/group-stop-ordering.scores
+@@ -0,0 +1,17 @@
++Allocation scores:
++group_color: grp allocation score on fastvm-rhel-7-5-73: 0
++group_color: grp allocation score on fastvm-rhel-7-5-74: 0
++group_color: inside_resource_2 allocation score on fastvm-rhel-7-5-73: 0
++group_color: inside_resource_2 allocation score on fastvm-rhel-7-5-74: 0
++group_color: inside_resource_3 allocation score on fastvm-rhel-7-5-73: 0
++group_color: inside_resource_3 allocation score on fastvm-rhel-7-5-74: 0
++native_color: fence-fastvm-rhel-7-5-73 allocation score on fastvm-rhel-7-5-73: -INFINITY
++native_color: fence-fastvm-rhel-7-5-73 allocation score on fastvm-rhel-7-5-74: 0
++native_color: fence-fastvm-rhel-7-5-74 allocation score on fastvm-rhel-7-5-73: 0
++native_color: fence-fastvm-rhel-7-5-74 allocation score on fastvm-rhel-7-5-74: -INFINITY
++native_color: inside_resource_2 allocation score on fastvm-rhel-7-5-73: 0
++native_color: inside_resource_2 allocation score on fastvm-rhel-7-5-74: 0
++native_color: inside_resource_3 allocation score on fastvm-rhel-7-5-73: -INFINITY
++native_color: inside_resource_3 allocation score on fastvm-rhel-7-5-74: 0
++native_color: outside_resource allocation score on fastvm-rhel-7-5-73: INFINITY
++native_color: outside_resource allocation score on fastvm-rhel-7-5-74: 0
+diff --git a/pengine/test10/group-stop-ordering.summary b/pengine/test10/group-stop-ordering.summary
+new file mode 100644
+index 0000000..0ec8eb6
+--- /dev/null
++++ b/pengine/test10/group-stop-ordering.summary
+@@ -0,0 +1,25 @@
++
++Current cluster status:
++Online: [ fastvm-rhel-7-5-73 fastvm-rhel-7-5-74 ]
++
++ fence-fastvm-rhel-7-5-73	(stonith:fence_xvm):	Started fastvm-rhel-7-5-74
++ fence-fastvm-rhel-7-5-74	(stonith:fence_xvm):	Started fastvm-rhel-7-5-73
++ outside_resource	(ocf::pacemaker:Dummy):	FAILED fastvm-rhel-7-5-73 (blocked)
++ Resource Group: grp
++     inside_resource_2	(ocf::pacemaker:Dummy):	Started fastvm-rhel-7-5-74
++     inside_resource_3	(ocf::pacemaker:Dummy):	Started fastvm-rhel-7-5-74
++
++Transition Summary:
++
++Executing cluster transition:
++
++Revised cluster status:
++Online: [ fastvm-rhel-7-5-73 fastvm-rhel-7-5-74 ]
++
++ fence-fastvm-rhel-7-5-73	(stonith:fence_xvm):	Started fastvm-rhel-7-5-74
++ fence-fastvm-rhel-7-5-74	(stonith:fence_xvm):	Started fastvm-rhel-7-5-73
++ outside_resource	(ocf::pacemaker:Dummy):	FAILED fastvm-rhel-7-5-73 (blocked)
++ Resource Group: grp
++     inside_resource_2	(ocf::pacemaker:Dummy):	Started fastvm-rhel-7-5-74
++     inside_resource_3	(ocf::pacemaker:Dummy):	Started fastvm-rhel-7-5-74
++
+diff --git a/pengine/test10/group-stop-ordering.xml b/pengine/test10/group-stop-ordering.xml
+new file mode 100644
+index 0000000..8439c1f
+--- /dev/null
++++ b/pengine/test10/group-stop-ordering.xml
+@@ -0,0 +1,132 @@
++<cib crm_feature_set="3.0.14" validate-with="pacemaker-2.10" epoch="32" num_updates="15" admin_epoch="0" cib-last-written="Sat Jul 28 03:06:46 2018" update-origin="fastvm-rhel-7-5-73" update-client="crmd" update-user="hacluster" have-quorum="1" dc-uuid="1">
++  <configuration>
++    <crm_config>
++      <cluster_property_set id="cib-bootstrap-options">
++        <nvpair id="cib-bootstrap-options-have-watchdog" name="have-watchdog" value="false"/>
++        <nvpair id="cib-bootstrap-options-dc-version" name="dc-version" value="1.1.18-11.el7_5.3-2b07d5c5a9"/>
++        <nvpair id="cib-bootstrap-options-cluster-infrastructure" name="cluster-infrastructure" value="corosync"/>
++        <nvpair id="cib-bootstrap-options-cluster-name" name="cluster-name" value="cluster"/>
++        <nvpair id="cib-bootstrap-options-last-lrm-refresh" name="last-lrm-refresh" value="1532740006"/>
++      </cluster_property_set>
++    </crm_config>
++    <nodes>
++      <node id="1" uname="fastvm-rhel-7-5-73"/>
++      <node id="2" uname="fastvm-rhel-7-5-74"/>
++    </nodes>
++    <resources>
++      <primitive class="stonith" id="fence-fastvm-rhel-7-5-73" type="fence_xvm">
++        <instance_attributes id="fence-fastvm-rhel-7-5-73-instance_attributes">
++          <nvpair id="fence-fastvm-rhel-7-5-73-instance_attributes-pcmk_host_map" name="pcmk_host_map" value="fastvm-rhel-7-5-73:fastvm-rhel-7.5-73;"/>
++        </instance_attributes>
++        <operations>
++          <op id="fence-fastvm-rhel-7-5-73-monitor-interval-30s" interval="30s" name="monitor"/>
++        </operations>
++      </primitive>
++      <primitive class="stonith" id="fence-fastvm-rhel-7-5-74" type="fence_xvm">
++        <instance_attributes id="fence-fastvm-rhel-7-5-74-instance_attributes">
++          <nvpair id="fence-fastvm-rhel-7-5-74-instance_attributes-pcmk_host_map" name="pcmk_host_map" value="fastvm-rhel-7-5-74:fastvm-rhel-7.5-74;"/>
++        </instance_attributes>
++        <operations>
++          <op id="fence-fastvm-rhel-7-5-74-monitor-interval-30s" interval="30s" name="monitor"/>
++        </operations>
++      </primitive>
++      <primitive class="ocf" id="outside_resource" provider="pacemaker" type="Dummy">
++        <operations>
++          <op id="outside_resource-migrate_from-interval-0s" interval="0s" name="migrate_from" timeout="20"/>
++          <op id="outside_resource-migrate_to-interval-0s" interval="0s" name="migrate_to" timeout="20"/>
++          <op id="outside_resource-monitor-interval-10" interval="10" name="monitor" on-fail="block"/>
++          <op id="outside_resource-reload-interval-0s" interval="0s" name="reload" timeout="20"/>
++          <op id="outside_resource-start-interval-0s" interval="0s" name="start" timeout="20"/>
++          <op id="outside_resource-stop-interval-0s" interval="0s" name="stop" timeout="20"/>
++        </operations>
++        <meta_attributes id="outside_resource-meta_attributes"/>
++      </primitive>
++      <group id="grp">
++        <primitive class="ocf" id="inside_resource_2" provider="pacemaker" type="Dummy">
++          <operations>
++            <op id="inside_resource_2-migrate_from-interval-0s" interval="0s" name="migrate_from" timeout="20"/>
++            <op id="inside_resource_2-migrate_to-interval-0s" interval="0s" name="migrate_to" timeout="20"/>
++            <op id="inside_resource_2-monitor-interval-10" interval="10" name="monitor" timeout="20"/>
++            <op id="inside_resource_2-reload-interval-0s" interval="0s" name="reload" timeout="20"/>
++            <op id="inside_resource_2-start-interval-0s" interval="0s" name="start" timeout="20"/>
++            <op id="inside_resource_2-stop-interval-0s" interval="0s" name="stop" timeout="20"/>
++          </operations>
++        </primitive>
++        <primitive class="ocf" id="inside_resource_3" provider="pacemaker" type="Dummy">
++          <operations>
++            <op id="inside_resource_3-migrate_from-interval-0s" interval="0s" name="migrate_from" timeout="20"/>
++            <op id="inside_resource_3-migrate_to-interval-0s" interval="0s" name="migrate_to" timeout="20"/>
++            <op id="inside_resource_3-monitor-interval-10" interval="10" name="monitor" timeout="20"/>
++            <op id="inside_resource_3-reload-interval-0s" interval="0s" name="reload" timeout="20"/>
++            <op id="inside_resource_3-start-interval-0s" interval="0s" name="start" timeout="20"/>
++            <op id="inside_resource_3-stop-interval-0s" interval="0s" name="stop" timeout="20"/>
++          </operations>
++        </primitive>
++      </group>
++    </resources>
++    <constraints>
++      <rsc_location id="location-fence-fastvm-rhel-7-5-73-fastvm-rhel-7-5-73--INFINITY" node="fastvm-rhel-7-5-73" rsc="fence-fastvm-rhel-7-5-73" score="-INFINITY"/>
++      <rsc_location id="location-fence-fastvm-rhel-7-5-74-fastvm-rhel-7-5-74--INFINITY" node="fastvm-rhel-7-5-74" rsc="fence-fastvm-rhel-7-5-74" score="-INFINITY"/>
++      <rsc_order first="inside_resource_2" first-action="start" id="order-inside_resource_2-outside_resource-mandatory" then="outside_resource" then-action="start"/>
++    </constraints>
++  </configuration>
++  <status>
++    <node_state id="1" uname="fastvm-rhel-7-5-73" in_ccm="true" crmd="online" crm-debug-origin="do_update_resource" join="member" expected="member">
++      <lrm id="1">
++        <lrm_resources>
++          <lrm_resource id="fence-fastvm-rhel-7-5-73" type="fence_xvm" class="stonith">
++            <lrm_rsc_op id="fence-fastvm-rhel-7-5-73_last_0" operation_key="fence-fastvm-rhel-7-5-73_monitor_0" operation="monitor" crm-debug-origin="do_update_resource" crm_feature_set="3.0.14" transition-key="2:0:7:6895fb61-9ed3-458d-8207-59cfaf0c8079" transition-magic="0:7;2:0:7:6895fb61-9ed3-458d-8207-59cfaf0c8079" exit-reason="" on_node="fastvm-rhel-7-5-73" call-id="5" rc-code="7" op-status="0" interval="0" last-run="1532677735" last-rc-change="1532677735" exec-time="2" queue-time="0" op-digest="19df1a0b16e49519b6ad60ced7864b32"/>
++          </lrm_resource>
++          <lrm_resource id="fence-fastvm-rhel-7-5-74" type="fence_xvm" class="stonith">
++            <lrm_rsc_op id="fence-fastvm-rhel-7-5-74_last_0" operation_key="fence-fastvm-rhel-7-5-74_start_0" operation="start" crm-debug-origin="do_update_resource" crm_feature_set="3.0.14" transition-key="10:1:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" transition-magic="0:0;10:1:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" exit-reason="" on_node="fastvm-rhel-7-5-73" call-id="10" rc-code="0" op-status="0" interval="0" last-run="1532677735" last-rc-change="1532677735" exec-time="34" queue-time="0" op-digest="0b321829ad4a026df6dcad0efa304d0d"/>
++            <lrm_rsc_op id="fence-fastvm-rhel-7-5-74_monitor_30000" operation_key="fence-fastvm-rhel-7-5-74_monitor_30000" operation="monitor" crm-debug-origin="do_update_resource" crm_feature_set="3.0.14" transition-key="11:1:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" transition-magic="0:0;11:1:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" exit-reason="" on_node="fastvm-rhel-7-5-73" call-id="19" rc-code="0" op-status="0" interval="30000" last-rc-change="1532677735" exec-time="27" queue-time="0" op-digest="37581a67508cb0e5baab51caa4d57481"/>
++          </lrm_resource>
++          <lrm_resource id="inside_resource_2" type="Dummy" class="ocf" provider="pacemaker">
++            <lrm_rsc_op id="inside_resource_2_last_0" operation_key="inside_resource_2_stop_0" operation="stop" crm-debug-origin="do_update_resource" crm_feature_set="3.0.14" transition-key="12:40:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" transition-magic="0:0;12:40:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" exit-reason="" on_node="fastvm-rhel-7-5-73" call-id="119" rc-code="0" op-status="0" interval="0" last-run="1532679131" last-rc-change="1532679131" exec-time="15" queue-time="0" op-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8" op-force-restart=" envfile  op_sleep  passwd  state " op-restart-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8" op-secure-params=" passwd " op-secure-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8"/>
++            <lrm_rsc_op id="inside_resource_2_monitor_10000" operation_key="inside_resource_2_monitor_10000" operation="monitor" crm-debug-origin="do_update_resource" crm_feature_set="3.0.14" transition-key="12:34:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" transition-magic="0:0;12:34:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" exit-reason="" on_node="fastvm-rhel-7-5-73" call-id="98" rc-code="0" op-status="0" interval="10000" last-rc-change="1532679034" exec-time="16" queue-time="0" op-digest="4811cef7f7f94e3a35a70be7916cb2fd" op-secure-params=" passwd " op-secure-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8"/>
++          </lrm_resource>
++          <lrm_resource id="inside_resource_3" type="Dummy" class="ocf" provider="pacemaker">
++            <lrm_rsc_op id="inside_resource_3_last_0" operation_key="inside_resource_3_stop_0" operation="stop" crm-debug-origin="do_update_resource" crm_feature_set="3.0.14" transition-key="15:38:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" transition-magic="0:0;15:38:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" exit-reason="" on_node="fastvm-rhel-7-5-73" call-id="111" rc-code="0" op-status="0" interval="0" last-run="1532679120" last-rc-change="1532679120" exec-time="14" queue-time="0" op-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8" op-force-restart=" envfile  op_sleep  passwd  state " op-restart-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8" op-secure-params=" passwd " op-secure-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8"/>
++            <lrm_rsc_op id="inside_resource_3_monitor_10000" operation_key="inside_resource_3_monitor_10000" operation="monitor" crm-debug-origin="do_update_resource" crm_feature_set="3.0.14" transition-key="3:37:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" transition-magic="0:0;3:37:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" exit-reason="" on_node="fastvm-rhel-7-5-73" call-id="109" rc-code="0" op-status="0" interval="10000" last-rc-change="1532679109" exec-time="11" queue-time="0" op-digest="4811cef7f7f94e3a35a70be7916cb2fd" op-secure-params=" passwd " op-secure-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8"/>
++          </lrm_resource>
++          <lrm_resource id="outside_resource" type="Dummy" class="ocf" provider="pacemaker">
++            <lrm_rsc_op id="outside_resource_last_0" operation_key="outside_resource_start_0" operation="start" crm-debug-origin="do_update_resource" crm_feature_set="3.0.14" transition-key="11:111:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" transition-magic="0:0;11:111:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" exit-reason="" on_node="fastvm-rhel-7-5-73" call-id="128" rc-code="0" op-status="0" interval="0" last-run="1532740007" last-rc-change="1532740007" exec-time="12" queue-time="0" op-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8" op-force-restart=" envfile  op_sleep  passwd  state " op-restart-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8" op-secure-params=" passwd " op-secure-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8"/>
++            <lrm_rsc_op id="outside_resource_monitor_10000" operation_key="outside_resource_monitor_10000" operation="monitor" crm-debug-origin="do_update_resource" crm_feature_set="3.0.14" transition-key="12:111:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" transition-magic="0:0;12:111:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" exit-reason="" on_node="fastvm-rhel-7-5-73" call-id="129" rc-code="0" op-status="0" interval="10000" last-rc-change="1532740007" exec-time="11" queue-time="0" op-digest="4811cef7f7f94e3a35a70be7916cb2fd" op-secure-params=" passwd " op-secure-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8"/>
++            <lrm_rsc_op id="outside_resource_last_failure_0" operation_key="outside_resource_monitor_10000" operation="monitor" crm-debug-origin="do_update_resource" crm_feature_set="3.0.14" transition-key="12:111:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" transition-magic="0:7;12:111:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" exit-reason="" on_node="fastvm-rhel-7-5-73" call-id="129" rc-code="7" op-status="0" interval="10000" last-rc-change="1532740638" exec-time="0" queue-time="0" op-digest="4811cef7f7f94e3a35a70be7916cb2fd" op-secure-params=" passwd " op-secure-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8"/>
++          </lrm_resource>
++        </lrm_resources>
++      </lrm>
++      <transient_attributes id="1">
++        <instance_attributes id="status-1">
++          <nvpair id="status-1-fail-count-outside_resource.monitor_10000" name="fail-count-outside_resource#monitor_10000" value="1"/>
++          <nvpair id="status-1-last-failure-outside_resource.monitor_10000" name="last-failure-outside_resource#monitor_10000" value="1532740638"/>
++        </instance_attributes>
++      </transient_attributes>
++    </node_state>
++    <node_state id="2" uname="fastvm-rhel-7-5-74" in_ccm="true" crmd="online" crm-debug-origin="do_update_resource" join="member" expected="member">
++      <lrm id="2">
++        <lrm_resources>
++          <lrm_resource id="fence-fastvm-rhel-7-5-73" type="fence_xvm" class="stonith">
++            <lrm_rsc_op id="fence-fastvm-rhel-7-5-73_last_0" operation_key="fence-fastvm-rhel-7-5-73_start_0" operation="start" crm-debug-origin="do_update_resource" crm_feature_set="3.0.14" transition-key="8:1:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" transition-magic="0:0;8:1:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" exit-reason="" on_node="fastvm-rhel-7-5-74" call-id="10" rc-code="0" op-status="0" interval="0" last-run="1532677735" last-rc-change="1532677735" exec-time="28" queue-time="0" op-digest="19df1a0b16e49519b6ad60ced7864b32"/>
++            <lrm_rsc_op id="fence-fastvm-rhel-7-5-73_monitor_30000" operation_key="fence-fastvm-rhel-7-5-73_monitor_30000" operation="monitor" crm-debug-origin="do_update_resource" crm_feature_set="3.0.14" transition-key="9:1:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" transition-magic="0:0;9:1:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" exit-reason="" on_node="fastvm-rhel-7-5-74" call-id="15" rc-code="0" op-status="0" interval="30000" last-rc-change="1532677735" exec-time="32" queue-time="0" op-digest="70d4caa7832da5fcdf131e29ea3936b7"/>
++          </lrm_resource>
++          <lrm_resource id="fence-fastvm-rhel-7-5-74" type="fence_xvm" class="stonith">
++            <lrm_rsc_op id="fence-fastvm-rhel-7-5-74_last_0" operation_key="fence-fastvm-rhel-7-5-74_monitor_0" operation="monitor" crm-debug-origin="do_update_resource" crm_feature_set="3.0.14" transition-key="6:0:7:6895fb61-9ed3-458d-8207-59cfaf0c8079" transition-magic="0:7;6:0:7:6895fb61-9ed3-458d-8207-59cfaf0c8079" exit-reason="" on_node="fastvm-rhel-7-5-74" call-id="9" rc-code="7" op-status="0" interval="0" last-run="1532677735" last-rc-change="1532677735" exec-time="0" queue-time="0" op-digest="0b321829ad4a026df6dcad0efa304d0d"/>
++          </lrm_resource>
++          <lrm_resource id="outside_resource" type="Dummy" class="ocf" provider="pacemaker">
++            <lrm_rsc_op id="outside_resource_last_0" operation_key="outside_resource_stop_0" operation="stop" crm-debug-origin="do_update_resource" crm_feature_set="3.0.14" transition-key="12:15:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" transition-magic="0:0;12:15:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" exit-reason="" on_node="fastvm-rhel-7-5-74" call-id="37" rc-code="0" op-status="0" interval="0" last-run="1532678303" last-rc-change="1532678303" exec-time="18" queue-time="0" op-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8" op-force-restart=" envfile  op_sleep  passwd  state " op-restart-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8" op-secure-params=" passwd " op-secure-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8"/>
++            <lrm_rsc_op id="outside_resource_monitor_10000" operation_key="outside_resource_monitor_10000" operation="monitor" crm-debug-origin="do_update_resource" crm_feature_set="3.0.14" transition-key="14:12:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" transition-magic="0:0;14:12:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" exit-reason="" on_node="fastvm-rhel-7-5-74" call-id="35" rc-code="0" op-status="0" interval="10000" last-rc-change="1532678229" exec-time="10" queue-time="0" op-digest="4811cef7f7f94e3a35a70be7916cb2fd" op-secure-params=" passwd " op-secure-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8"/>
++          </lrm_resource>
++          <lrm_resource id="inside_resource_2" type="Dummy" class="ocf" provider="pacemaker">
++            <lrm_rsc_op id="inside_resource_2_last_0" operation_key="inside_resource_2_start_0" operation="start" crm-debug-origin="do_update_resource" crm_feature_set="3.0.14" transition-key="13:40:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" transition-magic="0:0;13:40:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" exit-reason="" on_node="fastvm-rhel-7-5-74" call-id="45" rc-code="0" op-status="0" interval="0" last-run="1532679131" last-rc-change="1532679131" exec-time="14" queue-time="0" op-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8" op-force-restart=" envfile  op_sleep  passwd  state " op-restart-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8" op-secure-params=" passwd " op-secure-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8"/>
++            <lrm_rsc_op id="inside_resource_2_monitor_10000" operation_key="inside_resource_2_monitor_10000" operation="monitor" crm-debug-origin="do_update_resource" crm_feature_set="3.0.14" transition-key="14:40:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" transition-magic="0:0;14:40:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" exit-reason="" on_node="fastvm-rhel-7-5-74" call-id="46" rc-code="0" op-status="0" interval="10000" last-rc-change="1532679131" exec-time="10" queue-time="0" op-digest="4811cef7f7f94e3a35a70be7916cb2fd" op-secure-params=" passwd " op-secure-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8"/>
++          </lrm_resource>
++          <lrm_resource id="inside_resource_3" type="Dummy" class="ocf" provider="pacemaker">
++            <lrm_rsc_op id="inside_resource_3_last_0" operation_key="inside_resource_3_start_0" operation="start" crm-debug-origin="do_update_resource" crm_feature_set="3.0.14" transition-key="15:113:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" transition-magic="0:0;15:113:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" exit-reason="" on_node="fastvm-rhel-7-5-74" call-id="323" rc-code="0" op-status="0" interval="0" last-run="1532740638" last-rc-change="1532740638" exec-time="12" queue-time="0" op-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8" op-force-restart=" envfile  op_sleep  passwd  state " op-restart-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8" op-secure-params=" passwd " op-secure-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8"/>
++            <lrm_rsc_op id="inside_resource_3_monitor_10000" operation_key="inside_resource_3_monitor_10000" operation="monitor" crm-debug-origin="do_update_resource" crm_feature_set="3.0.14" transition-key="5:113:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" transition-magic="0:0;5:113:0:6895fb61-9ed3-458d-8207-59cfaf0c8079" exit-reason="" on_node="fastvm-rhel-7-5-74" call-id="324" rc-code="0" op-status="0" interval="10000" last-rc-change="1532740638" exec-time="11" queue-time="0" op-digest="4811cef7f7f94e3a35a70be7916cb2fd" op-secure-params=" passwd " op-secure-digest="f2317cad3d54cec5d7d7aa7d0bf35cf8"/>
++          </lrm_resource>
++        </lrm_resources>
++      </lrm>
++    </node_state>
++  </status>
++</cib>
+-- 
+1.8.3.1
+

@@ -1,0 +1,46 @@
+From 0cfbb0797ba1788e131cf964ca53adcde8209e1f Mon Sep 17 00:00:00 2001
+From: Ken Gaillot <kgaillot@redhat.com>
+Date: Thu, 21 Mar 2019 09:20:32 -0500
+Subject: [PATCH] Fix: libcrmcommon: pcmk_nvpair_t should handle NULL values
+
+Detected by static analysis; if pcmk_prepend_nvpair() were given a NULL value,
+pcmk__new_nvpair() would try to strdup() it. Now, name is asserted to be
+non-NULL, and NULL values are set directly.
+---
+ lib/common/nvpair.c | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/lib/common/nvpair.c b/lib/common/nvpair.c
+index 5d6853f..e9fec8a 100644
+--- a/lib/common/nvpair.c
++++ b/lib/common/nvpair.c
+@@ -33,7 +33,7 @@
+  * \internal
+  * \brief Allocate a new name/value pair
+  *
+- * \param[in] name   New name
++ * \param[in] name   New name (required)
+  * \param[in] value  New value
+  *
+  * \return Newly allocated name/value pair
+@@ -43,11 +43,15 @@
+ static pcmk_nvpair_t *
+ pcmk__new_nvpair(const char *name, const char *value)
+ {
+-    pcmk_nvpair_t *nvpair = calloc(1, sizeof(pcmk_nvpair_t));
++    pcmk_nvpair_t *nvpair = NULL;
+ 
++    CRM_ASSERT(name);
++
++    nvpair = calloc(1, sizeof(pcmk_nvpair_t));
+     CRM_ASSERT(nvpair);
++
+     nvpair->name = strdup(name);
+-    nvpair->value = strdup(value);
++    nvpair->value = value? strdup(value) : NULL;
+     return nvpair;
+ }
+ 
+-- 
+1.8.3.1
+

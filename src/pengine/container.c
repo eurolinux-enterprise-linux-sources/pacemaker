@@ -796,7 +796,7 @@ container_update_actions(action_t * first, action_t * then, node_t * node, enum 
 }
 
 void
-container_rsc_location(resource_t * rsc, rsc_to_node_t * constraint)
+container_rsc_location(pe_resource_t *rsc, pe__location_t *constraint)
 {
     container_variant_data_t *container_data = NULL;
     get_container_variant_data(container_data, rsc);
@@ -845,10 +845,19 @@ container_expand(resource_t * rsc, pe_working_set_t * data_set)
             const char *calculated_addr = container_fix_remote_addr_in(tuple->remote, nvpair, "value");
 
             if (calculated_addr) {
-                crm_trace("Fixed addr for %s on %s", tuple->remote->id, calculated_addr);
+                crm_trace("Set address for bundle connection %s to bundle host %s",
+                          tuple->remote->id, calculated_addr);
                 g_hash_table_replace(tuple->remote->parameters, strdup("addr"), strdup(calculated_addr));
             } else {
-                crm_err("Could not fix addr for %s", tuple->remote->id);
+                /* The only way to get here is if the remote connection is
+                 * neither currently running nor scheduled to run. That means we
+                 * won't be doing any operations that require addr (only start
+                 * requires it; we additionally use it to compare digests when
+                 * unpacking status, promote, and migrate_from history, but
+                 * that's already happened by this point).
+                 */
+                crm_info("Unable to determine address for bundle %s remote connection",
+                         rsc->id);
             }
         }
         if(tuple->ip) {

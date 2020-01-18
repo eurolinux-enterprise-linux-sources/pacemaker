@@ -1972,13 +1972,14 @@ log_operation(async_command_t * cmd, int rc, int pid, const char *next, const ch
     if (cmd->victim != NULL) {
         do_crm_log(rc == 0 ? LOG_NOTICE : LOG_ERR,
                    "Operation '%s' [%d] (call %d from %s) for host '%s' with device '%s' returned: %d (%s)%s%s",
-                   cmd->action, pid, cmd->id, cmd->client_name, cmd->victim, cmd->device, rc,
-                   pcmk_strerror(rc), next ? ". Trying: " : "", next ? next : "");
+                   cmd->action, pid, cmd->id, cmd->client_name, cmd->victim,
+                   cmd->device, rc, pcmk_strerror(rc),
+                   (next? ", retrying with " : ""), (next ? next : ""));
     } else {
         do_crm_log_unlikely(rc == 0 ? LOG_DEBUG : LOG_NOTICE,
                             "Operation '%s' [%d] for device '%s' returned: %d (%s)%s%s",
                             cmd->action, pid, cmd->device, rc, pcmk_strerror(rc),
-                            next ? ". Trying: " : "", next ? next : "");
+                            (next? ", retrying with " : ""), (next ? next : ""));
     }
 
     if (output) {
@@ -2043,6 +2044,7 @@ stonith_send_async_reply(async_command_t * cmd, const char *output, int rc, GPid
         crm_xml_add(notify_data, F_STONITH_ORIGIN, cmd->client);
 
         do_stonith_notify(0, T_STONITH_NOTIFY_FENCE, rc, notify_data);
+        do_stonith_notify(0, T_STONITH_NOTIFY_HISTORY, 0, NULL);
     }
 
     free_xml(reply);
@@ -2140,7 +2142,7 @@ st_child_done(GPid pid, int rc, const char *output, gpointer user_data)
 
     /* this operation requires more fencing, hooray! */
     if (next_device) {
-        log_operation(cmd, rc, pid, cmd->device, output);
+        log_operation(cmd, rc, pid, next_device->id, output);
 
         schedule_stonith_command(cmd, next_device);
         /* Prevent cmd from being freed */
@@ -2277,22 +2279,19 @@ stonith_fence(xmlNode * msg)
 
     } else {
         const char *host = crm_element_value(dev, F_STONITH_TARGET);
-        char *nodename = NULL;
 
         if (cmd->options & st_opt_cs_nodeid) {
             int nodeid = crm_atoi(host, NULL);
+            crm_node_t *node = crm_find_known_peer_full(nodeid, NULL, CRM_GET_PEER_ANY);
 
-            nodename = stonith_get_peer_name(nodeid);
-            if (nodename) {
-                host = nodename;
+            if (node) {
+                host = node->uname;
             }
         }
 
         /* If we get to here, then self-fencing is implicitly allowed */
         get_capable_devices(host, cmd->action, cmd->default_timeout,
                             TRUE, cmd, stonith_fence_get_devices_cb);
-
-        free(nodename);
     }
 
     return -EINPROGRESS;
@@ -2584,7 +2583,14 @@ handle_request(crm_client_t * client, uint32_t id, uint32_t flags, xmlNode * req
         }
 
     } else if (crm_str_eq(op, STONITH_OP_FENCE_HISTORY, TRUE)) {
-        rc = stonith_fence_history(request, &data);
+        rc = stonith_fence_history(request, &data, remote_peer, call_options);
+        if (call_options & st_opt_discard_reply) {
+            /* we don't expect answers to the broadcast
+             * we might have sent out
+             */
+            free_xml(data);
+            return pcmk_ok;
+        }
 
     } else if (crm_str_eq(op, STONITH_OP_DEVICE_ADD, TRUE)) {
         const char *device_id = NULL;

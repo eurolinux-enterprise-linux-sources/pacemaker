@@ -258,7 +258,8 @@ cli_resource_update_attribute(resource_t *rsc, const char *requested_name,
             if (rc == pcmk_ok && BE_QUIET == FALSE) {
                 printf("WARNING: There is already a meta attribute for '%s' called '%s' (id=%s)\n",
                        uber_parent(rsc)->id, attr_name, local_attr_id);
-                printf("         Delete '%s' first or use --force to override\n", local_attr_id);
+                printf("         Delete '%s' first or use the force option to override\n",
+                       local_attr_id);
             }
             free(local_attr_id);
             if (rc == pcmk_ok) {
@@ -467,7 +468,7 @@ send_lrm_rsc_op(crm_ipc_t * crmd_channel, const char *op,
         return -EINVAL;
 
     } else if (host_uname == NULL) {
-        CMD_ERR("Please supply a node name with --node");
+        CMD_ERR("Please specify a node name");
         return -EINVAL;
     } else {
         node_t *node = pe_find_node(data_set->nodes, host_uname);
@@ -558,15 +559,142 @@ rsc_fail_name(resource_t *rsc)
     return is_set(rsc->flags, pe_rsc_unique)? strdup(name) : clone_strip(name);
 }
 
+static int
+clear_rsc_history(crm_ipc_t *crmd_channel, const char *host_uname,
+                  const char *rsc_id, pe_working_set_t *data_set)
+{
+    int rc = pcmk_ok;
+
+    /* Erase the resource's entire LRM history in the CIB, even if we're only
+     * clearing a single operation's fail count. If we erased only entries for a
+     * single operation, we might wind up with a wrong idea of the current
+     * resource state, and we might not re-probe the resource.
+     */
+    rc = send_lrm_rsc_op(crmd_channel, CRM_OP_LRM_DELETE, host_uname, rsc_id,
+                         TRUE, data_set);
+    if (rc != pcmk_ok) {
+        return rc;
+    }
+    crmd_replies_needed++;
+
+    crm_trace("Processing %d mainloop inputs", crmd_replies_needed);
+    while (g_main_context_iteration(NULL, FALSE)) {
+        crm_trace("Processed mainloop input, %d still remaining",
+                  crmd_replies_needed);
+    }
+
+    if (crmd_replies_needed < 0) {
+        crmd_replies_needed = 0;
+    }
+    return rc;
+}
+
+static int
+clear_rsc_failures(crm_ipc_t *crmd_channel, const char *node_name,
+                   const char *rsc_id, const char *operation,
+                   const char *interval, pe_working_set_t *data_set)
+{
+    int rc = pcmk_ok;
+    const char *failed_value = NULL;
+    const char *failed_id = NULL;
+    const char *interval_ms_str = NULL;
+    GHashTable *rscs = NULL;
+    GHashTableIter iter;
+
+    /* Create a hash table to use as a set of resources to clean. This lets us
+     * clean each resource only once (per node) regardless of how many failed
+     * operations it has.
+     */
+    rscs = g_hash_table_new_full(crm_str_hash, g_str_equal, NULL, NULL);
+
+    // Normalize interval to milliseconds for comparison to history entry
+    if (operation) {
+        interval_ms_str = crm_strdup_printf("%llu", crm_get_interval(interval));
+    }
+
+    for (xmlNode *xml_op = __xml_first_child(data_set->failed); xml_op != NULL;
+         xml_op = __xml_next(xml_op)) {
+
+        failed_id = crm_element_value(xml_op, XML_LRM_ATTR_RSCID);
+        if (failed_id == NULL) {
+            // Malformed history entry, should never happen
+            continue;
+        }
+
+        // No resource specified means all resources match
+        if (rsc_id) {
+            resource_t *fail_rsc = pe_find_resource_with_flags(data_set->resources,
+                                                               failed_id,
+                                                               pe_find_renamed|pe_find_anon);
+
+            if (!fail_rsc || safe_str_neq(rsc_id, fail_rsc->id)) {
+                continue;
+            }
+        }
+
+        // Host name should always have been provided by this point
+        failed_value = crm_element_value(xml_op, XML_ATTR_UNAME);
+        if (safe_str_neq(node_name, failed_value)) {
+            continue;
+        }
+
+        // No operation specified means all operations match
+        if (operation) {
+            failed_value = crm_element_value(xml_op, XML_LRM_ATTR_TASK);
+            if (safe_str_neq(operation, failed_value)) {
+                continue;
+            }
+
+            // Interval (if operation was specified) defaults to 0 (not all)
+            failed_value = crm_element_value(xml_op, XML_LRM_ATTR_INTERVAL);
+            if (safe_str_neq(interval_ms_str, failed_value)) {
+                continue;
+            }
+        }
+
+        /* not available until glib 2.32
+        g_hash_table_add(rscs, (gpointer) failed_id);
+        */
+        g_hash_table_insert(rscs, (gpointer) failed_id, (gpointer) failed_id);
+    }
+
+    g_hash_table_iter_init(&iter, rscs);
+    while (g_hash_table_iter_next(&iter, (gpointer *) &failed_id, NULL)) {
+        crm_debug("Erasing failures of %s on %s", failed_id, node_name);
+        rc = clear_rsc_history(crmd_channel, node_name, failed_id, data_set);
+        if (rc != pcmk_ok) {
+            return rc;
+        }
+    }
+    g_hash_table_destroy(rscs);
+    return rc;
+}
+
+static int
+clear_rsc_fail_attrs(resource_t *rsc, const char *operation,
+                     const char *interval, node_t *node)
+{
+    int rc = pcmk_ok;
+    int attr_options = attrd_opt_none;
+    char *rsc_name = rsc_fail_name(rsc);
+
+    if (is_remote_node(node)) {
+        attr_options |= attrd_opt_remote;
+    }
+    rc = attrd_clear_delegate(NULL, node->details->uname, rsc_name, operation,
+                              interval, NULL, attr_options);
+    free(rsc_name);
+    return rc;
+}
+
 int
 cli_resource_delete(crm_ipc_t *crmd_channel, const char *host_uname,
                     resource_t *rsc, const char *operation,
-                    const char *interval, pe_working_set_t *data_set)
+                    const char *interval, bool just_failures,
+                    pe_working_set_t *data_set)
 {
     int rc = pcmk_ok;
     node_t *node = NULL;
-    char *rsc_name = NULL;
-    int attr_options = attrd_opt_none;
 
     if (rsc == NULL) {
         return -ENXIO;
@@ -578,8 +706,8 @@ cli_resource_delete(crm_ipc_t *crmd_channel, const char *host_uname,
             resource_t *child = (resource_t *) lpc->data;
 
             rc = cli_resource_delete(crmd_channel, host_uname, child, operation,
-                                     interval, data_set);
-            if(rc != pcmk_ok) {
+                                     interval, just_failures, data_set);
+            if (rc != pcmk_ok) {
                 return rc;
             }
         }
@@ -611,8 +739,13 @@ cli_resource_delete(crm_ipc_t *crmd_channel, const char *host_uname,
             node = (node_t *) lpc->data;
 
             if (node->details->online) {
-                cli_resource_delete(crmd_channel, node->details->uname, rsc,
-                                    operation, interval, data_set);
+                rc = cli_resource_delete(crmd_channel, node->details->uname,
+                                         rsc, operation, interval,
+                                         just_failures, data_set);
+            }
+            if (rc != pcmk_ok) {
+                g_list_free(nodes);
+                return rc;
             }
         }
 
@@ -637,48 +770,91 @@ cli_resource_delete(crm_ipc_t *crmd_channel, const char *host_uname,
     if (crmd_channel == NULL) {
         printf("Dry run: skipping clean-up of %s on %s due to CIB_file\n",
                rsc->id, host_uname);
-        return rc;
-     }
+        return pcmk_ok;
+    }
 
-    /* Erase the resource's entire LRM history in the CIB, even if we're only
-     * clearing a single operation's fail count. If we erased only entries for a
-     * single operation, we might wind up with a wrong idea of the current
-     * resource state, and we might not re-probe the resource.
-     */
-    rc = send_lrm_rsc_op(crmd_channel, CRM_OP_LRM_DELETE, host_uname, rsc->id,
-                         TRUE, data_set);
+    rc = clear_rsc_fail_attrs(rsc, operation, interval, node);
     if (rc != pcmk_ok) {
-        printf("Unable to clean up %s history on %s: %s\n",
-               rsc->id, host_uname, pcmk_strerror(rc));
+        printf("Unable to clean up %s failures on %s: %s\n",
+                rsc->id, host_uname, pcmk_strerror(rc));
         return rc;
     }
-    crmd_replies_needed++;
 
-    crm_trace("Processing %d mainloop inputs", crmd_replies_needed);
-    while(g_main_context_iteration(NULL, FALSE)) {
-        crm_trace("Processed mainloop input, %d still remaining",
-                  crmd_replies_needed);
+    if (just_failures) {
+        rc = clear_rsc_failures(crmd_channel, host_uname, rsc->id, operation,
+                                interval, data_set);
+    } else {
+        rc = clear_rsc_history(crmd_channel, host_uname, rsc->id, data_set);
     }
-
-    if(crmd_replies_needed < 0) {
-        crmd_replies_needed = 0;
-    }
-
-    rsc_name = rsc_fail_name(rsc);
-    if (is_remote_node(node)) {
-        attr_options |= attrd_opt_remote;
-    }
-    rc = attrd_clear_delegate(NULL, host_uname, rsc_name, operation, interval,
-                              NULL, attr_options);
     if (rc != pcmk_ok) {
-        printf("Cleaned %s history on %s, but unable to clear failures: %s\n",
+        printf("Cleaned %s failures on %s, but unable to clean history: %s\n",
                rsc->id, host_uname, pcmk_strerror(rc));
     } else {
         printf("Cleaned up %s on %s\n", rsc->id, host_uname);
     }
-    free(rsc_name);
-
     return rc;
+}
+
+int
+cli_cleanup_all(crm_ipc_t *crmd_channel, const char *node_name,
+                const char *operation, const char *interval,
+                pe_working_set_t *data_set)
+{
+    int rc = pcmk_ok;
+    int attr_options = attrd_opt_none;
+    const char *display_name = node_name? node_name : "all nodes";
+
+    if (crmd_channel == NULL) {
+        printf("Dry run: skipping clean-up of %s due to CIB_file\n",
+               display_name);
+        return pcmk_ok;
+    }
+    crmd_replies_needed = 0;
+
+    if (node_name) {
+        node_t *node = pe_find_node(data_set->nodes, node_name);
+
+        if (node == NULL) {
+            CMD_ERR("Unknown node: %s", node_name);
+            return -ENXIO;
+        }
+        if (is_remote_node(node)) {
+            attr_options |= attrd_opt_remote;
+        }
+    }
+
+    rc = attrd_clear_delegate(NULL, node_name, NULL, operation, interval,
+                              NULL, attr_options);
+    if (rc != pcmk_ok) {
+        printf("Unable to clean up all failures on %s: %s\n",
+                display_name, pcmk_strerror(rc));
+        return rc;
+    }
+
+    if (node_name) {
+        rc = clear_rsc_failures(crmd_channel, node_name, NULL,
+                                operation, interval, data_set);
+        if (rc != pcmk_ok) {
+            printf("Cleaned all resource failures on %s, but unable to clean history: %s\n",
+                   node_name, pcmk_strerror(rc));
+            return rc;
+        }
+    } else {
+        for (GList *iter = data_set->nodes; iter; iter = iter->next) {
+            pe_node_t *node = (pe_node_t *) iter->data;
+
+            rc = clear_rsc_failures(crmd_channel, node->details->uname, NULL,
+                                    operation, interval, data_set);
+            if (rc != pcmk_ok) {
+                printf("Cleaned all resource failures on all nodes, but unable to clean history: %s\n",
+                       pcmk_strerror(rc));
+                return rc;
+            }
+        }
+    }
+
+    printf("Cleaned up all resources on %s\n", display_name);
+    return pcmk_ok;
 }
 
 void
@@ -951,7 +1127,7 @@ update_dataset(cib_t *cib, pe_working_set_t * data_set, bool simulate)
     cib_t *shadow_cib = NULL;
     int rc;
 
-    cleanup_alloc_calculations(data_set);
+    pe_reset_working_set(data_set);
     rc = update_working_set_from_cib(data_set, cib);
     if (rc != pcmk_ok) {
         return rc;
@@ -1075,7 +1251,8 @@ max_delay_in(pe_working_set_t * data_set, GList *resources)
  * \return pcmk_ok on success, -errno on failure (exits on certain failures)
  */
 int
-cli_resource_restart(resource_t * rsc, const char *host, int timeout_ms, cib_t * cib)
+cli_resource_restart(pe_resource_t *rsc, const char *host, int timeout_ms,
+                     cib_t *cib)
 {
     int rc = 0;
     int lpc = 0;
@@ -1093,7 +1270,7 @@ cli_resource_restart(resource_t * rsc, const char *host, int timeout_ms, cib_t *
     GList *current_active = NULL;
     GList *restart_target_active = NULL;
 
-    pe_working_set_t data_set;
+    pe_working_set_t *data_set = NULL;
 
     if(resource_is_running_on(rsc, host) == FALSE) {
         const char *id = rsc->clone_name?rsc->clone_name:rsc->id;
@@ -1131,17 +1308,20 @@ cli_resource_restart(resource_t * rsc, const char *host, int timeout_ms, cib_t *
       - Allow a --no-deps option (aka. --force-restart)
     */
 
-
-    set_working_set_defaults(&data_set);
-    rc = update_dataset(cib, &data_set, FALSE);
+    data_set = pe_new_working_set();
+    if (data_set == NULL) {
+        crm_perror(LOG_ERR, "Could not allocate working set");
+        rc = -ENOMEM;
+        goto done;
+    }
+    rc = update_dataset(cib, data_set, FALSE);
     if(rc != pcmk_ok) {
         fprintf(stdout, "Could not get new resource list: %s (%d)\n", pcmk_strerror(rc), rc);
-        free(rsc_id);
-        return rc;
+        goto done;
     }
 
-    restart_target_active = get_active_resources(host, data_set.resources);
-    current_active = get_active_resources(host, data_set.resources);
+    restart_target_active = get_active_resources(host, data_set->resources);
+    current_active = get_active_resources(host, data_set->resources);
 
     dump_list(current_active, "Origin");
 
@@ -1162,7 +1342,7 @@ cli_resource_restart(resource_t * rsc, const char *host, int timeout_ms, cib_t *
         free(lookup_id);
         rc = cli_resource_update_attribute(rsc, rsc_id, NULL, NULL,
                                            XML_RSC_ATTR_TARGET_ROLE,
-                                           RSC_STOPPED, FALSE, cib, &data_set);
+                                           RSC_STOPPED, FALSE, cib, data_set);
     }
     if(rc != pcmk_ok) {
         fprintf(stderr, "Could not set target-role for %s: %s (%d)\n", rsc_id, pcmk_strerror(rc), rc);
@@ -1172,17 +1352,16 @@ cli_resource_restart(resource_t * rsc, const char *host, int timeout_ms, cib_t *
         if (restart_target_active) {
             g_list_free_full(restart_target_active, free);
         }
-        free(rsc_id);
-        return crm_exit(rc);
+        goto done;
     }
 
-    rc = update_dataset(cib, &data_set, TRUE);
+    rc = update_dataset(cib, data_set, TRUE);
     if(rc != pcmk_ok) {
         fprintf(stderr, "Could not determine which resources would be stopped\n");
         goto failure;
     }
 
-    target_active = get_active_resources(host, data_set.resources);
+    target_active = get_active_resources(host, data_set->resources);
     dump_list(target_active, "Target");
 
     list_delta = subtract_lists(current_active, target_active);
@@ -1193,7 +1372,7 @@ cli_resource_restart(resource_t * rsc, const char *host, int timeout_ms, cib_t *
     while(g_list_length(list_delta) > 0) {
         before = g_list_length(list_delta);
         if(timeout_ms == 0) {
-            step_timeout_s = max_delay_in(&data_set, list_delta) / sleep_interval;
+            step_timeout_s = max_delay_in(data_set, list_delta) / sleep_interval;
         }
 
         /* We probably don't need the entire step timeout */
@@ -1203,7 +1382,7 @@ cli_resource_restart(resource_t * rsc, const char *host, int timeout_ms, cib_t *
                 timeout -= sleep_interval;
                 crm_trace("%ds remaining", timeout);
             }
-            rc = update_dataset(cib, &data_set, FALSE);
+            rc = update_dataset(cib, data_set, FALSE);
             if(rc != pcmk_ok) {
                 fprintf(stderr, "Could not determine which resources were stopped\n");
                 goto failure;
@@ -1212,7 +1391,7 @@ cli_resource_restart(resource_t * rsc, const char *host, int timeout_ms, cib_t *
             if (current_active) {
                 g_list_free_full(current_active, free);
             }
-            current_active = get_active_resources(host, data_set.resources);
+            current_active = get_active_resources(host, data_set->resources);
             g_list_free(list_delta);
             list_delta = subtract_lists(current_active, target_active);
             dump_list(current_active, "Current");
@@ -1231,25 +1410,24 @@ cli_resource_restart(resource_t * rsc, const char *host, int timeout_ms, cib_t *
     }
 
     if (stop_via_ban) {
-        rc = cli_resource_clear(rsc_id, host, NULL, cib);
+        rc = cli_resource_clear(rsc_id, host, NULL, cib, TRUE);
 
     } else if (orig_target_role) {
         rc = cli_resource_update_attribute(rsc, rsc_id, NULL, NULL,
                                            XML_RSC_ATTR_TARGET_ROLE,
                                            orig_target_role, FALSE, cib,
-                                           &data_set);
+                                           data_set);
         free(orig_target_role);
         orig_target_role = NULL;
     } else {
         rc = cli_resource_delete_attribute(rsc, rsc_id, NULL, NULL,
                                            XML_RSC_ATTR_TARGET_ROLE, cib,
-                                           &data_set);
+                                           data_set);
     }
 
     if(rc != pcmk_ok) {
         fprintf(stderr, "Could not unset target-role for %s: %s (%d)\n", rsc_id, pcmk_strerror(rc), rc);
-        free(rsc_id);
-        return crm_exit(rc);
+        goto done;
     }
 
     if (target_active) {
@@ -1267,7 +1445,7 @@ cli_resource_restart(resource_t * rsc, const char *host, int timeout_ms, cib_t *
     while (waiting_for_starts(list_delta, rsc, host)) {
         before = g_list_length(list_delta);
         if(timeout_ms == 0) {
-            step_timeout_s = max_delay_in(&data_set, list_delta) / sleep_interval;
+            step_timeout_s = max_delay_in(data_set, list_delta) / sleep_interval;
         }
 
         /* We probably don't need the entire step timeout */
@@ -1279,7 +1457,7 @@ cli_resource_restart(resource_t * rsc, const char *host, int timeout_ms, cib_t *
                 crm_trace("%ds remaining", timeout);
             }
 
-            rc = update_dataset(cib, &data_set, FALSE);
+            rc = update_dataset(cib, data_set, FALSE);
             if(rc != pcmk_ok) {
                 fprintf(stderr, "Could not determine which resources were started\n");
                 goto failure;
@@ -1292,7 +1470,7 @@ cli_resource_restart(resource_t * rsc, const char *host, int timeout_ms, cib_t *
             /* It's OK if dependent resources moved to a different node,
              * so we check active resources on all nodes.
              */
-            current_active = get_active_resources(NULL, data_set.resources);
+            current_active = get_active_resources(NULL, data_set->resources);
             g_list_free(list_delta);
             list_delta = subtract_lists(target_active, current_active);
             dump_list(current_active, "Current");
@@ -1314,15 +1492,15 @@ cli_resource_restart(resource_t * rsc, const char *host, int timeout_ms, cib_t *
 
   failure:
     if (stop_via_ban) {
-        cli_resource_clear(rsc_id, host, NULL, cib);
+        cli_resource_clear(rsc_id, host, NULL, cib, TRUE);
     } else if (orig_target_role) {
         cli_resource_update_attribute(rsc, rsc_id, NULL, NULL,
                                       XML_RSC_ATTR_TARGET_ROLE,
-                                      orig_target_role, FALSE, cib, &data_set);
+                                      orig_target_role, FALSE, cib, data_set);
         free(orig_target_role);
     } else {
         cli_resource_delete_attribute(rsc, rsc_id, NULL, NULL,
-                                      XML_RSC_ATTR_TARGET_ROLE, cib, &data_set);
+                                      XML_RSC_ATTR_TARGET_ROLE, cib, data_set);
     }
 
 done:
@@ -1338,8 +1516,8 @@ done:
     if (restart_target_active) {
         g_list_free_full(restart_target_active, free);
     }
-    cleanup_alloc_calculations(&data_set);
     free(rsc_id);
+    pe_free_working_set(data_set);
     return rc;
 }
 
@@ -1430,14 +1608,18 @@ print_pending_actions(GListPtr actions)
 int
 wait_till_stable(int timeout_ms, cib_t * cib)
 {
-    pe_working_set_t data_set;
+    pe_working_set_t *data_set = NULL;
     int rc = -1;
     int timeout_s = timeout_ms? ((timeout_ms + 999) / 1000) : WAIT_DEFAULT_TIMEOUT_S;
     time_t expire_time = time(NULL) + timeout_s;
     time_t time_diff;
     bool printed_version_warning = BE_QUIET; // i.e. don't print if quiet
 
-    set_working_set_defaults(&data_set);
+    data_set = pe_new_working_set();
+    if (data_set == NULL) {
+        return -ENOMEM;
+    }
+
     do {
 
         /* Abort if timeout is reached */
@@ -1445,8 +1627,8 @@ wait_till_stable(int timeout_ms, cib_t * cib)
         if (time_diff > 0) {
             crm_info("Waiting up to %d seconds for cluster actions to complete", time_diff);
         } else {
-            print_pending_actions(data_set.actions);
-            cleanup_alloc_calculations(&data_set);
+            print_pending_actions(data_set->actions);
+            pe_free_working_set(data_set);
             return -ETIME;
         }
         if (rc == pcmk_ok) { /* this avoids sleep on first loop iteration */
@@ -1454,13 +1636,13 @@ wait_till_stable(int timeout_ms, cib_t * cib)
         }
 
         /* Get latest transition graph */
-        cleanup_alloc_calculations(&data_set);
-        rc = update_working_set_from_cib(&data_set, cib);
+        pe_reset_working_set(data_set);
+        rc = update_working_set_from_cib(data_set, cib);
         if (rc != pcmk_ok) {
-            cleanup_alloc_calculations(&data_set);
+            pe_free_working_set(data_set);
             return rc;
         }
-        do_calculations(&data_set, data_set.input, NULL);
+        do_calculations(data_set, data_set->input, NULL);
 
         if (!printed_version_warning) {
             /* If the DC has a different version than the local node, the two
@@ -1471,17 +1653,19 @@ wait_till_stable(int timeout_ms, cib_t * cib)
              * wait as a new crmd operation that would be forwarded to the DC.
              * However, that would have potential problems of its own.
              */
-            const char *dc_version = g_hash_table_lookup(data_set.config_hash,
+            const char *dc_version = g_hash_table_lookup(data_set->config_hash,
                                                          "dc-version");
 
             if (safe_str_neq(dc_version, PACEMAKER_VERSION "-" BUILD_VERSION)) {
-                printf("warning: --wait command may not work properly in mixed-version cluster\n");
+                printf("warning: wait option may not work properly in "
+                       "mixed-version cluster\n");
                 printed_version_warning = TRUE;
             }
         }
 
-    } while (actions_are_pending(data_set.actions));
+    } while (actions_are_pending(data_set->actions));
 
+    pe_free_working_set(data_set);
     return pcmk_ok;
 }
 
@@ -1518,7 +1702,8 @@ cli_resource_execute(resource_t *rsc, const char *requested_name,
             if(rc > 0 && do_force == FALSE) {
                 CMD_ERR("It is not safe to %s %s here: the cluster claims it is already active",
                         action, rsc->id);
-                CMD_ERR("Try setting target-role=stopped first or specifying --force");
+                CMD_ERR("Try setting target-role=Stopped first or specifying "
+                        "the force option");
                 crm_exit(EPERM);
             }
         }
@@ -1530,7 +1715,8 @@ cli_resource_execute(resource_t *rsc, const char *requested_name,
     }
 
     if(rsc->variant == pe_group) {
-        CMD_ERR("Sorry, --%s doesn't support group resources", rsc_action);
+        CMD_ERR("Sorry, the %s option doesn't support group resources",
+                rsc_action);
         crm_exit(EOPNOTSUPP);
     }
 
@@ -1539,7 +1725,8 @@ cli_resource_execute(resource_t *rsc, const char *requested_name,
     rtype = crm_element_value(rsc->xml, XML_ATTR_TYPE);
 
     if (safe_str_eq(rclass, PCMK_RESOURCE_CLASS_STONITH)) {
-        CMD_ERR("Sorry, --%s doesn't support %s resources yet", rsc_action, rclass);
+        CMD_ERR("Sorry, the %s option doesn't support %s resources yet",
+                rsc_action, rclass);
         crm_exit(EOPNOTSUPP);
     }
 
@@ -1576,6 +1763,12 @@ cli_resource_execute(resource_t *rsc, const char *requested_name,
     if(resource_verbose > 1) {
         setenv("OCF_TRACE_RA", "1", 1);
     }
+
+    /* A resource agent using the standard ocf-shellfuncs library will not print
+     * messages to stderr if it doesn't have a controlling terminal (e.g. if
+     * crm_resource is called via script or ssh). This forces it to do so.
+     */
+    setenv("OCF_TRACE_FILE", "/dev/stderr", 0);
 
     if (override_hash) {
         GHashTableIter iter;
@@ -1661,12 +1854,12 @@ cli_resource_move(resource_t *rsc, const char *rsc_id, const char *host_name,
     if (scope_master && rsc->variant != pe_master) {
         resource_t *p = uber_parent(rsc);
         if(p->variant == pe_master) {
-            CMD_ERR("Using parent '%s' for --move command instead of '%s'.", rsc->id, rsc_id);
+            CMD_ERR("Using parent '%s' for move instead of '%s'.", rsc->id, rsc_id);
             rsc_id = p->id;
             rsc = p;
 
         } else {
-            CMD_ERR("Ignoring '--master' option: not valid for %s resources.",
+            CMD_ERR("Ignoring master option: not valid for %s resources.",
                     get_resource_typename(rsc->variant));
             scope_master = FALSE;
         }
@@ -1717,8 +1910,11 @@ cli_resource_move(resource_t *rsc, const char *rsc_id, const char *host_name,
         }
     }
 
-    /* Clear any previous constraints for 'dest' */
-    cli_resource_clear(rsc_id, dest->details->uname, data_set->nodes, cib);
+    /* Clear any previous prefer constraints across all nodes. */
+    cli_resource_clear(rsc_id, NULL, data_set->nodes, cib, FALSE);
+
+    /* Clear any previous ban constraints on 'dest'. */
+    cli_resource_clear(rsc_id, dest->details->uname, data_set->nodes, cib, TRUE);
 
     /* Record an explicit preference for 'dest' */
     rc = cli_resource_prefer(rsc_id, dest->details->uname, cib);
@@ -1735,10 +1931,13 @@ cli_resource_move(resource_t *rsc, const char *rsc_id, const char *host_name,
             (void)cli_resource_ban(rsc_id, current->details->uname, NULL, cib);
 
         } else if(count > 1) {
-            CMD_ERR("Resource '%s' is currently %s in %d locations. One may now move to %s",
-                    rsc_id, scope_master?"promoted":"active", count, dest->details->uname);
-            CMD_ERR("You can prevent '%s' from being %s at a specific location with:"
-                    " --ban %s--host <name>", rsc_id, scope_master?"promoted":"active", scope_master?"--master ":"");
+            CMD_ERR("Resource '%s' is currently %s in %d locations. "
+                    "One may now move to %s",
+                    rsc_id, (scope_master? "promoted" : "active"),
+                    count, dest->details->uname);
+            CMD_ERR("To prevent '%s' from being %s at a specific location, "
+                    "specify a node.",
+                    rsc_id, (scope_master? "promoted" : "active"));
 
         } else {
             crm_trace("Not banning %s from its current location: not active", rsc_id);

@@ -34,6 +34,7 @@
 
 #  define T_STONITH_NOTIFY_DISCONNECT     "st_notify_disconnect"
 #  define T_STONITH_NOTIFY_FENCE          "st_notify_fence"
+#  define T_STONITH_NOTIFY_HISTORY        "st_notify_history"
 
 /* *INDENT-OFF* */
 enum stonith_state {
@@ -59,6 +60,10 @@ enum stonith_call_options {
     st_opt_timeout_updates = 0x00002000,
     /*! Only report back if operation is a success in callback */
     st_opt_report_only_success = 0x00004000,
+    /* used where ever apropriate - e.g. cleanup of history */
+    st_opt_cleanup         = 0x000080000,
+    /* used where ever apropriate - e.g. send out a history query to all nodes */
+    st_opt_broadcast       = 0x000100000,
 };
 
 /*! Order matters here, do not change values */
@@ -85,7 +90,7 @@ enum stonith_namespace {
 };
 
 enum stonith_namespace stonith_text2namespace(const char *namespace_s);
-const char *stonith_namespace2text(enum stonith_namespace namespace);
+const char *stonith_namespace2text(enum stonith_namespace st_namespace);
 enum stonith_namespace stonith_get_namespace(const char *agent,
                                              const char *namespace_s);
 

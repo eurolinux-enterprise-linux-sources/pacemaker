@@ -13,7 +13,7 @@
 ## Upstream pacemaker version, and its package version (specversion
 ## can be incremented to build packages reliably considered "newer"
 ## than previously built packages with the same pcmkversion)
-%global pcmkversion 1.1.19
+%global pcmkversion 1.1.20
 %global specversion 1
 
 ## Upstream commit (or git tag, such as "Pacemaker-" plus the
@@ -173,8 +173,8 @@ Source0:       https://github.com/%{github_owner}/%{name}/archive/%{commit}/%{na
 BuildRoot:     %(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
 AutoReqProv:   on
 Requires:      resource-agents
-Requires:      %{name}-libs = %{version}-%{release}
-Requires:      %{name}-cluster-libs = %{version}-%{release}
+Requires:      %{name}-libs%{?_isa} = %{version}-%{release}
+Requires:      %{name}-cluster-libs%{?_isa} = %{version}-%{release}
 Requires:      %{name}-cli = %{version}-%{release}
 %{?systemd_requires}
 
@@ -247,7 +247,7 @@ Available rpmbuild rebuild options:
 License:       GPLv2+ and LGPLv2+
 Summary:       Command line tools for controlling Pacemaker clusters
 Group:         System Environment/Daemons
-Requires:      %{name}-libs = %{version}-%{release}
+Requires:      %{name}-libs%{?_isa} = %{version}-%{release}
 Requires:      perl-TimeDate
 
 %description cli
@@ -263,6 +263,8 @@ License:       GPLv2+ and LGPLv2+
 Summary:       Core Pacemaker libraries
 Group:         System Environment/Daemons
 Requires(pre): shadow-utils
+# sbd 1.4.0+ supports the libpe_status API for pe_working_set_t
+Conflicts:     sbd < 1.4.0
 
 %description -n %{name}-libs
 Pacemaker is an advanced, scalable High-Availability cluster resource
@@ -275,7 +277,7 @@ nodes and those just running the CLI tools.
 License:       GPLv2+ and LGPLv2+
 Summary:       Cluster Libraries used by Pacemaker
 Group:         System Environment/Daemons
-Requires:      %{name}-libs = %{version}-%{release}
+Requires:      %{name}-libs%{?_isa} = %{version}-%{release}
 
 %description -n %{name}-cluster-libs
 Pacemaker is an advanced, scalable High-Availability cluster resource
@@ -293,7 +295,7 @@ License:       GPLv2+ and LGPLv2+ and BSD
 %endif
 Summary:       Pacemaker remote daemon for non-cluster nodes
 Group:         System Environment/Daemons
-Requires:      %{name}-libs = %{version}-%{release}
+Requires:      %{name}-libs%{?_isa} = %{version}-%{release}
 Requires:      %{name}-cli = %{version}-%{release}
 Requires:      resource-agents
 # -remote can be fully independent of systemd
@@ -448,6 +450,12 @@ find %{buildroot} -name '*.xml' -type f -print0 | xargs -0 chmod a-x
 # Don't package static libs
 find %{buildroot} -name '*.a' -type f -print0 | xargs -0 rm -f
 find %{buildroot} -name '*.la' -type f -print0 | xargs -0 rm -f
+
+# For now, don't package the servicelog-related binaries built only for
+# ppc64le when certain dependencies are installed. If they get more exercise by
+# advanced users, we can reconsider.
+rm -f %{buildroot}/%{_sbindir}/notifyServicelogEvent
+rm -f %{buildroot}/%{_sbindir}/ipmiservicelogd
 
 # Do not package these either
 rm -f %{buildroot}/%{_libdir}/service_crm.so

@@ -18,6 +18,17 @@
 
 #include <attrd_common.h>
 
+// Elections
+void attrd_election_init(void);
+void attrd_election_fini(void);
+void attrd_start_election_if_needed(void);
+bool attrd_election_won(void);
+void attrd_handle_election_op(const crm_node_t *peer, xmlNode *xml);
+bool attrd_check_for_new_writer(const crm_node_t *peer, xmlNode *xml);
+void attrd_declare_winner(void);
+void attrd_remove_voter(const crm_node_t *peer);
+void attrd_xml_add_writer(xmlNode *xml);
+
 typedef struct attribute_s {
     char *uuid; /* TODO: Remove if at all possible */
     char *id;
@@ -35,6 +46,8 @@ typedef struct attribute_s {
 
     char *user;
 
+    gboolean force_write; /* Flag for updating attribute by ignoring delay */
+
 } attribute_t;
 
 typedef struct attribute_value_s {
@@ -48,12 +61,11 @@ typedef struct attribute_value_s {
 
 crm_cluster_t *attrd_cluster;
 GHashTable *attributes;
-election_t *writer;
 
 #define attrd_send_ack(client, id, flags) \
     crm_ipcs_send_ack((client), (id), (flags), "ack", __FUNCTION__, __LINE__)
 
-void write_attributes(bool all);
+void write_attributes(bool all, bool ignore_delay);
 void attrd_broadcast_protocol(void);
 void attrd_peer_message(crm_node_t *client, xmlNode *msg);
 void attrd_client_peer_remove(const char *client_name, xmlNode *xml);

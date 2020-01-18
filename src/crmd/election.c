@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2004 Andrew Beekhof <andrew@beekhof.net>
+ * Copyright 2004-2019 Andrew Beekhof <andrew@beekhof.net>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public
@@ -26,10 +26,64 @@
 #include <crm/cluster/internal.h>
 #include <crm/cluster/election.h>
 #include <crm/crm.h>
+#include <crmd.h>
 #include <crmd_fsa.h>
 #include <crmd_messages.h>
 #include <crmd_callbacks.h>
 #include <tengine.h>
+
+static election_t *fsa_election = NULL;
+
+static gboolean
+election_win_cb(gpointer data)
+{
+    register_fsa_input(C_FSA_INTERNAL, I_ELECTION_DC, NULL);
+    return FALSE;
+}
+
+void
+controld_election_init(const char *uname)
+{
+    fsa_election = election_init("DC", uname, 60000 /*60s*/, election_win_cb);
+}
+
+void
+controld_remove_voter(const char *uname)
+{
+    election_remove(fsa_election, uname);
+
+    if (safe_str_eq(uname, fsa_our_dc)) {
+        /* Clear any election dampening in effect. Otherwise, if the lost DC had
+         * just won, an immediate new election could fizzle out with no new DC.
+         */
+        election_clear_dampening(fsa_election);
+    }
+}
+
+void
+controld_stop_election_timeout()
+{
+    election_timeout_stop(fsa_election);
+}
+
+void
+controld_election_fini()
+{
+    election_fini(fsa_election);
+    fsa_election = NULL;
+}
+
+void
+controld_set_election_period(const char *value)
+{
+    election_timeout_set_period(fsa_election, crm_get_msec(value));
+}
+
+void
+controld_stop_election_timer()
+{
+    election_timeout_stop(fsa_election);
+}
 
 /*	A_ELECTION_VOTE	*/
 void
@@ -84,14 +138,11 @@ do_election_check(long long action,
                   enum crmd_fsa_state cur_state,
                   enum crmd_fsa_input current_input, fsa_data_t * msg_data)
 {
-    if (fsa_state != S_ELECTION) {
+    if (fsa_state == S_ELECTION) {
+        election_check(fsa_election);
+    } else {
         crm_debug("Ignoring election check because we are not in an election");
-
-    } else if(election_check(fsa_election)) {
-        register_fsa_input(C_FSA_INTERNAL, I_ELECTION_DC, NULL);
     }
-
-    return;
 }
 
 #define loss_dampen 2           /* in seconds */
@@ -132,10 +183,8 @@ do_election_count_vote(long long action,
             }
             break;
 
-        case election_in_progress:
-            break;
         default:
-            crm_err("Unhandled election result: %d", rc);
+            crm_trace("Election message resulted in state %d", rc);
     }
 }
 
@@ -248,8 +297,7 @@ do_dc_release(long long action,
             crm_update_peer_expected(__FUNCTION__, node, CRMD_JOINSTATE_DOWN);
             update = create_node_state_update(node, node_update_expected, NULL,
                                               __FUNCTION__);
-            fsa_cib_anon_update(XML_CIB_TAG_STATUS, update,
-                                cib_scope_local | cib_quorum_override | cib_can_create);
+            fsa_cib_anon_update(XML_CIB_TAG_STATUS, update);
             free_xml(update);
         }
         register_fsa_input(C_FSA_INTERNAL, I_RELEASE_SUCCESS, NULL);

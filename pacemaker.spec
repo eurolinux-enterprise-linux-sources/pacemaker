@@ -13,12 +13,12 @@
 ## Upstream pacemaker version, and its package version (specversion
 ## can be incremented to build packages reliably considered "newer"
 ## than previously built packages with the same pcmkversion)
-%global pcmkversion 1.1.19
-%global specversion 8
+%global pcmkversion 1.1.20
+%global specversion 5
 
 ## Upstream commit (or git tag, such as "Pacemaker-" plus the
 ## {pcmkversion} macro for an official release) to use for this package
-%global commit c3c624ea3d98a74a8a287671a156db126c99a7bb
+%global commit 3c4c782f70ebdc9c6882859d16b7975193697640
 ## Since git v2.11, the extent of abbreviation is autoscaled by default
 ## (used to be constant of 7), so we need to convey it for non-tags, too.
 %global commit_abbrev 7
@@ -160,7 +160,7 @@
 Name:          pacemaker
 Summary:       Scalable High-Availability cluster resource manager
 Version:       %{pcmkversion}
-Release:       %{pcmk_release}%{?dist}.5
+Release:       %{pcmk_release}%{?dist}
 %if %{defined _unitdir}
 License:       GPLv2+ and LGPLv2+
 %else
@@ -176,39 +176,27 @@ Source0:       https://github.com/%{github_owner}/%{name}/archive/%{commit}/%{na
 Source1:       nagios-agents-metadata-%{nagios_hash}.tar.gz
 
 # upstream commits
-Patch1:        001-rollup.patch
-Patch2:        002-ppc64le.patch
-Patch3:        003-static-analysis.patch
-Patch4:        004-cleanup.patch
-Patch5:        005-corosync.patch
-Patch6:        006-fail-count.patch
-Patch7:        007-stderr.patch
-Patch8:        008-bundle-ordering.patch
-Patch9:        009-sbd-guest.patch
-Patch10:       010-route-notify.patch
-Patch11:       011-notifs.patch
-Patch12:       012-stonith-ordering.patch
-Patch13:       013-pseudo-removal.patch
-Patch14:       014-cli-test.patch
-Patch15:       015-remote-ordering.patch
-Patch16:       016-regression-tests.patch.gz
-Patch17:       017-cleanup-pending-op.patch
-Patch18:       018-security.patch
-Patch19:       019-security-log.patch
-Patch20:       020-security-active.patch
-Patch21:       021-security-return.patch
+Patch1:        001-constraint-fix.patch
+Patch2:        002-null-value.patch
+Patch3:        003-fence-output.patch
+Patch4:        004-group-ordering.patch
+Patch5:        005-bug-url.patch
+Patch6:        006-fence-output-fix.patch
+Patch7:        007-security.patch
+Patch8:        008-security-log.patch
+Patch9:        009-use-after-free.patch
+Patch10:       010-fork-callback.patch
 
 # patches that aren't from upstream
 Patch100:      lrmd-protocol-version.patch
-Patch101:      rhbz-url.patch
-Patch102:      2.0-record-pending-behavior.patch
-Patch103:      2.0-cleanup-behavior.patch
+Patch101:      2.0-record-pending-behavior.patch
+Patch102:      2.0-cleanup-behavior.patch
 
 BuildRoot:     %(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
 AutoReqProv:   on
 Requires:      resource-agents
-Requires:      %{name}-libs = %{version}-%{release}
-Requires:      %{name}-cluster-libs = %{version}-%{release}
+Requires:      %{name}-libs%{?_isa} = %{version}-%{release}
+Requires:      %{name}-cluster-libs%{?_isa} = %{version}-%{release}
 Requires:      %{name}-cli = %{version}-%{release}
 Obsoletes:     rgmanager < 3.2.0
 Provides:      rgmanager >= 3.2.0
@@ -289,7 +277,7 @@ Available rpmbuild rebuild options:
 License:       GPLv2+ and LGPLv2+
 Summary:       Command line tools for controlling Pacemaker clusters
 Group:         System Environment/Daemons
-Requires:      %{name}-libs = %{version}-%{release}
+Requires:      %{name}-libs%{?_isa} = %{version}-%{release}
 Requires:      perl-TimeDate
 
 %description cli
@@ -305,6 +293,8 @@ License:       GPLv2+ and LGPLv2+
 Summary:       Core Pacemaker libraries
 Group:         System Environment/Daemons
 Requires(pre): shadow-utils
+# RHEL: required for libpe_status API change from 7.6 to 7.7
+Conflicts:     sbd < 1.4.0
 
 %description -n %{name}-libs
 Pacemaker is an advanced, scalable High-Availability cluster resource
@@ -317,7 +307,7 @@ nodes and those just running the CLI tools.
 License:       GPLv2+ and LGPLv2+
 Summary:       Cluster Libraries used by Pacemaker
 Group:         System Environment/Daemons
-Requires:      %{name}-libs = %{version}-%{release}
+Requires:      %{name}-libs%{?_isa} = %{version}-%{release}
 
 %description -n %{name}-cluster-libs
 Pacemaker is an advanced, scalable High-Availability cluster resource
@@ -335,7 +325,7 @@ License:       GPLv2+ and LGPLv2+ and BSD
 %endif
 Summary:       Pacemaker remote daemon for non-cluster nodes
 Group:         System Environment/Daemons
-Requires:      %{name}-libs = %{version}-%{release}
+Requires:      %{name}-libs%{?_isa} = %{version}-%{release}
 Requires:      %{name}-cli = %{version}-%{release}
 Requires:      resource-agents
 Provides:      pcmk-cluster-manager
@@ -472,6 +462,7 @@ export LDFLAGS_HARDENED_LIB="%{?_hardening_ldflags}"
         %{!?with_hardening:  --disable-hardening}  \
         --with-initdir=%{_initrddir}               \
         --localstatedir=%{_var}                    \
+        --with-bug-url=https://bugzilla.redhat.com/ \
         --with-nagios                              \
         --with-nagios-metadata-dir=%{_datadir}/pacemaker/nagios/plugins-metadata/   \
         --with-nagios-plugin-dir=%{_libdir}/nagios/plugins/   \
@@ -881,35 +872,75 @@ exit 0
 %attr(0644,root,root) %{_datadir}/pacemaker/nagios/plugins-metadata/*
 
 %changelog
-* Tue Apr 30 2019 Ken Gaillot <kgaillot@redhat.com> - 1.1.19-8.5
-- Improve clients' authentication of IPC servers (CVE-2018-16877)
-- Fix use-after-free with potential information disclosure (CVE-2019-3885)
+* Fri May 24 2019 Ken Gaillot <kgaillot@redhat.com> - 1.1.20-5
+- Correct memory issue in fence agent output fix
+- Resolves: rhbz#1549366
+
+* Fri Apr 19 2019 Ken Gaillot <kgaillot@redhat.com> - 1.1.20-4
+- Update security patches
+- Resolves: rhbz#1694556
+- Resolves: rhbz#1694559
+- Resolves: rhbz#1694907
+
+* Thu Apr 4 2019 Ken Gaillot <kgaillot@redhat.com> - 1.1.20-3
+- Support more than 64KB of fence agent output
+- Avoid unnecessary recovery of group member
+- Improve IPC clients' authentication of servers (CVE-2018-16877)
 - Improve pacemakerd authentication of running subdaemons (CVE-2018-16878)
-- Resolves: rhbz#1694555
-- Resolves: rhbz#1700704
-- Resolves: rhbz#1700705
+- Fix use-after-free with potential information disclosure (CVE-2019-3885)
+- Resolves: rhbz#1549366
+- Resolves: rhbz#1609453
+- Resolves: rhbz#1694556
+- Resolves: rhbz#1694559
+- Resolves: rhbz#1694907
 
-* Mon Jan 14 2019 Ken Gaillot <kgaillot@redhat.com> - 1.1.19-8.4
-- Fix regression in resource clean-up/refresh when an operation is pending
-- Resolves: rhbz#1665816
+* Thu Mar 21 2019 Ken Gaillot <kgaillot@redhat.com> - 1.1.20-2
+- Assume unprivileged ACL if unable to get user information from host
+- Delay 2 seconds before re-attempting a failed node attribute write
+- SNMP alert sample script now sends all OIDs with every alert
+- Recover dependent resources correctly with asymmetric ordering
+- Rebase on upstream 1.1.20 final version
+- Resolves: rhbz#1596125
+- Resolves: rhbz#1597695
+- Resolves: rhbz#1608979
+- Resolves: rhbz#1628966
+- Resolves: rhbz#1644864
 
-* Tue Jan 8 2019 Ken Gaillot <kgaillot@redhat.com> - 1.1.19-8.3
-- Fix regression in crm_resource --refresh
-- Order resource moves after remote connection starts
-- Resolves: rhbz#1664242
-- Resolves: rhbz#1664243
-
-* Thu Nov 29 2018 Ken Gaillot <kgaillot@redhat.com> - 1.1.19-8.2
-- Don't schedule clone notifications behind stopped remote connection
-- Resolves: rhbz#1654602
-
-* Tue Nov 6 2018 Ken Gaillot <kgaillot@redhat.com> - 1.1.19-8.1
-- Route remote clone notifications through correct cluster node
-- Allow clean-up of managed guest nodes and bundle nodes
-- Allow use of guest nodes and bundles in clusters with sbd fencing
-- Resolves: rhbz#1646347
-- Resolves: rhbz#1646350
-- Resolves: rhbz#1646872
+* Fri Feb 1 2019 Ken Gaillot <kgaillot@redhat.com> - 1.1.20-1
+- pcs status now shows when a standby node still has active resources
+- Allow clean-up of guest nodes and bundles without unmanaging first
+- pcs status now shows pending and failed fence actions by default
+- Improve pcs status display when disconnected from cluster
+- Ensure node attributes are recorded if attrd writer is shutting down
+- Synchronize fencing history across all nodes
+- Add stonith_admin option to clear fencing history
+- Don't schedule unneeded bundle actions when connection is on different node
+- Allow use of sbd in clusters with guest nodes and bundles
+- Schedule bundle clone notifications correctly when connection is moving
+- Rebase on upstream 1.1.20-rc1 version
+- Avoid unneeded resource restarts when remote connection fails to start
+- Allow crm_resource --move to work when a previous move had a lifetime
+- Wait for all replies when refreshing a resource
+- Don't schedule clone notifications for a stopped bundle
+- Allow option to crm_resource --clear to clear only expired constraints
+- Fix result reporting when cleanup is done while an operation is in-flight
+- Resolves: rhbz#1419548
+- Resolves: rhbz#1448467
+- Resolves: rhbz#1461964
+- Resolves: rhbz#1486869
+- Resolves: rhbz#1535221
+- Resolves: rhbz#1555938
+- Resolves: rhbz#1595422
+- Resolves: rhbz#1627948
+- Resolves: rhbz#1638593
+- Resolves: rhbz#1644076
+- Resolves: rhbz#1644864
+- Resolves: rhbz#1648507
+- Resolves: rhbz#1648620
+- Resolves: rhbz#1652053
+- Resolves: rhbz#1652752
+- Resolves: rhbz#1658650
+- Resolves: rhbz#1665343
 
 * Mon Sep 24 2018 Ken Gaillot <kgaillot@redhat.com> - 1.1.19-8
 - Ensure crm_resource --force-* commands get stderr messages

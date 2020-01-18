@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2004 Andrew Beekhof
+# Copyright 2004-2019 Andrew Beekhof <andrew@beekhof.net>
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -30,7 +30,9 @@ lib_LTLIBRARIES	= libcrmcommon.la
 
 CFLAGS		= $(CFLAGS_COPY:-Wcast-qual=) -fPIC
 
-libcrmcommon_la_LDFLAGS	= -version-info 12:0:9
+noinst_HEADERS		= crmcommon_private.h
+
+libcrmcommon_la_LDFLAGS	= -version-info 13:0:10
 
 libcrmcommon_la_CFLAGS	= $(CFLAGS_HARDENED_LIB)
 libcrmcommon_la_LDFLAGS	+= $(LDFLAGS_HARDENED_LIB)
@@ -40,7 +42,7 @@ libcrmcommon_la_LIBADD	= @LIBADD_DL@ $(GNUTLSLIBS)
 libcrmcommon_la_SOURCES	= compat.c digest.c ipc.c io.c procfs.c utils.c xml.c	\
 			  iso8601.c remote.c mainloop.c logging.c watchdog.c	\
 			  schemas.c strings.c xpath.c attrd_client.c alerts.c	\
-			  operations.c
+			  operations.c acl.c agents.c nvpair.c
 if BUILD_CIBSECRETS
 libcrmcommon_la_SOURCES	+= cib_secrets.c
 endif

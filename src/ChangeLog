@@ -1,3 +1,52 @@
+* Mon Mar 04 2019 Ken Gaillot <kgaillot@redhat.com> Pacemaker-1.1.20-1
+- Changesets: 303
+- Diff:       139 files changed, 8751 insertions(+), 4923 deletions(-)
+
+- Features added since Pacemaker-1.1.19
+  + fencing: SBD may now be used in a cluster that has guest nodes or bundles
+  + fencing: synchronize fencing history among all nodes
+  + fencing: stonith_admin now has option to clear fence history
+  + tools: crm_mon now supports showing fencing action failures and history
+  + tools: crm_resource --clear supports new --expired option
+  + Pacemaker Remote: option to restrict TLS Diffie-Hellman prime length
+
+- Changes since Pacemaker-1.1.19
+  + Pacemaker Remote: avoid unnecessary downtime when moving resource to
+    Pacemaker Remote node that fails to come up (regression since 1.1.18)
+  + tools: restore stonith_admin ability to confirm unseen nodes are down
+    (regression since 1.1.12)
+  + build: minor logging fixes to allow compatibility with GCC 9 -Werror
+  + attrd: wait a short time before re-attempting failed writes
+  + attrd: ignore attribute delays when writing after node (re-)join
+  + attrd: start new election immediately if writer is lost
+  + attrd: detect alert configuration changes when CIB is entirely replaced
+  + attrd: clear election dampening when the writer leaves
+  + CIB: inform originator of CIB upgrade failure
+  + crmd: clear election dampening when DC is lost
+  + fencing: limit fencing history to 500 entries
+  + fencing: stonith_admin now complains if no action option is specified
+  + pengine: regression test compatibility with glib 2.59.0
+  + pengine: don't order non-DC shutdowns before DC fencing
+  + pengine: avoid unnecessary recovery of cleaned guest nodes
+  + pengine: convert unique clones to anonymous if not supported by standard
+  + pengine: don't send clone notifications to a stopped remote node
+  + pengine: ensure bundle clone notifications are directed to correct host
+  + pengine: avoid improper bundle monitor rescheduling or fail count clearing
+  + pengine: honor asymmetric orderings even when restarting
+  + ACLs: assume unprivileged ACL user if can't get user info
+  + Pacemaker Remote: get Diffie-Hellman prime bit length from GnuTLS API
+  + libcrmservice: cancel DBus call when cancelling systemd/upstart actions
+  + libcrmservice: order systemd resources relative to pacemaker_remote
+  + libpe_status: add public API constructor/destructor for pe_working_set_t
+  + tools: fix crm_resource --clear when lifetime was used with ban/move
+  + tools: fix crm_resource --move when lifetime was used with previous move
+  + tools: make crm_mon CIB connection errors non-fatal if previously successful
+  + tools: improve crm_mon messages when generating HTML output
+  + tools: crm_mon cluster connection failure is now "critical" in nagios mode
+  + tools: crm_mon listing of standby nodes shows if they have active resources
+  + tools: improve crm_report detection of logs
+  + tools: crm_simulate resource history uses same name as live cluster would
+
 * Wed Jul 11 2018 Ken Gaillot <kgaillot@redhat.com> Pacemaker-1.1.19-1
 - Changesets: 184
 - Diff:       99 files changed, 3900 insertions(+), 2435 deletions(-)

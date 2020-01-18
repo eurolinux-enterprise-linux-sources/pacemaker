@@ -1,0 +1,2659 @@
+From f91a961112ec9796181b42aa52f9c36dfa3c6a99 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jan=20Pokorn=C3=BD?= <jpokorny@redhat.com>
+Date: Tue, 2 Apr 2019 10:13:21 +0200
+Subject: [PATCH 1/7] High: libservices: fix use-after-free wrt. alert handling
+
+This could possibly lead to unsolicited information disclosure by the
+means of standard output of the immediately preceding agent/resource
+execution leaking into the log stream under some circumstances.
+It was hence assigned CVE-2019-3885.
+
+The provoked pathological state of pacemaker-execd daemon progresses
+towards crashing it for hitting segmentation fault.
+---
+ lib/services/services.c       | 40 +---------------------------------------
+ lib/services/services_linux.c | 35 +++++++++++++++++++++++++++++++----
+ 2 files changed, 32 insertions(+), 43 deletions(-)
+
+diff --git a/lib/services/services.c b/lib/services/services.c
+index ef2c5fc..1d06c5d 100644
+--- a/lib/services/services.c
++++ b/lib/services/services.c
+@@ -450,35 +450,6 @@ services_action_user(svc_action_t *op, const char *user)
+     return crm_user_lookup(user, &(op->opaque->uid), &(op->opaque->gid));
+ }
+ 
+-static void
+-set_alert_env(gpointer key, gpointer value, gpointer user_data)
+-{
+-    int rc;
+-
+-    if (value) {
+-        rc = setenv(key, value, 1);
+-    } else {
+-        rc = unsetenv(key);
+-    }
+-
+-    if (rc < 0) {
+-        crm_perror(LOG_ERR, "setenv %s=%s",
+-                  (char*)key, (value? (char*)value : ""));
+-    } else {
+-        crm_trace("setenv %s=%s", (char*)key, (value? (char*)value : ""));
+-    }
+-}
+-
+-static void
+-unset_alert_env(gpointer key, gpointer value, gpointer user_data)
+-{
+-    if (unsetenv(key) < 0) {
+-        crm_perror(LOG_ERR, "unset %s", (char*)key);
+-    } else {
+-        crm_trace("unset %s", (char*)key);
+-    }
+-}
+-
+ /*!
+  * \brief Execute an alert agent action
+  *
+@@ -493,18 +464,9 @@ unset_alert_env(gpointer key, gpointer value, gpointer user_data)
+ gboolean
+ services_alert_async(svc_action_t *action, void (*cb)(svc_action_t *op))
+ {
+-    gboolean responsible;
+-
+     action->synchronous = false;
+     action->opaque->callback = cb;
+-    if (action->params) {
+-        g_hash_table_foreach(action->params, set_alert_env, NULL);
+-    }
+-    responsible = services_os_action_execute(action);
+-    if (action->params) {
+-        g_hash_table_foreach(action->params, unset_alert_env, NULL);
+-    }
+-    return responsible;
++    return services_os_action_execute(action);
+ }
+ 
+ #if SUPPORT_DBUS
+diff --git a/lib/services/services_linux.c b/lib/services/services_linux.c
+index 705901e..2047b64 100644
+--- a/lib/services/services_linux.c
++++ b/lib/services/services_linux.c
+@@ -159,6 +159,25 @@ set_ocf_env_with_prefix(gpointer key, gpointer value, gpointer user_data)
+     set_ocf_env(buffer, value, user_data);
+ }
+ 
++static void
++set_alert_env(gpointer key, gpointer value, gpointer user_data)
++{
++    int rc;
++
++    if (value != NULL) {
++        rc = setenv(key, value, 1);
++    } else {
++        rc = unsetenv(key);
++    }
++
++    if (rc < 0) {
++        crm_perror(LOG_ERR, "setenv %s=%s",
++                  (char*)key, (value? (char*)value : ""));
++    } else {
++        crm_trace("setenv %s=%s", (char*)key, (value? (char*)value : ""));
++    }
++}
++
+ /*!
+  * \internal
+  * \brief Add environment variables suitable for an action
+@@ -168,12 +187,20 @@ set_ocf_env_with_prefix(gpointer key, gpointer value, gpointer user_data)
+ static void
+ add_action_env_vars(const svc_action_t *op)
+ {
+-    if (safe_str_eq(op->standard, PCMK_RESOURCE_CLASS_OCF) == FALSE) {
+-        return;
++    void (*env_setter)(gpointer, gpointer, gpointer) = NULL;
++    if (op->agent == NULL) {
++        env_setter = set_alert_env;  /* we deal with alert handler */
++
++    } else if (safe_str_eq(op->standard, PCMK_RESOURCE_CLASS_OCF)) {
++        env_setter = set_ocf_env_with_prefix;
+     }
+ 
+-    if (op->params) {
+-        g_hash_table_foreach(op->params, set_ocf_env_with_prefix, NULL);
++    if (env_setter != NULL && op->params != NULL) {
++        g_hash_table_foreach(op->params, env_setter, NULL);
++    }
++
++    if (env_setter == NULL || env_setter == set_alert_env) {
++        return;
+     }
+ 
+     set_ocf_env("OCF_RA_VERSION_MAJOR", "1", NULL);
+-- 
+1.8.3.1
+
+
+From ab44422fa955c2dff1ac1822521e7ad335d4aab7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jan=20Pokorn=C3=BD?= <jpokorny@redhat.com>
+Date: Mon, 15 Apr 2019 23:19:44 +0200
+Subject: [PATCH 2/7] High: pacemakerd vs. IPC/procfs confused deputy
+ authenticity issue (0/4)
+
+[0/4: make crm_pid_active more precise as to when detections fail]
+
+It would be bad if the function claimed the process is not active
+when the only obstacle in the detection process was that none of the
+detection methods worked for a plain lack of permissions to apply
+them.  Also, do some other minor cleanup of the function and add its
+documentation.  As an additional measure, log spamming is kept at
+minimum for repeated queries about the same PID.
+---
+ include/crm_internal.h | 21 +++++++++++
+ lib/common/utils.c     | 96 +++++++++++++++++++++++++++-----------------------
+ 2 files changed, 73 insertions(+), 44 deletions(-)
+
+diff --git a/include/crm_internal.h b/include/crm_internal.h
+index 5692929..0adeb7b 100644
+--- a/include/crm_internal.h
++++ b/include/crm_internal.h
+@@ -140,6 +140,27 @@ extern int node_score_yellow;
+ extern int node_score_infinity;
+ 
+ /* Assorted convenience functions */
++
++/*!
++ * \internal
++ * \brief Detect if process per PID and optionally exe path (component) exists
++ *
++ * \param[in] pid     PID of process assumed alive, disproving of which to try
++ * \param[in] daemon  exe path (component) to possibly match with procfs entry
++ *
++ * \return -1 on invalid PID specification, -2 when the calling process has no
++ *         (is refused an) ability to (dis)prove the predicate,
++ *         0 if the negation of the predicate is confirmed (check-through-kill
++ *         indicates so, or the subsequent check-through-procfs-match on
++ *         \p daemon when provided and procfs available at the standard path),
++ *         1 if it cannot be disproved (reliably [modulo race conditions]
++ *         when \p daemon provided, procfs available at the standard path
++ *         and the calling process has permissions to access the respective
++ *         procfs location, less so otherwise, since mere check-through-kill
++ *         is exercised without powers to exclude PID recycled in the interim).
++ *
++ * \note This function cannot be used to verify \e authenticity of the process.
++ */
+ int crm_pid_active(long pid, const char *daemon);
+ void crm_make_daemon(const char *name, gboolean daemonize, const char *pidfile);
+ 
+diff --git a/lib/common/utils.c b/lib/common/utils.c
+index f3f60ed..2ac7901 100644
+--- a/lib/common/utils.c
++++ b/lib/common/utils.c
+@@ -1,19 +1,10 @@
+ /*
+- * Copyright (C) 2004 Andrew Beekhof <andrew@beekhof.net>
++ * Copyright 2004-2019 the Pacemaker project contributors
+  *
+- * This library is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU Lesser General Public
+- * License as published by the Free Software Foundation; either
+- * version 2.1 of the License, or (at your option) any later version.
++ * The version control history for this file may have further details.
+  *
+- * This library is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+- * Lesser General Public License for more details.
+- *
+- * You should have received a copy of the GNU Lesser General Public
+- * License along with this library; if not, write to the Free Software
+- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
++ * This source code is licensed under the GNU Lesser General Public License
++ * version 2.1 or later (LGPLv2.1+) WITHOUT ANY WARRANTY.
+  */
+ 
+ #include <crm_internal.h>
+@@ -717,16 +708,21 @@ crm_abort(const char *file, const char *function, int line,
+ int
+ crm_pid_active(long pid, const char *daemon)
+ {
++    static int last_asked_pid = 0;  /* log spam prevention */
++#if SUPPORT_PROCFS
+     static int have_proc_pid = 0;
++#else
++    static int have_proc_pid = -1;
++#endif
++    int rc = 0;
+ 
+-    if(have_proc_pid == 0) {
++    if (have_proc_pid == 0) {
++        /* evaluation of /proc/PID/exe applicability via self-introspection */
+         char proc_path[PATH_MAX], exe_path[PATH_MAX];
+-
+-        /* check to make sure pid hasn't been reused by another process */
+-        snprintf(proc_path, sizeof(proc_path), "/proc/%lu/exe", (long unsigned int)getpid());
+-
++        snprintf(proc_path, sizeof(proc_path), "/proc/%lu/exe",
++                 (long unsigned int) getpid());
+         have_proc_pid = 1;
+-        if(readlink(proc_path, exe_path, PATH_MAX - 1) < 0) {
++        if (readlink(proc_path, exe_path, sizeof(exe_path) - 1) < 0) {
+             have_proc_pid = -1;
+         }
+     }
+@@ -734,40 +730,52 @@ crm_pid_active(long pid, const char *daemon)
+     if (pid <= 0) {
+         return -1;
+ 
+-    } else if (kill(pid, 0) < 0 && errno == ESRCH) {
+-        return 0;
++    } else if ((rc = kill(pid, 0)) < 0 && errno == ESRCH) {
++        return 0;  /* no such PID detected */
+ 
+-    } else if(daemon == NULL || have_proc_pid == -1) {
+-        return 1;
++    } else if (rc < 0 && have_proc_pid == -1) {
++        if (last_asked_pid != pid) {
++            crm_info("Cannot examine PID %ld: %s", pid, strerror(errno));
++            last_asked_pid = pid;
++        }
++        return -2;  /* errno != ESRCH */
++
++    } else if (rc == 0 && (daemon == NULL || have_proc_pid == -1)) {
++        return 1;  /* kill as the only indicator, cannot double check */
+ 
+     } else {
+-        int rc = 0;
++        /* make sure PID hasn't been reused by another process
++           XXX: might still be just a zombie, which could confuse decisions */
++        bool checked_through_kill = (rc == 0);
+         char proc_path[PATH_MAX], exe_path[PATH_MAX], myexe_path[PATH_MAX];
+-
+-        /* check to make sure pid hasn't been reused by another process */
+-        snprintf(proc_path, sizeof(proc_path), "/proc/%lu/exe", pid);
+-
+-        rc = readlink(proc_path, exe_path, PATH_MAX - 1);
+-        if (rc < 0 && errno == EACCES) {
+-            crm_perror(LOG_INFO, "Could not read from %s", proc_path);
+-            return 1;
++        snprintf(proc_path, sizeof(proc_path), "/proc/%ld/exe", pid);
++
++        rc = readlink(proc_path, exe_path, sizeof(exe_path) - 1);
++        if ((rc < 0) && (errno == EACCES)) {
++            if (last_asked_pid != pid) {
++                crm_info("Could not read from %s: %s", proc_path,
++                         strerror(errno));
++                last_asked_pid = pid;
++            }
++            return checked_through_kill ? 1 : -2;
+         } else if (rc < 0) {
+-            crm_perror(LOG_ERR, "Could not read from %s", proc_path);
+-            return 0;
++            if (last_asked_pid != pid) {
++                crm_err("Could not read from %s: %s (%d)", proc_path,
++                        strerror(errno), errno);
++                last_asked_pid = pid;
++            }
++            return 0;  /* most likely errno == ENOENT */
+         }
+-        
++        exe_path[rc] = '\0';
+ 
+-        exe_path[rc] = 0;
+-
+-        if(daemon[0] != '/') {
+-            rc = snprintf(myexe_path, sizeof(proc_path), CRM_DAEMON_DIR"/%s", daemon);
+-            myexe_path[rc] = 0;
++        if (daemon[0] != '/') {
++            rc = snprintf(myexe_path, sizeof(myexe_path), CRM_DAEMON_DIR"/%s",
++                          daemon);
+         } else {
+-            rc = snprintf(myexe_path, sizeof(proc_path), "%s", daemon);
+-            myexe_path[rc] = 0;
++            rc = snprintf(myexe_path, sizeof(myexe_path), "%s", daemon);
+         }
+-        
+-        if (strcmp(exe_path, myexe_path) == 0) {
++
++        if (rc > 0 && rc < sizeof(myexe_path) && !strcmp(exe_path, myexe_path)) {
+             return 1;
+         }
+     }
+-- 
+1.8.3.1
+
+
+From 6888aaf3ad365ef772f8189c9958f58b85ec62d4 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jan=20Pokorn=C3=BD?= <jpokorny@redhat.com>
+Date: Mon, 15 Apr 2019 23:20:42 +0200
+Subject: [PATCH 3/7] High: pacemakerd vs. IPC/procfs confused deputy
+ authenticity issue (1/4)
+
+[1/4: new helpers to allow IPC client side to authenticate the server]
+
+The title problem here could possibly lead to local privilege escalation
+up to the root's level (and implicitly unguarded by some additional
+protection layers like SELinux unless the defaults constrained further).
+
+Main problem is that the authenticity assumptions were built on two,
+seemingly mutually supporting legs leading to two CVEs assigned:
+
+* procfs (mere process existence and right path to binary check)
+  used to verify (this part was assigned CVE-2018-16878), and
+
+* one-way only client-server authentication, putting the client
+  here at the mercy of the server not necessarily cross-verified
+  per the above point if at all (this part was assigned
+  CVE-2018-16877)
+
+whereas these two were in fact orthogonal, tearing security
+assumptions about the "passive influencers" in the pacemaker's daemon
+resilience-friendly constellation (orchestrated by the main of them,
+pacemakerd) apart.  Moreover, procfs-based approach is discouraged
+for other reasons.
+
+The layout of the basic fix is as follows:
+* 1/4: new helpers to allow IPC client side to authenticate the server
+       (this commit, along with unifying subsequent solution for
+       both CVEs)
+* 2/4: pacemakerd to trust pre-existing processes via new checks instead
+       (along with unifying solution for both CVEs)
+* 3/4: other daemons to authenticate IPC servers of fellow processes
+       (along with addressing CVE-2018-16877 alone, for parts of
+       pacemaker not covered earlier)
+* 4/4: CPG users to be careful about now-more-probable rival processes
+       (this is merely to mitigate corner case fallout from the new
+       approaches taken to face CVE-2018-16878 in particular;
+       courtesy of Yan Gao of SUSE for reporting this)
+
+With "basic", it is meant that it constitutes a self-contained best
+effort solution with some compromises that can only be overcome with the
+assistance of IPC library, libqb, as is also elaborated in messages of
+remaining "fix" commits.  Beside that, also conventional encapsulation
+of server-by-client authentication would be useful, but lack thereof
+is not an obstacle (more so should there by any security related
+neglectations on the IPC client side and its connection initiating
+arrangement within libqb that has a potential to strike as early as
+when the authenticity of the server side is yet to be examined).
+
+One extra kludge that's introduced for FreeBSD lacking Unix socket to
+remote peer PID mapping is masquerading such an unspecified PID with
+value of 1, since that shall always be around as "init" task and,
+deferring to proof by contradiction, cannot be pacemakerd-spawned
+child either even if PID 1 was pacemakerd (and running such a child
+alone is rather nonsensical).  The code making decisions based on that
+value must acknowledge this craze and refrain from killing/signalling
+the underlying process on this platform (but shall in general follow
+the same elsewhere, keep in mind systemd socket-based activation for
+instance, which would end up in such a situation easily!).
+---
+ configure.ac                      |  43 +++++++++++
+ include/crm/common/Makefile.am    |   7 +-
+ include/crm/common/ipc.h          |  55 +++++++++----
+ include/crm/common/ipc_internal.h |  69 +++++++++++++++++
+ lib/common/ipc.c                  | 158 ++++++++++++++++++++++++++++++++++----
+ 5 files changed, 303 insertions(+), 29 deletions(-)
+ create mode 100644 include/crm/common/ipc_internal.h
+
+diff --git a/configure.ac b/configure.ac
+index ed51f67..ce02777 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -465,6 +465,48 @@ do
+   fi
+ done
+ 
++us_auth=
++AC_CHECK_HEADER([sys/socket.h], [
++    AC_CHECK_DECL([SO_PEERCRED], [
++        # Linux
++        AC_CHECK_TYPE([struct ucred], [
++            us_auth=peercred_ucred;
++            AC_DEFINE([US_AUTH_PEERCRED_UCRED], [1],
++                      [Define if Unix socket auth method is
++                       getsockopt(s, SO_PEERCRED, &ucred, ...)])
++        ], [
++            # OpenBSD
++            AC_CHECK_TYPE([struct sockpeercred], [
++                us_auth=localpeercred_sockepeercred;
++                AC_DEFINE([US_AUTH_PEERCRED_SOCKPEERCRED], [1],
++                          [Define if Unix socket auth method is
++                           getsockopt(s, SO_PEERCRED, &sockpeercred, ...)])
++            ], [], [[#include <sys/socket.h>]])
++        ], [[#define _GNU_SOURCE
++             #include <sys/socket.h>]])
++    ], [], [[#include <sys/socket.h>]])
++])
++
++if test -z "${us_auth}"; then
++    # FreeBSD
++    AC_CHECK_DECL([getpeereid], [
++        us_auth=getpeereid;
++        AC_DEFINE([US_AUTH_GETPEEREID], [1],
++                  [Define if Unix socket auth method is
++                   getpeereid(s, &uid, &gid)])
++    ], [
++        # Solaris/OpenIndiana
++        AC_CHECK_DECL([getpeerucred], [
++            us_auth=getpeerucred;
++            AC_DEFINE([US_AUTH_GETPEERUCRED], [1],
++                      [Define if Unix socket auth method is
++                       getpeercred(s, &ucred)])
++        ], [
++            AC_MSG_ERROR([No way to authenticate a Unix socket peer])
++        ], [[#include <ucred.h>]])
++    ])
++fi
++
+ dnl This OS-based decision-making is poor autotools practice;
+ dnl feature-based mechanisms are strongly preferred.
+ dnl
+@@ -2179,3 +2221,4 @@ AC_MSG_RESULT([  LDFLAGS_HARDENED_EXE     = ${LDFLAGS_HARDENED_EXE}])
+ AC_MSG_RESULT([  LDFLAGS_HARDENED_LIB     = ${LDFLAGS_HARDENED_LIB}])
+ AC_MSG_RESULT([  Libraries                = ${LIBS}])
+ AC_MSG_RESULT([  Stack Libraries          = ${CLUSTERLIBS}])
++AC_MSG_RESULT([  Unix socket auth method  = ${us_auth}])
+diff --git a/include/crm/common/Makefile.am b/include/crm/common/Makefile.am
+index b90ac79..aacb6ff 100644
+--- a/include/crm/common/Makefile.am
++++ b/include/crm/common/Makefile.am
+@@ -1,5 +1,7 @@
+ #
+-# Copyright 2004-2019 Andrew Beekhof <andrew@beekhof.net>
++# Copyright 2004-2019 the Pacemaker project contributors
++#
++# The version control history for this file may have further details.
+ #
+ # This source code is licensed under the GNU General Public License version 2
+ # or later (GPLv2+) WITHOUT ANY WARRANTY.
+@@ -11,7 +13,8 @@ headerdir=$(pkgincludedir)/crm/common
+ 
+ header_HEADERS = xml.h ipc.h util.h iso8601.h mainloop.h logging.h \
+ 		 nvpair.h
+-noinst_HEADERS = ipcs.h internal.h remote_internal.h xml_internal.h
++noinst_HEADERS = ipcs.h internal.h remote_internal.h xml_internal.h \
++		 ipc_internal.h
+ if BUILD_CIBSECRETS
+ noinst_HEADERS += cib_secrets.h
+ endif
+diff --git a/include/crm/common/ipc.h b/include/crm/common/ipc.h
+index 8722252..df56bbe 100644
+--- a/include/crm/common/ipc.h
++++ b/include/crm/common/ipc.h
+@@ -1,19 +1,10 @@
+ /*
+- * Copyright (C) 2013 Andrew Beekhof <andrew@beekhof.net>
++ * Copyright 2013-2019 the Pacemaker project contributors
+  *
+- * This program is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU Lesser General Public
+- * License as published by the Free Software Foundation; either
+- * version 2 of the License, or (at your option) any later version.
++ * The version control history for this file may have further details.
+  *
+- * This software is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+- * General Public License for more details.
+- *
+- * You should have received a copy of the GNU Lesser General Public
+- * License along with this library; if not, write to the Free Software
+- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
++ * This source code is licensed under the GNU Lesser General Public License
++ * version 2.1 or later (LGPLv2.1+) WITHOUT ANY WARRANTY.
+  */
+ #ifndef CRM_COMMON_IPC__H
+ #  define CRM_COMMON_IPC__H
+@@ -77,6 +68,44 @@ uint32_t crm_ipc_buffer_flags(crm_ipc_t * client);
+ const char *crm_ipc_name(crm_ipc_t * client);
+ unsigned int crm_ipc_default_buffer_size(void);
+ 
++/*!
++ * \brief Check the authenticity of the IPC socket peer process
++ *
++ * If everything goes well, peer's authenticity is verified by the means
++ * of comparing against provided referential UID and GID (either satisfies),
++ * and the result of this check can be deduced from the return value.
++ * As an exception, detected UID of 0 ("root") satisfies arbitrary
++ * provided referential daemon's credentials.
++ *
++ * \param[in]  sock    IPC related, connected Unix socket to check peer of
++ * \param[in]  refuid  referential UID to check against
++ * \param[in]  refgid  referential GID to check against
++ * \param[out] gotpid  to optionally store obtained PID of the peer
++ *                     (not available on FreeBSD, special value of 1
++ *                     used instead, and the caller is required to
++ *                     special case this value respectively)
++ * \param[out] gotuid  to optionally store obtained UID of the peer
++ * \param[out] gotgid  to optionally store obtained GID of the peer
++ *
++ * \return 0 if IPC related socket's peer is not authentic given the
++ *         referential credentials (see above), 1 if it is,
++ *         negative value on error (generally expressing -errno unless
++ *         it was zero even on nonhappy path, -pcmk_err_generic is
++ *         returned then; no message is directly emitted)
++ *
++ * \note While this function is tolerant on what constitutes authorized
++ *       IPC daemon process (its effective user matches UID=0 or \p refuid,
++ *       or at least its group matches \p refroup), either or both (in case
++ *       of UID=0) mismatches on the expected credentials of such peer
++ *       process \e shall be investigated at the caller when value of 1
++ *       gets returned there, since higher-than-expected privileges in
++ *       respect to the expected/intended credentials possibly violate
++ *       the least privilege principle and may pose an additional risk
++ *       (i.e. such accidental inconsistency shall be eventually fixed).
++ */
++int crm_ipc_is_authentic_process(int sock, uid_t refuid, gid_t refgid,
++                                 pid_t *gotpid, uid_t *gotuid, gid_t *gotgid);
++
+ /* Utils */
+ xmlNode *create_hello_message(const char *uuid, const char *client_name,
+                               const char *major_version, const char *minor_version);
+diff --git a/include/crm/common/ipc_internal.h b/include/crm/common/ipc_internal.h
+new file mode 100644
+index 0000000..41a6653
+--- /dev/null
++++ b/include/crm/common/ipc_internal.h
+@@ -0,0 +1,69 @@
++/*
++ * Copyright 2019 the Pacemaker project contributors
++ *
++ * The version control history for this file may have further details.
++ *
++ * This source code is licensed under the GNU Lesser General Public License
++ * version 2.1 or later (LGPLv2.1+) WITHOUT ANY WARRANTY.
++ */
++
++#ifndef PCMK__IPC_INTERNAL_H
++#define PCMK__IPC_INTERNAL_H
++
++#include <sys/types.h>
++
++#include <crm_config.h>  /* US_AUTH_GETPEEREID */
++
++
++/* denotes "non yieldable PID" on FreeBSD, or actual PID1 in scenarios that
++   require a delicate handling anyway (socket-based activation with systemd);
++   we can be reasonably sure that this PID is never possessed by the actual
++   child daemon, as it gets taken either by the proper init, or by pacemakerd
++   itself (i.e. this precludes anything else); note that value of zero
++   is meant to carry "unset" meaning, and better not to bet on/conditionalize
++   over signedness of pid_t */
++#define PCMK__SPECIAL_PID  1
++
++#if defined(US_AUTH_GETPEEREID)
++/* on FreeBSD, we don't want to expose "non-yieldable PID" (leading to
++   "IPC liveness check only") as its nominal representation, which could
++   cause confusion -- this is unambiguous as long as there's no
++   socket-based activation like with systemd (very improbable) */
++#define PCMK__SPECIAL_PID_AS_0(p)  (((p) == PCMK__SPECIAL_PID) ? 0 : (p))
++#else
++#define PCMK__SPECIAL_PID_AS_0(p)  (p)
++#endif
++
++/*!
++ * \internal
++ * \brief Check the authenticity and liveness of the process via IPC end-point
++ *
++ * When IPC daemon under given IPC end-point (name) detected, its authenticity
++ * is verified by the means of comparing against provided referential UID and
++ * GID, and the result of this check can be deduced from the return value.
++ * As an exception, referential UID of 0 (~ root) satisfies arbitrary
++ * detected daemon's credentials.
++ *
++ * \param[in]  name    IPC name to base the search on
++ * \param[in]  refuid  referential UID to check against
++ * \param[in]  refgid  referential GID to check against
++ * \param[out] gotpid  to optionally store obtained PID of the found process
++ *                     upon returning 1 or -2
++ *                     (not available on FreeBSD, special value of 1,
++ *                     see PCMK__SPECIAL_PID, used instead, and the caller
++ *                     is required to special case this value respectively)
++ *
++ * \return 0 if no trace of IPC peer's liveness detected, 1 if it was,
++ *         -1 on error, and -2 when the IPC blocked with unauthorized
++ *         process (log message emitted in both latter cases)
++ *
++ * \note This function emits a log message also in case there isn't a perfect
++ *       match in respect to \p reguid and/or \p refgid, for a possible
++ *       least privilege principle violation.
++ *
++ * \see crm_ipc_is_authentic_process
++ */
++int pcmk__ipc_is_authentic_process_active(const char *name, uid_t refuid,
++                                          gid_t refgid, pid_t *gotpid);
++
++#endif
+diff --git a/lib/common/ipc.c b/lib/common/ipc.c
+index 3258bcb..5b47dd6 100644
+--- a/lib/common/ipc.c
++++ b/lib/common/ipc.c
+@@ -1,23 +1,25 @@
+ /*
+- * Copyright (C) 2004 Andrew Beekhof <andrew@beekhof.net>
++ * Copyright 2004-2019 the Pacemaker project contributors
+  *
+- * This library is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU Lesser General Public
+- * License as published by the Free Software Foundation; either
+- * version 2.1 of the License, or (at your option) any later version.
++ * The version control history for this file may have further details.
+  *
+- * This library is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+- * Lesser General Public License for more details.
+- *
+- * You should have received a copy of the GNU Lesser General Public
+- * License along with this library; if not, write to the Free Software
+- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
++ * This source code is licensed under the GNU Lesser General Public License
++ * version 2.1 or later (LGPLv2.1+) WITHOUT ANY WARRANTY.
+  */
+ 
+ #include <crm_internal.h>
+ 
++#if defined(US_AUTH_PEERCRED_UCRED) || defined(US_AUTH_PEERCRED_SOCKPEERCRED)
++#  ifdef US_AUTH_PEERCRED_UCRED
++#    ifndef _GNU_SOURCE
++#      define _GNU_SOURCE
++#    endif
++#  endif
++#  include <sys/socket.h>
++#elif defined(US_AUTH_GETPEERUCRED)
++#  include <ucred.h>
++#endif
++
+ #include <sys/param.h>
+ 
+ #include <stdio.h>
+@@ -30,11 +32,13 @@
+ #include <fcntl.h>
+ #include <bzlib.h>
+ 
+-#include <crm/crm.h>
++#include <crm/crm.h>   /* indirectly: pcmk_err_generic */
+ #include <crm/msg_xml.h>
+ #include <crm/common/ipc.h>
+ #include <crm/common/ipcs.h>
+ 
++#include <crm/common/ipc_internal.h>  /* PCMK__SPECIAL_PID* */
++
+ #define PCMK_IPC_VERSION 1
+ 
+ /* Evict clients whose event queue grows this large (by default) */
+@@ -1375,6 +1379,132 @@ crm_ipc_send(crm_ipc_t * client, xmlNode * message, enum crm_ipc_flags flags, in
+     return rc;
+ }
+ 
++int
++crm_ipc_is_authentic_process(int sock, uid_t refuid, gid_t refgid,
++                             pid_t *gotpid, uid_t *gotuid, gid_t *gotgid) {
++    int ret = 0;
++    pid_t found_pid = 0; uid_t found_uid = 0; gid_t found_gid = 0;
++#if defined(US_AUTH_PEERCRED_UCRED)
++    struct ucred ucred;
++    socklen_t ucred_len = sizeof(ucred);
++
++    if (!getsockopt(sock, SOL_SOCKET, SO_PEERCRED,
++                    &ucred, &ucred_len)
++                && ucred_len == sizeof(ucred)) {
++        found_pid = ucred.pid; found_uid = ucred.uid; found_gid = ucred.gid;
++
++#elif defined(US_AUTH_PEERCRED_SOCKPEERCRED)
++    struct sockpeercred sockpeercred;
++    socklen_t sockpeercred_len = sizeof(sockpeercred);
++
++    if (!getsockopt(sock, SOL_SOCKET, SO_PEERCRED,
++                    &sockpeercred, &sockpeercred_len)
++                && sockpeercred_len == sizeof(sockpeercred_len)) {
++        found_pid = sockpeercred.pid;
++        found_uid = sockpeercred.uid; found_gid = sockpeercred.gid;
++
++#elif defined(US_AUTH_GETPEEREID)
++    if (!getpeereid(sock, &found_uid, &found_gid)) {
++        found_pid = PCMK__SPECIAL_PID;  /* cannot obtain PID (FreeBSD) */
++
++#elif defined(US_AUTH_GETPEERUCRED)
++    ucred_t *ucred;
++    if (!getpeerucred(sock, &ucred)) {
++        errno = 0;
++        found_pid = ucred_getpid(ucred);
++        found_uid = ucred_geteuid(ucred); found_gid = ucred_getegid(ucred);
++        ret = -errno;
++        ucred_free(ucred);
++        if (ret) {
++            return (ret < 0) ? ret : -pcmk_err_generic;
++        }
++
++#else
++#  error "No way to authenticate a Unix socket peer"
++    errno = 0;
++    if (0) {
++#endif
++        if (gotpid != NULL) {
++            *gotpid = found_pid;
++        }
++        if (gotuid != NULL) {
++            *gotuid = found_uid;
++        }
++        if (gotgid != NULL) {
++            *gotgid = found_gid;
++        }
++        ret = (found_uid == 0 || found_uid == refuid || found_gid == refgid);
++    } else {
++        ret = (errno > 0) ? -errno : -pcmk_err_generic;
++    }
++
++    return ret;
++}
++
++int
++pcmk__ipc_is_authentic_process_active(const char *name, uid_t refuid,
++                                      gid_t refgid, pid_t *gotpid) {
++    static char last_asked_name[PATH_MAX / 2] = "";  /* log spam prevention */
++    int fd, ret = 0;
++    pid_t found_pid = 0; uid_t found_uid = 0; gid_t found_gid = 0;
++    qb_ipcc_connection_t *c;
++
++    if ((c = qb_ipcc_connect(name, 0)) == NULL) {
++        crm_info("Could not connect to %s IPC: %s", name, strerror(errno));
++
++    } else if ((ret = qb_ipcc_fd_get(c, &fd))) {
++        crm_err("Could not get fd from %s IPC: %s (%d)", name,
++                strerror(-ret), -ret);
++        ret = -1;
++
++    } else if ((ret = crm_ipc_is_authentic_process(fd, refuid, refgid,
++                                                   &found_pid, &found_uid,
++                                                   &found_gid)) < 0) {
++        if (ret == -pcmk_err_generic) {
++            crm_err("Could not get peer credentials from %s IPC", name);
++        } else {
++            crm_err("Could not get peer credentials from %s IPC: %s (%d)",
++                    name, strerror(-ret), -ret);
++        }
++        ret = -1;
++
++    } else {
++        if (gotpid != NULL) {
++            *gotpid = found_pid;
++        }
++
++        if (!ret) {
++            crm_err("Daemon (IPC %s) effectively blocked with unauthorized"
++                    " process %lld (uid: %lld, gid: %lld)",
++                    name, (long long) PCMK__SPECIAL_PID_AS_0(found_pid),
++                    (long long) found_uid, (long long) found_gid);
++            ret = -2;
++        } else if ((found_uid != refuid || found_gid != refgid)
++                && strncmp(last_asked_name, name, sizeof(last_asked_name))) {
++            if (!found_uid && refuid) {
++                crm_warn("Daemon (IPC %s) runs as root, whereas the expected"
++                         " credentials are %lld:%lld, hazard of violating"
++                         " the least privilege principle",
++                         name, (long long) refuid, (long long) refgid);
++            } else {
++                crm_notice("Daemon (IPC %s) runs as %lld:%lld, whereas the"
++                           " expected credentials are %lld:%lld, which may"
++                           " mean a different set of privileges than expected",
++                           name, (long long) found_uid, (long long) found_gid,
++                           (long long) refuid, (long long) refgid);
++            }
++            memccpy(last_asked_name, name, '\0', sizeof(last_asked_name));
++        }
++    }
++
++    if (ret) {  /* here, !ret only when we could not initially connect */
++        qb_ipcc_disconnect(c);
++    }
++
++    return ret;
++}
++
++
+ /* Utils */
+ 
+ xmlNode *
+-- 
+1.8.3.1
+
+
+From 904c53ea311fd6fae945a55202b0a7ccf3783465 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jan=20Pokorn=C3=BD?= <jpokorny@redhat.com>
+Date: Tue, 16 Apr 2019 00:04:47 +0200
+Subject: [PATCH 4/7] High: pacemakerd vs. IPC/procfs confused deputy
+ authenticity issue (2/4)
+
+[2/4: pacemakerd to trust pre-existing processes via new checks instead]
+
+In pacemakerd in the context of entrusting pre-existing processes,
+we now resort to procfs-based solution only in boundary, fouled cases,
+and primarily examine the credentials of the processes already
+occupying known IPC end-points before adopting them.
+
+The commit applies the new helpers from 1/1 so as to close the both
+related sensitive problems, CVE-2018-16877 and CVE-2018-16878, in
+a unified manner, this time limited to the main daemon of pacemaker
+(pacemakerd).
+
+To be noted that it is clearly not 100% for this purpose for still
+allowing for TOCTTOU, but that's what commit (3/3) is meant to solve
+for the most part, plus there may be optimizations solving this concern
+as a side effect, but that requires an active assistance on the libqb
+side (https://github.com/ClusterLabs/libqb/issues/325) since any
+improvement on pacemaker side in isolation would be very
+cumbersome if generally possible at all, but either way
+means a new, soft compatibility encumberment.
+
+As a follow-up to what was put in preceding 1/3 commit, PID of 1 tracked
+as child's identification on FreeBSD (or when socket-based activation is
+used with systemd) is treated specially, incl. special precaution with
+child's PID discovered as 1 elsewhere.
+
+v2: courtesy of Yan Gao of SUSE for early discovery and report for
+    what's primarily solved with 4/4 commit, in extension, child
+    daemons in the initialization phase coinciding with IPC-feasibility
+    based process scan in pacemakerd in a way that those are missed
+    (although they are to come up fully just moments later only
+    to interfere with naturally spawned ones) are now considered so
+    that if any native children later fail for said clash, the
+    pre-existing counterpart may get adopted instead of ending up
+    with repeated spawn-bury loop ad nauseam without real progress
+    (note that PCMK_fail_fast=true could possibly help, but that's
+    rather a big hammer not suitable for all the use cases, not
+    the ones we try to deal with gracefully here)
+---
+ mcp/pacemaker.c | 431 +++++++++++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 362 insertions(+), 69 deletions(-)
+
+diff --git a/mcp/pacemaker.c b/mcp/pacemaker.c
+index 2986be6..86df216 100644
+--- a/mcp/pacemaker.c
++++ b/mcp/pacemaker.c
+@@ -1,5 +1,7 @@
+ /*
+- * Copyright 2010-2018 Andrew Beekhof <andrew@beekhof.net>
++ * Copyright 2010-2019 the Pacemaker project contributors
++ *
++ * The version control history for this file may have further details.
+  *
+  * This source code is licensed under the GNU General Public License version 2
+  * or later (GPLv2+) WITHOUT ANY WARRANTY.
+@@ -10,17 +12,23 @@
+ 
+ #include <pwd.h>
+ #include <grp.h>
++#include <poll.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <sys/time.h>
+ #include <sys/resource.h>
+ #include <sys/reboot.h>
+ 
++#include <crm/crm.h>  /* indirectly: CRM_EX_* */
++#include <crm/cib/internal.h>  /* cib_channel_ro */
+ #include <crm/msg_xml.h>
+ #include <crm/common/ipcs.h>
+ #include <crm/common/mainloop.h>
+ #include <crm/cluster/internal.h>
+ #include <crm/cluster.h>
++
++#include <crm/common/ipc_internal.h>  /* PCMK__SPECIAL_PID*, ... */
++
+ #ifdef SUPPORT_COROSYNC
+ #include <corosync/cfg.h>
+ #endif
+@@ -31,6 +39,7 @@
+ gboolean pcmk_quorate = FALSE;
+ gboolean fatal_error = FALSE;
+ GMainLoop *mainloop = NULL;
++static bool global_keep_tracking = false;
+ 
+ #define PCMK_PROCESS_CHECK_INTERVAL 5
+ 
+@@ -48,6 +57,7 @@ typedef struct pcmk_child_s {
+     const char *name;
+     const char *uid;
+     const char *command;
++    const char *endpoint;  /* IPC server name */
+ 
+     gboolean active_before_startup;
+ } pcmk_child_t;
+@@ -59,17 +69,35 @@ typedef struct pcmk_child_s {
+ static pcmk_child_t pcmk_children[] = {
+     { 0, crm_proc_none,       0, 0, FALSE, "none",       NULL,            NULL },
+     { 0, crm_proc_plugin,     0, 0, FALSE, "ais",        NULL,            NULL },
+-    { 0, crm_proc_lrmd,       3, 0, TRUE,  "lrmd",       NULL,            CRM_DAEMON_DIR"/lrmd" },
+-    { 0, crm_proc_cib,        1, 0, TRUE,  "cib",        CRM_DAEMON_USER, CRM_DAEMON_DIR"/cib" },
+-    { 0, crm_proc_crmd,       6, 0, TRUE,  "crmd",       CRM_DAEMON_USER, CRM_DAEMON_DIR"/crmd" },
+-    { 0, crm_proc_attrd,      4, 0, TRUE,  "attrd",      CRM_DAEMON_USER, CRM_DAEMON_DIR"/attrd" },
+-    { 0, crm_proc_stonithd,   0, 0, TRUE,  "stonithd",   NULL,            NULL },
+-    { 0, crm_proc_pe,         5, 0, TRUE,  "pengine",    CRM_DAEMON_USER, CRM_DAEMON_DIR"/pengine" },
+-    { 0, crm_proc_mgmtd,      0, 0, TRUE,  "mgmtd",      NULL,            HB_DAEMON_DIR"/mgmtd" },
+-    { 0, crm_proc_stonith_ng, 2, 0, TRUE,  "stonith-ng", NULL,            CRM_DAEMON_DIR"/stonithd" },
++    { 0, crm_proc_lrmd,       3, 0, TRUE,  "lrmd",       NULL,            CRM_DAEMON_DIR"/lrmd",
++      CRM_SYSTEM_LRMD
++    },
++    { 0, crm_proc_cib,        1, 0, TRUE,  "cib",        CRM_DAEMON_USER, CRM_DAEMON_DIR"/cib",
++      cib_channel_ro
++    },
++    { 0, crm_proc_crmd,       6, 0, TRUE,  "crmd",       CRM_DAEMON_USER, CRM_DAEMON_DIR"/crmd",
++      CRM_SYSTEM_CRMD
++    },
++    { 0, crm_proc_attrd,      4, 0, TRUE,  "attrd",      CRM_DAEMON_USER, CRM_DAEMON_DIR"/attrd",
++      T_ATTRD
++    },
++    { 0, crm_proc_stonithd,   0, 0, TRUE,  "stonithd",   NULL,            NULL,
++      NULL
++    },
++    { 0, crm_proc_pe,         5, 0, TRUE,  "pengine",    CRM_DAEMON_USER, CRM_DAEMON_DIR"/pengine",
++      CRM_SYSTEM_PENGINE
++    },
++    { 0, crm_proc_mgmtd,      0, 0, TRUE,  "mgmtd",      NULL,            HB_DAEMON_DIR"/mgmtd",
++      NULL
++    },
++    { 0, crm_proc_stonith_ng, 2, 0, TRUE,  "stonith-ng", NULL,            CRM_DAEMON_DIR"/stonithd",
++      "stonith-ng"
++    },
+ };
+ /* *INDENT-ON* */
+ 
++static gboolean check_active_before_startup_processes(gpointer user_data);
++static int pcmk_child_active(pcmk_child_t *child);
+ static gboolean start_child(pcmk_child_t * child);
+ void update_process_clients(crm_client_t *client);
+ void update_process_peers(void);
+@@ -131,14 +159,31 @@ pcmk_process_exit(pcmk_child_t * child)
+     }
+ 
+     if (shutdown_trigger) {
++        /* resume step-wise shutdown (returned TRUE yields no parallelizing) */
+         mainloop_set_trigger(shutdown_trigger);
++        /* intended to speed up propagating expected lay-off of the daemons? */
+         update_node_processes(local_nodeid, NULL, get_process_list());
+ 
+-    } else if (child->respawn && crm_is_true(getenv("PCMK_fail_fast"))) {
++    } else if (!child->respawn) {
++        /* nothing to do */
++
++    } else if (crm_is_true(getenv("PCMK_fail_fast"))) {
+         crm_err("Rebooting system because of %s", child->name);
+         pcmk_panic(__FUNCTION__);
+ 
+-    } else if (child->respawn) {
++    } else if (pcmk_child_active(child) == 1) {
++        crm_warn("One-off suppressing strict respawning of a child process %s,"
++                 " appears alright per %s IPC end-point",
++                 child->name, child->endpoint);
++        /* need to monitor how it evolves, and start new process if badly */
++        child->active_before_startup = TRUE;
++        if (!global_keep_tracking) {
++            global_keep_tracking = true;
++            g_timeout_add_seconds(PCMK_PROCESS_CHECK_INTERVAL,
++                                  check_active_before_startup_processes, NULL);
++        }
++
++    } else {
+         crm_notice("Respawning failed child process: %s", child->name);
+         start_child(child);
+     }
+@@ -215,8 +260,13 @@ stop_child(pcmk_child_t * child, int signal)
+         signal = SIGTERM;
+     }
+ 
+-    if (child->command == NULL) {
+-        crm_debug("Nothing to do for child \"%s\"", child->name);
++    /* why to skip PID of 1?
++       - FreeBSD ~ how untrackable process behind IPC is masqueraded as
++       - elsewhere: how "init" task is designated; in particular, in systemd
++         arrangement of socket-based activation, this is pretty real */
++    if (child->command == NULL || child->pid == PCMK__SPECIAL_PID) {
++        crm_debug("Nothing to do for child \"%s\" (process %lld)",
++                  child->name, (long long) PCMK__SPECIAL_PID_AS_0(child->pid));
+         return TRUE;
+     }
+ 
+@@ -241,6 +291,11 @@ stop_child(pcmk_child_t * child, int signal)
+ static char *opts_default[] = { NULL, NULL };
+ static char *opts_vgrind[] = { NULL, NULL, NULL, NULL, NULL };
+ 
++/* TODO once libqb is taught to juggle with IPC end-points carried over as
++        bare file descriptor (https://github.com/ClusterLabs/libqb/issues/325)
++        it shall hand over these descriptors here if/once they are successfully
++        pre-opened in (presumably) pcmk_child_active, to avoid any remaining
++        room for races */
+ static gboolean
+ start_child(pcmk_child_t * child)
+ {
+@@ -371,7 +426,10 @@ escalate_shutdown(gpointer data)
+ 
+     pcmk_child_t *child = data;
+ 
+-    if (child->pid) {
++    if (child->pid == PCMK__SPECIAL_PID) {
++        pcmk_process_exit(child);
++
++    } else if (child->pid) {
+         /* Use SIGSEGV instead of SIGKILL to create a core so we can see what it was up to */
+         crm_err("Child %s not terminating in a timely manner, forcing", child->name);
+         stop_child(child, SIGSEGV);
+@@ -379,6 +437,8 @@ escalate_shutdown(gpointer data)
+     return FALSE;
+ }
+ 
++#define SHUTDOWN_ESCALATION_PERIOD 180000  /* 3m */
++
+ static gboolean
+ pcmk_shutdown_worker(gpointer user_data)
+ {
+@@ -407,11 +467,24 @@ pcmk_shutdown_worker(gpointer user_data)
+                 time_t now = time(NULL);
+ 
+                 if (child->respawn) {
++                    if (child->pid == PCMK__SPECIAL_PID) {
++                        crm_warn("The process behind %s IPC cannot be"
++                                 " terminated, so either wait the graceful"
++                                 " period of %ld s for its native termination"
++                                 " if it vitally depends on some other daemons"
++                                 " going down in a controlled way already,"
++                                 " or locate and kill the correct %s process"
++                                 " on your own; set PCMK_fail_fast=1 to avoid"
++                                 " this altogether next time around",
++                                 child->name, (long) SHUTDOWN_ESCALATION_PERIOD,
++                                 child->command);
++                    }
+                     next_log = now + 30;
+                     child->respawn = FALSE;
+                     stop_child(child, SIGTERM);
+                     if (phase < pcmk_children[pcmk_child_crmd].start_seq) {
+-                        g_timeout_add(180000 /* 3m */ , escalate_shutdown, child);
++                        g_timeout_add(SHUTDOWN_ESCALATION_PERIOD,
++                                      escalate_shutdown, child);
+                     }
+ 
+                 } else if (now >= next_log) {
+@@ -696,7 +769,106 @@ mcp_chown(const char *path, uid_t uid, gid_t gid)
+     }
+ }
+ 
+-#if SUPPORT_PROCFS
++/*!
++ * \internal
++ * \brief Check the liveness of the child based on IPC name and PID if tracked
++ *
++ * \param[inout] child  Child tracked data
++ *
++ * \return 0 if no trace of child's liveness detected (while it is detectable
++ *         to begin with, at least according to one of the two properties),
++ *         1 if everything is fine, 2 if it's up per PID, but not per IPC
++ *         end-point (still starting?), -1 on error, and -2 when the child
++ *         (its IPC) blocked with an unauthorized process (log message
++ *         emitted in both latter cases)
++ *
++ * \note This function doesn't modify any of \p child members but \c pid,
++ *       and is not actively toying with processes as such but invoking
++ *       \c stop_child in one particular case (there's for some reason
++ *       a different authentic holder of the IPC end-point).
++ */
++static int
++pcmk_child_active(pcmk_child_t *child) {
++    static uid_t cl_uid = 0;
++    static gid_t cl_gid = 0;
++    const uid_t root_uid = 0;
++    const gid_t root_gid = 0;
++    const uid_t *ref_uid;
++    const gid_t *ref_gid;
++    int ret = 0;
++    pid_t ipc_pid = 0;
++    const char *use_name;
++
++    if (child->endpoint == NULL
++            && (child->pid <= 0 || child->pid == PCMK__SPECIAL_PID)) {
++        crm_err("Cannot track child %s for missing both API end-point and PID",
++                child->name);
++        ret = -1;  /* misuse of the function when child is not trackable */
++
++    } else if (child->endpoint != NULL) {
++
++        ref_uid = (child->uid != NULL) ? &cl_uid : &root_uid;
++        ref_gid = (child->uid != NULL) ? &cl_gid : &root_gid;
++
++        if (child->uid != NULL && !cl_uid && !cl_gid
++                && crm_user_lookup(CRM_DAEMON_USER, &cl_uid, &cl_gid) < 0) {
++            crm_err("Could not find user and group IDs for user %s",
++                    CRM_DAEMON_USER);
++            ret = -1;
++        } else if ((ret = pcmk__ipc_is_authentic_process_active(child->endpoint,
++                                                                *ref_uid, *ref_gid,
++                                                                &ipc_pid)) < 0) {
++            /* game over */
++        } else if (child->pid <= 0) {
++            /* hit new child to be initialized, or reset to zero
++               and investigate further for ret == 0 */
++            child->pid = ipc_pid;
++        } else if (ipc_pid && child->pid != ipc_pid) {
++            /* ultimately strange for ret == 1; either way, investigate */
++            ret = 0;
++        }
++    }
++
++    if (!ret) {
++        use_name = (child->flag == crm_proc_stonith_ng)
++                     ? "stonithd"  /* compensate "simplification" 61fc951e9 */
++                     : child->name;
++        /* when no IPC based liveness detected (incl. if ever a child without
++           IPC is tracked), or detected for a different _authentic_ process;
++           safe on FreeBSD since the only change possible from a proper child's
++           PID into "special" PID of 1 behind more loosely related process */
++        ret = crm_pid_active(child->pid, use_name);
++        if (ipc_pid && (ret != 1
++                        || ipc_pid == PCMK__SPECIAL_PID
++                        || crm_pid_active(ipc_pid, use_name) == 1)) {
++            if (ret == 1) {
++                /* assume there's no forking-while-retaining-IPC-socket
++                   involved in the "children's" lifecycle, hence that the
++                   tracking got out of sync purely because of some external
++                   (esotheric?) forces (user initiated process "refresh" by
++                   force? or intentionally racing on start-up, even?), and
++                   that switching over to this other detected, authentic
++                   instance with an IPC already in possession is a better
++                   trade-off than "neutralizing" it first so as to give
++                   either the original or possibly a new to-be-spawned
++                   daemon process a leeway for operation, which would
++                   otherwise have to be carried out */
++                /* not possessing IPC, afterall (what about corosync CPG?) */
++                stop_child(child, SIGKILL);
++            } else {
++                ret = 1;
++            }
++            child->pid = ipc_pid;
++        } else if (ret == 1) {
++            ret = 2;  /* up per PID, but not per IPC (still starting?) */
++        } else if (!child->pid && ret == -1) {
++            ret = 0;  /* correct -1 on FreeBSD from above back to 0 */
++        }
++    }
++
++    return ret;
++}
++
+ static gboolean
+ check_active_before_startup_processes(gpointer user_data)
+ {
+@@ -713,15 +885,41 @@ check_active_before_startup_processes(gpointer user_data)
+                 continue;
+             } else {
+                 const char *name = pcmk_children[lpc].name;
+-                if (pcmk_children[lpc].flag == crm_proc_stonith_ng) {
+-                    name = "stonithd";
+-                }
+-
+-                if (crm_pid_active(pcmk_children[lpc].pid, name) != 1) {
+-                    crm_notice("Process %s terminated (pid=%d)",
+-                           name, pcmk_children[lpc].pid);
+-                    pcmk_process_exit(&(pcmk_children[lpc]));
+-                    continue;
++                int ret;
++
++                switch ((ret = pcmk_child_active(&pcmk_children[lpc]))) {
++                    case 1:
++                        break;
++                    case 0:
++                    case 2:  /* this very case: it was OK once already */
++                        if (pcmk_children[lpc].respawn == TRUE) {
++                            /* presumably after crash, hence critical */
++                            crm_crit("Process %s terminated (pid=%lld)%s", \
++                                     name, (long long)
++                                     PCMK__SPECIAL_PID_AS_0(pcmk_children[lpc].pid),
++                                     ret ? ", at least per IPC end-point that went AWOL"
++                                         : "");
++                        } else {
++                            /* orderly shutdown */
++                            crm_notice("Process %s terminated (pid=%lld)%s", \
++                                       name, (long long)
++                                       PCMK__SPECIAL_PID_AS_0(pcmk_children[lpc].pid),
++                                       ret ? ", at least per IPC end-point that went AWOL"
++                                           : "");
++                        }
++                        pcmk_process_exit(&(pcmk_children[lpc]));
++                        continue;
++                    default:
++                        crm_crit("Unexpected value from pcmk_child_active:"
++                                 " %d (pid=%lld)", ret,
++                                 (long long) PCMK__SPECIAL_PID_AS_0(
++                                                 pcmk_children[lpc].pid));
++                        /* fall through */
++                    case -1:
++                    case -2:
++                        /* message(s) already emitted */
++                        crm_exit(DAEMON_RESPAWN_STOP);
++                        break;  /* static analysis/noreturn */
+                 }
+             }
+             /* at least one of the processes found at startup
+@@ -730,61 +928,147 @@ check_active_before_startup_processes(gpointer user_data)
+         }
+     }
+ 
++    global_keep_tracking = keep_tracking;
+     return keep_tracking;
+ }
+-#endif // SUPPORT_PROCFS
+ 
+-static void
++/*!
++ * \internal
++ * \brief Initial one-off check of the pre-existing "child" processes
++ *
++ * With "child" process, we mean the subdaemon that defines an API end-point
++ * (all of them do as of the comment) -- the possible complement is skipped
++ * as it is deemed it has no such shared resources to cause conflicts about,
++ * hence it can presumably be started anew without hesitation.
++ * If that won't hold true in the future, the concept of a shared resource
++ * will have to be generalized beyond the API end-point.
++ *
++ * For boundary cases that the "child" is still starting (IPC end-point is yet
++ * to be witnessed), or more rarely (practically FreeBSD only), when there's
++ * a pre-existing "untrackable" authentic process, we give the situation some
++ * time to possibly unfold in the right direction, meaning that said socket
++ * will appear or the unattainable process will disappear per the observable
++ * IPC, respectively.
++ *
++ * \return 0 if no such "child" process found, positive number X when X
++ *         "children" detected, -1 on an internal error, -2 when any
++ *         would-be-used IPC is blocked with an unauthorized process
++ *
++ * \note Since this gets run at the very start, \c respawn_count fields
++ *       for particular children get temporarily overloaded with "rounds
++ *       of waiting" tracking, restored once we are about to finish with
++ *       success (i.e. returning value >=0) and will remain unrestored
++ *       otherwise.  One way to suppress liveness detection logic for
++ *       particular child is to set the said value to a negative number.
++ */
++#define WAIT_TRIES 4  /* together with interleaved sleeps, worst case ~ 1s */
++static int
+ find_and_track_existing_processes(void)
+ {
+-#if SUPPORT_PROCFS
+-    DIR *dp;
+-    struct dirent *entry;
+-    bool start_tracker = FALSE;
+-    char entry_name[64];
+-
+-    dp = opendir("/proc");
+-    if (!dp) {
+-        /* no proc directory to search through */
+-        crm_notice("Can not read /proc directory to track existing components");
+-        return;
+-    }
+-
+-    while ((entry = readdir(dp)) != NULL) {
+-        int pid;
+-        int max = SIZEOF(pcmk_children);
+-        int i;
+-
+-        if (crm_procfs_process_info(entry, entry_name, &pid) < 0) {
+-            continue;
+-        }
+-        for (i = 0; i < max; i++) {
+-            const char *name = pcmk_children[i].name;
+-
+-            if (pcmk_children[i].start_seq == 0) {
++    unsigned tracking = 0U;
++    bool wait_in_progress;
++    int cur;
++    size_t i, rounds;
++
++    for (rounds = 1; rounds <= WAIT_TRIES; rounds++) {
++        wait_in_progress = false;
++        for (i = 0; i < SIZEOF(pcmk_children); i++) {
++            if (!pcmk_children[i].endpoint
++                    || pcmk_children[i].respawn_count < 0
++                    || !(cur = pcmk_child_active(&pcmk_children[i]))) {
++                /* as a speculation, don't give up in the context of
++                   pcmk_child_active check if there are more rounds to
++                   come for other reasons, but don't artificially wait just
++                   because of this, since we would preferably start ASAP */
+                 continue;
+             }
+-            if (pcmk_children[i].flag == crm_proc_stonith_ng) {
+-                name = "stonithd";
+-            }
+-            if (safe_str_eq(entry_name, name) && (crm_pid_active(pid, NULL) == 1)) {
+-                crm_notice("Tracking existing %s process (pid=%d)", name, pid);
+-                pcmk_children[i].pid = pid;
+-                pcmk_children[i].active_before_startup = TRUE;
+-                start_tracker = TRUE;
+-                break;
++            pcmk_children[i].respawn_count = rounds;
++            switch (cur) {
++                case 1:
++                    if (pcmk_children[i].pid == PCMK__SPECIAL_PID) {
++                        if (crm_is_true(getenv("PCMK_fail_fast"))) {
++                            crm_crit("Cannot reliably track pre-existing"
++                                     " authentic process behind %s IPC on this"
++                                     " platform and PCMK_fail_fast requested",
++                                     pcmk_children[i].endpoint);
++                            return -1;
++                        } else if (pcmk_children[i].respawn_count == WAIT_TRIES) {
++                            crm_notice("Assuming pre-existing authentic, though"
++                                       " on this platform untrackable, process"
++                                       " behind %s IPC is stable (was in %d"
++                                       " previous samples) so rather than"
++                                       " bailing out (PCMK_fail_fast not"
++                                       " requested), we just switch to a less"
++                                       " optimal IPC liveness monitoring"
++                                       " (not very suitable for heavy load)",
++                                       pcmk_children[i].name, WAIT_TRIES - 1);
++                            crm_warn("The process behind %s IPC cannot be"
++                                     " terminated, so the overall shutdown"
++                                     " will get delayed implicitly (%ld s),"
++                                     " which serves as a graceful period for"
++                                     " its native termination if it vitally"
++                                     " depends on some other daemons going"
++                                     " down in a controlled way already",
++                                     pcmk_children[i].name,
++                                     (long) SHUTDOWN_ESCALATION_PERIOD);
++                        } else {
++                            wait_in_progress = true;
++                            crm_warn("Cannot reliably track pre-existing"
++                                     " authentic process behind %s IPC on this"
++                                     " platform, can still disappear in %d"
++                                     " attempt(s)", pcmk_children[i].endpoint,
++                                     WAIT_TRIES - pcmk_children[i].respawn_count);
++                            continue;
++                        }
++                    }
++                    crm_notice("Tracking existing %s process (pid=%lld)",
++                               pcmk_children[i].name,
++                               (long long) PCMK__SPECIAL_PID_AS_0(
++                                               pcmk_children[i].pid));
++                    pcmk_children[i].respawn_count = -1;  /* 0~keep watching */
++                    pcmk_children[i].active_before_startup = TRUE;
++                    tracking++;
++                    break;
++                case 2:
++                    if (pcmk_children[i].respawn_count == WAIT_TRIES) {
++                        crm_crit("%s IPC end-point for existing authentic"
++                                 " process %lld did not (re)appear",
++                                 pcmk_children[i].endpoint,
++                                 (long long) PCMK__SPECIAL_PID_AS_0(
++                                                 pcmk_children[i].pid));
++                        return -1;
++                    }
++                    wait_in_progress = true;
++                    crm_warn("Cannot find %s IPC end-point for existing"
++                             " authentic process %lld, can still (re)appear"
++                             " in %d attempts (?)",
++                             pcmk_children[i].endpoint,
++                             (long long) PCMK__SPECIAL_PID_AS_0(
++                                             pcmk_children[i].pid),
++                             WAIT_TRIES - pcmk_children[i].respawn_count);
++                    continue;
++                case -1:
++                case -2:
++                    return cur;  /* messages already emitted */
++                default:
++                    crm_crit("Unexpected condition"CRM_XS"cur=%d", cur);
++                    return -1;  /* unexpected condition */
+             }
+         }
++        if (!wait_in_progress) {
++            break;
++        }
++        (void) poll(NULL, 0, 250);  /* a bit for changes to possibly happen */
++    }
++    for (i = 0; i < SIZEOF(pcmk_children); i++) {
++        pcmk_children[i].respawn_count = 0;  /* restore pristine state */
+     }
+ 
+-    if (start_tracker) {
+-        g_timeout_add_seconds(PCMK_PROCESS_CHECK_INTERVAL, check_active_before_startup_processes,
+-                              NULL);
++    if (tracking) {
++        g_timeout_add_seconds(PCMK_PROCESS_CHECK_INTERVAL,
++                              check_active_before_startup_processes, NULL);
+     }
+-    closedir(dp);
+-#else
+-    crm_notice("No procfs support, so skipping check for existing components");
+-#endif // SUPPORT_PROCFS
++    return (tracking > INT_MAX) ? INT_MAX : tracking;
+ }
+ 
+ static void
+@@ -1106,7 +1390,16 @@ main(int argc, char **argv)
+         setenv("PCMK_watchdog", "false", 1);
+     }
+ 
+-    find_and_track_existing_processes();
++    switch (find_and_track_existing_processes()) {
++        case -1:
++            crm_crit("Internal fatality, see the log");
++            crm_exit(DAEMON_RESPAWN_STOP);
++        case -2:
++            crm_crit("Blocked by foreign process, kill the offender");
++            crm_exit(ENOLCK);
++        default:
++            break;
++    };
+ 
+     cluster.destroy = mcp_cpg_destroy;
+     cluster.cpg.cpg_deliver_fn = mcp_cpg_deliver;
+-- 
+1.8.3.1
+
+
+From 07a82c5c8f9d60989ea88c5a3cc316ee290ea784 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jan=20Pokorn=C3=BD?= <jpokorny@redhat.com>
+Date: Tue, 16 Apr 2019 00:04:57 +0200
+Subject: [PATCH 5/7] High: pacemakerd vs. IPC/procfs confused deputy
+ authenticity issue (3/4)
+
+[3/4: other daemons to authenticate IPC servers of fellow processes]
+
+Now that CVE-2018-16877 issue alone is still only partially covered
+based on the preceding commits in the set, put the server-by-client
+authentication (enabled and 1/3 and partially sported in 2/3) into
+practice widely amongst the communicating pacemaker child daemons and
+towards CPG API provided by 3rd party but principally using the same
+underlying IPC mechanism facilitated by libqb, and consequently close
+the remaining "big gap".
+
+As a small justification to introducing yet another "return
+value" int variable, type-correctness is restored for those
+that shall be cs_error_t to begin with.
+---
+ lib/cluster/corosync.c | 178 +++++++++++++++++++++++++++++++++++++++++--------
+ lib/cluster/cpg.c      |  94 +++++++++++++++++++-------
+ lib/common/ipc.c       |  43 +++++++++++-
+ mcp/corosync.c         |  76 ++++++++++++++++-----
+ 4 files changed, 320 insertions(+), 71 deletions(-)
+
+diff --git a/lib/cluster/corosync.c b/lib/cluster/corosync.c
+index 9719541..0acf9b2 100644
+--- a/lib/cluster/corosync.c
++++ b/lib/cluster/corosync.c
+@@ -1,19 +1,10 @@
+ /*
+- * Copyright (C) 2004 Andrew Beekhof <andrew@beekhof.net>
++ * Copyright 2004-2019 the Pacemaker project contributors
+  *
+- * This library is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU Lesser General Public
+- * License as published by the Free Software Foundation; either
+- * version 2.1 of the License, or (at your option) any later version.
++ * The version control history for this file may have further details.
+  *
+- * This library is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+- * Lesser General Public License for more details.
+- *
+- * You should have received a copy of the GNU Lesser General Public
+- * License along with this library; if not, write to the Free Software
+- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
++ * This source code is licensed under the GNU Lesser General Public License
++ * version 2.1 or later (LGPLv2.1+) WITHOUT ANY WARRANTY.
+  */
+ 
+ #include <crm_internal.h>
+@@ -40,6 +31,8 @@
+ 
+ #include <crm/msg_xml.h>
+ 
++#include <crm/common/ipc_internal.h>  /* PCMK__SPECIAL_PID* */
++
+ quorum_handle_t pcmk_quorum_handle = 0;
+ 
+ gboolean(*quorum_app_callback) (unsigned long long seq, gboolean quorate) = NULL;
+@@ -52,10 +45,15 @@ char *
+ corosync_node_name(uint64_t /*cmap_handle_t */ cmap_handle, uint32_t nodeid)
+ {
+     int lpc = 0;
+-    int rc = CS_OK;
++    cs_error_t rc = CS_OK;
+     int retries = 0;
+     char *name = NULL;
+     cmap_handle_t local_handle = 0;
++    int fd = -1;
++    uid_t found_uid = 0;
++    gid_t found_gid = 0;
++    pid_t found_pid = 0;
++    int rv;
+ 
+     /* nodeid == 0 == CMAN_NODEID_US */
+     if (nodeid == 0) {
+@@ -85,6 +83,27 @@ corosync_node_name(uint64_t /*cmap_handle_t */ cmap_handle, uint32_t nodeid)
+ 
+     if (cmap_handle == 0) {
+         cmap_handle = local_handle;
++
++        rc = cmap_fd_get(cmap_handle, &fd);
++        if (rc != CS_OK) {
++            crm_err("Could not obtain the CMAP API connection: %s (%d)",
++                    cs_strerror(rc), rc);
++            goto bail;
++        }
++
++        /* CMAP provider run as root (in given user namespace, anyway)? */
++        if (!(rv = crm_ipc_is_authentic_process(fd, (uid_t) 0,(gid_t) 0, &found_pid,
++                                                &found_uid, &found_gid))) {
++            crm_err("CMAP provider is not authentic:"
++                    " process %lld (uid: %lld, gid: %lld)",
++                    (long long) PCMK__SPECIAL_PID_AS_0(found_pid),
++                    (long long) found_uid, (long long) found_gid);
++            goto bail;
++        } else if (rv < 0) {
++            crm_err("Could not verify authenticity of CMAP provider: %s (%d)",
++                    strerror(-rv), -rv);
++            goto bail;
++        }
+     }
+ 
+     while (name == NULL && cmap_handle != 0) {
+@@ -126,6 +145,7 @@ corosync_node_name(uint64_t /*cmap_handle_t */ cmap_handle, uint32_t nodeid)
+         lpc++;
+     }
+ 
++bail:
+     if(local_handle) {
+         cmap_finalize(local_handle);
+     }
+@@ -249,11 +269,15 @@ gboolean
+ cluster_connect_quorum(gboolean(*dispatch) (unsigned long long, gboolean),
+                        void (*destroy) (gpointer))
+ {
+-    int rc = -1;
++    cs_error_t rc;
+     int fd = 0;
+     int quorate = 0;
+     uint32_t quorum_type = 0;
+     struct mainloop_fd_callbacks quorum_fd_callbacks;
++    uid_t found_uid = 0;
++    gid_t found_gid = 0;
++    pid_t found_pid = 0;
++    int rv;
+ 
+     quorum_fd_callbacks.dispatch = pcmk_quorum_dispatch;
+     quorum_fd_callbacks.destroy = destroy;
+@@ -262,7 +286,8 @@ cluster_connect_quorum(gboolean(*dispatch) (unsigned long long, gboolean),
+ 
+     rc = quorum_initialize(&pcmk_quorum_handle, &quorum_callbacks, &quorum_type);
+     if (rc != CS_OK) {
+-        crm_err("Could not connect to the Quorum API: %d", rc);
++        crm_err("Could not connect to the Quorum API: %s (%d)",
++                cs_strerror(rc), rc);
+         goto bail;
+ 
+     } else if (quorum_type != QUORUM_SET) {
+@@ -270,6 +295,29 @@ cluster_connect_quorum(gboolean(*dispatch) (unsigned long long, gboolean),
+         goto bail;
+     }
+ 
++    rc = quorum_fd_get(pcmk_quorum_handle, &fd);
++    if (rc != CS_OK) {
++        crm_err("Could not obtain the Quorum API connection: %s (%d)",
++                strerror(rc), rc);
++        goto bail;
++    }
++
++    /* Quorum provider run as root (in given user namespace, anyway)? */
++    if (!(rv = crm_ipc_is_authentic_process(fd, (uid_t) 0,(gid_t) 0, &found_pid,
++                                            &found_uid, &found_gid))) {
++        crm_err("Quorum provider is not authentic:"
++                " process %lld (uid: %lld, gid: %lld)",
++                (long long) PCMK__SPECIAL_PID_AS_0(found_pid),
++                (long long) found_uid, (long long) found_gid);
++        rc = CS_ERR_ACCESS;
++        goto bail;
++    } else if (rv < 0) {
++        crm_err("Could not verify authenticity of Quorum provider: %s (%d)",
++                strerror(-rv), -rv);
++        rc = CS_ERR_ACCESS;
++        goto bail;
++    }
++
+     rc = quorum_getquorate(pcmk_quorum_handle, &quorate);
+     if (rc != CS_OK) {
+         crm_err("Could not obtain the current Quorum API state: %d", rc);
+@@ -290,12 +338,6 @@ cluster_connect_quorum(gboolean(*dispatch) (unsigned long long, gboolean),
+         goto bail;
+     }
+ 
+-    rc = quorum_fd_get(pcmk_quorum_handle, &fd);
+-    if (rc != CS_OK) {
+-        crm_err("Could not obtain the Quorum API connection: %d", rc);
+-        goto bail;
+-    }
+-
+     mainloop_add_fd("quorum", G_PRIORITY_HIGH, fd, dispatch, &quorum_fd_callbacks);
+ 
+     corosync_initialize_nodelist(NULL, FALSE, NULL);
+@@ -486,10 +528,15 @@ gboolean
+ corosync_initialize_nodelist(void *cluster, gboolean force_member, xmlNode * xml_parent)
+ {
+     int lpc = 0;
+-    int rc = CS_OK;
++    cs_error_t rc = CS_OK;
+     int retries = 0;
+     gboolean any = FALSE;
+     cmap_handle_t cmap_handle;
++    int fd = -1;
++    uid_t found_uid = 0;
++    gid_t found_gid = 0;
++    pid_t found_pid = 0;
++    int rv;
+ 
+     do {
+         rc = cmap_initialize(&cmap_handle);
+@@ -507,6 +554,27 @@ corosync_initialize_nodelist(void *cluster, gboolean force_member, xmlNode * xml
+         return FALSE;
+     }
+ 
++    rc = cmap_fd_get(cmap_handle, &fd);
++    if (rc != CS_OK) {
++        crm_err("Could not obtain the CMAP API connection: %s (%d)",
++                cs_strerror(rc), rc);
++        goto bail;
++    }
++
++    /* CMAP provider run as root (in given user namespace, anyway)? */
++    if (!(rv = crm_ipc_is_authentic_process(fd, (uid_t) 0,(gid_t) 0, &found_pid,
++                                            &found_uid, &found_gid))) {
++        crm_err("CMAP provider is not authentic:"
++                " process %lld (uid: %lld, gid: %lld)",
++                (long long) PCMK__SPECIAL_PID_AS_0(found_pid),
++                (long long) found_uid, (long long) found_gid);
++        goto bail;
++    } else if (rv < 0) {
++        crm_err("Could not verify authenticity of CMAP provider: %s (%d)",
++                strerror(-rv), -rv);
++        goto bail;
++    }
++
+     crm_peer_init();
+     crm_trace("Initializing corosync nodelist");
+     for (lpc = 0; TRUE; lpc++) {
+@@ -560,6 +628,7 @@ corosync_initialize_nodelist(void *cluster, gboolean force_member, xmlNode * xml
+ 
+         free(name);
+     }
++bail:
+     cmap_finalize(cmap_handle);
+     return any;
+ }
+@@ -569,36 +638,68 @@ corosync_cluster_name(void)
+ {
+     cmap_handle_t handle;
+     char *cluster_name = NULL;
+-    int rc = CS_OK;
++    cs_error_t rc = CS_OK;
++    int fd = -1;
++    uid_t found_uid = 0;
++    gid_t found_gid = 0;
++    pid_t found_pid = 0;
++    int rv;
+ 
+     rc = cmap_initialize(&handle);
+     if (rc != CS_OK) {
+-        crm_info("Failed to initialize the cmap API: %s (%d)", ais_error2text(rc), rc);
++        crm_info("Failed to initialize the cmap API: %s (%d)",
++                 cs_strerror(rc), rc);
+         return NULL;
+     }
+ 
++    rc = cmap_fd_get(handle, &fd);
++    if (rc != CS_OK) {
++        crm_err("Could not obtain the CMAP API connection: %s (%d)",
++                cs_strerror(rc), rc);
++        goto bail;
++    }
++
++    /* CMAP provider run as root (in given user namespace, anyway)? */
++    if (!(rv = crm_ipc_is_authentic_process(fd, (uid_t) 0,(gid_t) 0, &found_pid,
++                                            &found_uid, &found_gid))) {
++        crm_err("CMAP provider is not authentic:"
++                " process %lld (uid: %lld, gid: %lld)",
++                (long long) PCMK__SPECIAL_PID_AS_0(found_pid),
++                (long long) found_uid, (long long) found_gid);
++        goto bail;
++    } else if (rv < 0) {
++        crm_err("Could not verify authenticity of CMAP provider: %s (%d)",
++                strerror(-rv), -rv);
++        goto bail;
++    }
++
+     rc = cmap_get_string(handle, "totem.cluster_name", &cluster_name);
+     if (rc != CS_OK) {
+-        crm_info("Cannot get totem.cluster_name: %s (%d)", ais_error2text(rc), rc);
++        crm_info("Cannot get totem.cluster_name: %s (%d)", cs_strerror(rc), rc);
+ 
+     } else {
+         crm_debug("cmap totem.cluster_name = '%s'", cluster_name);
+     }
+ 
++bail:
+     cmap_finalize(handle);
+-
+     return cluster_name;
+ }
+ 
+ int
+ corosync_cmap_has_config(const char *prefix)
+ {
+-    int rc = CS_OK;
++    cs_error_t rc = CS_OK;
+     int retries = 0;
+     static int found = -1;
+     cmap_handle_t cmap_handle;
+     cmap_iter_handle_t iter_handle;
+     char key_name[CMAP_KEYNAME_MAXLEN + 1];
++    int fd = -1;
++    uid_t found_uid = 0;
++    gid_t found_gid = 0;
++    pid_t found_pid = 0;
++    int rv;
+ 
+     if(found != -1) {
+         return found;
+@@ -621,6 +722,27 @@ corosync_cmap_has_config(const char *prefix)
+         return -1;
+     }
+ 
++    rc = cmap_fd_get(cmap_handle, &fd);
++    if (rc != CS_OK) {
++        crm_err("Could not obtain the CMAP API connection: %s (%d)",
++                cs_strerror(rc), rc);
++        goto bail;
++    }
++
++    /* CMAP provider run as root (in given user namespace, anyway)? */
++    if (!(rv = crm_ipc_is_authentic_process(fd, (uid_t) 0,(gid_t) 0, &found_pid,
++                                            &found_uid, &found_gid))) {
++        crm_err("CMAP provider is not authentic:"
++                " process %lld (uid: %lld, gid: %lld)",
++                (long long) PCMK__SPECIAL_PID_AS_0(found_pid),
++                (long long) found_uid, (long long) found_gid);
++        goto bail;
++    } else if (rv < 0) {
++        crm_err("Could not verify authenticity of CMAP provider: %s (%d)",
++                strerror(-rv), -rv);
++        goto bail;
++    }
++
+     rc = cmap_iter_init(cmap_handle, prefix, &iter_handle);
+     if (rc != CS_OK) {
+         crm_warn("Failed to initialize iteration for corosync cmap '%s': %s (rc=%d)",
+diff --git a/lib/cluster/cpg.c b/lib/cluster/cpg.c
+index 1e6cf79..a61d492 100644
+--- a/lib/cluster/cpg.c
++++ b/lib/cluster/cpg.c
+@@ -1,19 +1,10 @@
+ /*
+- * Copyright (C) 2004 Andrew Beekhof <andrew@beekhof.net>
++ * Copyright 2004-2019 the Pacemaker project contributors
+  *
+- * This library is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU Lesser General Public
+- * License as published by the Free Software Foundation; either
+- * version 2.1 of the License, or (at your option) any later version.
++ * The version control history for this file may have further details.
+  *
+- * This library is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+- * Lesser General Public License for more details.
+- *
+- * You should have received a copy of the GNU Lesser General Public
+- * License along with this library; if not, write to the Free Software
+- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
++ * This source code is licensed under the GNU Lesser General Public License
++ * version 2.1 or later (LGPLv2.1+) WITHOUT ANY WARRANTY.
+  */
+ 
+ #include <crm_internal.h>
+@@ -38,6 +29,8 @@
+ 
+ #include <crm/msg_xml.h>
+ 
++#include <crm/common/ipc_internal.h>  /* PCMK__SPECIAL_PID* */
++
+ cpg_handle_t pcmk_cpg_handle = 0; /* TODO: Remove, use cluster.cpg_handle */
+ 
+ static bool cpg_evicted = FALSE;
+@@ -71,11 +64,16 @@ cluster_disconnect_cpg(crm_cluster_t *cluster)
+ 
+ uint32_t get_local_nodeid(cpg_handle_t handle)
+ {
+-    int rc = CS_OK;
++    cs_error_t rc = CS_OK;
+     int retries = 0;
+     static uint32_t local_nodeid = 0;
+     cpg_handle_t local_handle = handle;
+     cpg_callbacks_t cb = { };
++    int fd = -1;
++    uid_t found_uid = 0;
++    gid_t found_gid = 0;
++    pid_t found_pid = 0;
++    int rv;
+ 
+     if(local_nodeid != 0) {
+         return local_nodeid;
+@@ -92,6 +90,32 @@ uint32_t get_local_nodeid(cpg_handle_t handle)
+     if(handle == 0) {
+         crm_trace("Creating connection");
+         cs_repeat(retries, 5, rc = cpg_initialize(&local_handle, &cb));
++        if (rc != CS_OK) {
++            crm_err("Could not connect to the CPG API: %s (%d)",
++                    cs_strerror(rc), rc);
++            return 0;
++        }
++
++        rc = cpg_fd_get(local_handle, &fd);
++        if (rc != CS_OK) {
++            crm_err("Could not obtain the CPG API connection: %s (%d)",
++                    cs_strerror(rc), rc);
++            goto bail;
++        }
++
++        /* CPG provider run as root (in given user namespace, anyway)? */
++        if (!(rv = crm_ipc_is_authentic_process(fd, (uid_t) 0,(gid_t) 0, &found_pid,
++                                                &found_uid, &found_gid))) {
++            crm_err("CPG provider is not authentic:"
++                    " process %lld (uid: %lld, gid: %lld)",
++                    (long long) PCMK__SPECIAL_PID_AS_0(found_pid),
++                    (long long) found_uid, (long long) found_gid);
++            goto bail;
++        } else if (rv < 0) {
++            crm_err("Could not verify authenticity of CPG provider: %s (%d)",
++                    strerror(-rv), -rv);
++            goto bail;
++        }
+     }
+ 
+     if (rc == CS_OK) {
+@@ -103,6 +127,8 @@ uint32_t get_local_nodeid(cpg_handle_t handle)
+     if (rc != CS_OK) {
+         crm_err("Could not get local node id from the CPG API: %s (%d)", ais_error2text(rc), rc);
+     }
++
++bail:
+     if(handle == 0) {
+         crm_trace("Closing connection");
+         cpg_finalize(local_handle);
+@@ -435,12 +461,16 @@ pcmk_cpg_membership(cpg_handle_t handle,
+ gboolean
+ cluster_connect_cpg(crm_cluster_t *cluster)
+ {
+-    int rc = -1;
+-    int fd = 0;
++    cs_error_t rc;
++    int fd = -1;
+     int retries = 0;
+     uint32_t id = 0;
+     crm_node_t *peer = NULL;
+     cpg_handle_t handle = 0;
++    uid_t found_uid = 0;
++    gid_t found_gid = 0;
++    pid_t found_pid = 0;
++    int rv;
+ 
+     struct mainloop_fd_callbacks cpg_fd_callbacks = {
+         .dispatch = pcmk_cpg_dispatch,
+@@ -465,7 +495,31 @@ cluster_connect_cpg(crm_cluster_t *cluster)
+ 
+     cs_repeat(retries, 30, rc = cpg_initialize(&handle, &cpg_callbacks));
+     if (rc != CS_OK) {
+-        crm_err("Could not connect to the Cluster Process Group API: %d", rc);
++        crm_err("Could not connect to the CPG API: %s (%d)",
++                cs_strerror(rc), rc);
++        goto bail;
++    }
++
++    rc = cpg_fd_get(handle, &fd);
++    if (rc != CS_OK) {
++        crm_err("Could not obtain the CPG API connection: %s (%d)",
++                cs_strerror(rc), rc);
++        goto bail;
++    }
++
++    /* CPG provider run as root (in given user namespace, anyway)? */
++    if (!(rv = crm_ipc_is_authentic_process(fd, (uid_t) 0,(gid_t) 0, &found_pid,
++                                            &found_uid, &found_gid))) {
++        crm_err("CPG provider is not authentic:"
++                " process %lld (uid: %lld, gid: %lld)",
++                (long long) PCMK__SPECIAL_PID_AS_0(found_pid),
++                (long long) found_uid, (long long) found_gid);
++        rc = CS_ERR_ACCESS;
++        goto bail;
++    } else if (rv < 0) {
++        crm_err("Could not verify authenticity of CPG provider: %s (%d)",
++                strerror(-rv), -rv);
++        rc = CS_ERR_ACCESS;
+         goto bail;
+     }
+ 
+@@ -484,12 +538,6 @@ cluster_connect_cpg(crm_cluster_t *cluster)
+         goto bail;
+     }
+ 
+-    rc = cpg_fd_get(handle, &fd);
+-    if (rc != CS_OK) {
+-        crm_err("Could not obtain the CPG API connection: %d", rc);
+-        goto bail;
+-    }
+-
+     pcmk_cpg_handle = handle;
+     cluster->cpg_handle = handle;
+     mainloop_add_fd("corosync-cpg", G_PRIORITY_MEDIUM, fd, cluster, &cpg_fd_callbacks);
+diff --git a/lib/common/ipc.c b/lib/common/ipc.c
+index 5b47dd6..3e547f3 100644
+--- a/lib/common/ipc.c
++++ b/lib/common/ipc.c
+@@ -916,11 +916,18 @@ crm_ipc_new(const char *name, size_t max_size)
+  *
+  * \param[in] client  Connection instance obtained from crm_ipc_new()
+  *
+- * \return TRUE on success, FALSE otherwise (in which case errno will be set)
++ * \return TRUE on success, FALSE otherwise (in which case errno will be set;
++ *         specifically, in case of discovering the remote side is not
++ *         authentic, its value is set to ECONNABORTED).
+  */
+ bool
+ crm_ipc_connect(crm_ipc_t * client)
+ {
++    static uid_t cl_uid = 0;
++    static gid_t cl_gid = 0;
++    pid_t found_pid = 0; uid_t found_uid = 0; gid_t found_gid = 0;
++    int rv;
++
+     client->need_reply = FALSE;
+     client->ipc = qb_ipcc_connect(client->name, client->buf_size);
+ 
+@@ -931,7 +938,39 @@ crm_ipc_connect(crm_ipc_t * client)
+ 
+     client->pfd.fd = crm_ipc_get_fd(client);
+     if (client->pfd.fd < 0) {
+-        crm_debug("Could not obtain file descriptor for %s connection: %s (%d)", client->name, pcmk_strerror(errno), errno);
++        rv = errno;
++        /* message already omitted */
++        crm_ipc_close(client);
++        errno = rv;
++        return FALSE;
++    }
++
++    if (!cl_uid && !cl_gid
++            && (rv = crm_user_lookup(CRM_DAEMON_USER, &cl_uid, &cl_gid)) < 0) {
++        errno = -rv;
++        /* message already omitted */
++        crm_ipc_close(client);
++        errno = -rv;
++        return FALSE;
++    }
++
++    if (!(rv = crm_ipc_is_authentic_process(client->pfd.fd, cl_uid, cl_gid,
++                                            &found_pid, &found_uid,
++                                            &found_gid))) {
++        crm_err("Daemon (IPC %s) is not authentic:"
++                " process %lld (uid: %lld, gid: %lld)",
++                client->name,  (long long) PCMK__SPECIAL_PID_AS_0(found_pid),
++                (long long) found_uid, (long long) found_gid);
++        crm_ipc_close(client);
++        errno = ECONNABORTED;
++        return FALSE;
++
++    } else if (rv < 0) {
++        errno = -rv;
++        crm_perror(LOG_ERR, "Could not verify authenticity of daemon (IPC %s)",
++                   client->name);
++        crm_ipc_close(client);
++        errno = -rv;
+         return FALSE;
+     }
+ 
+diff --git a/mcp/corosync.c b/mcp/corosync.c
+index 7502da7..407a63f 100644
+--- a/mcp/corosync.c
++++ b/mcp/corosync.c
+@@ -1,19 +1,10 @@
+ /*
+- * Copyright (C) 2010 Andrew Beekhof <andrew@beekhof.net>
++ * Copyright 2010-2019 the Pacemaker project contributors
+  *
+- * This program is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU General Public
+- * License as published by the Free Software Foundation; either
+- * version 2 of the License, or (at your option) any later version.
++ * The version control history for this file may have further details.
+  *
+- * This software is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+- * General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public
+- * License along with this library; if not, write to the Free Software
+- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
++ * This source code is licensed under the GNU General Public License version 2
++ * or later (GPLv2+) WITHOUT ANY WARRANTY.
+  */
+ #include <crm_internal.h>
+ #include <pacemaker.h>
+@@ -33,8 +24,11 @@
+ #endif
+ 
+ #include <crm/cluster/internal.h>
++#include <crm/common/ipc.h>     /* for crm_ipc_is_authentic_process */
+ #include <crm/common/mainloop.h>
+ 
++#include <crm/common/ipc_internal.h>  /* PCMK__SPECIAL_PID* */
++
+ #if SUPPORT_CMAN
+ #  include <libcman.h>
+ #endif
+@@ -111,7 +105,10 @@ gboolean
+ cluster_connect_cfg(uint32_t * nodeid)
+ {
+     cs_error_t rc;
+-    int fd = 0, retries = 0;
++    int fd = -1, retries = 0, rv;
++    uid_t found_uid = 0;
++    gid_t found_gid = 0;
++    pid_t found_pid = 0;
+ 
+     static struct mainloop_fd_callbacks cfg_fd_callbacks = {
+         .dispatch = pcmk_cfg_dispatch,
+@@ -121,13 +118,27 @@ cluster_connect_cfg(uint32_t * nodeid)
+     cs_repeat(retries, 30, rc = corosync_cfg_initialize(&cfg_handle, &cfg_callbacks));
+ 
+     if (rc != CS_OK) {
+-        crm_err("corosync cfg init error %d", rc);
++        crm_err("corosync cfg init: %s (%d)", cs_strerror(rc), rc);
+         return FALSE;
+     }
+ 
+     rc = corosync_cfg_fd_get(cfg_handle, &fd);
+     if (rc != CS_OK) {
+-        crm_err("corosync cfg fd_get error %d", rc);
++        crm_err("corosync cfg fd_get: %s (%d)", cs_strerror(rc), rc);
++        goto bail;
++    }
++
++    /* CFG provider run as root (in given user namespace, anyway)? */
++    if (!(rv = crm_ipc_is_authentic_process(fd, (uid_t) 0,(gid_t) 0, &found_pid,
++                                            &found_uid, &found_gid))) {
++        crm_err("CFG provider is not authentic:"
++                " process %lld (uid: %lld, gid: %lld)",
++                (long long) PCMK__SPECIAL_PID_AS_0(found_pid),
++                (long long) found_uid, (long long) found_gid);
++        goto bail;
++    } else if (rv < 0) {
++        crm_err("Could not verify authenticity of CFG provider: %s (%d)",
++                strerror(-rv), -rv);
+         goto bail;
+     }
+ 
+@@ -264,7 +275,7 @@ get_config_opt(uint64_t unused, cmap_handle_t object_handle, const char *key, ch
+ gboolean
+ mcp_read_config(void)
+ {
+-    int rc = CS_OK;
++    cs_error_t rc = CS_OK;
+     int retries = 0;
+ 
+     const char *const_value = NULL;
+@@ -287,11 +298,16 @@ mcp_read_config(void)
+         } else {
+             break;
+         }
+-
+     } while (retries < 5);
++
+ #elif HAVE_CMAP
+     cmap_handle_t local_handle;
+     uint64_t config = 0;
++    int fd = -1;
++    uid_t found_uid = 0;
++    gid_t found_gid = 0;
++    pid_t found_pid = 0;
++    int rv;
+ 
+     /* There can be only one (possibility if confdb isn't around) */
+     do {
+@@ -315,6 +331,30 @@ mcp_read_config(void)
+         return FALSE;
+     }
+ 
++    rc = cmap_fd_get(local_handle, &fd);
++    if (rc != CS_OK) {
++        crm_err("Could not obtain the CMAP API connection: %s (%d)",
++                cs_strerror(rc), rc);
++        cmap_finalize(local_handle);
++        return FALSE;
++    }
++
++    /* CMAP provider run as root (in given user namespace, anyway)? */
++    if (!(rv = crm_ipc_is_authentic_process(fd, (uid_t) 0,(gid_t) 0, &found_pid,
++                                            &found_uid, &found_gid))) {
++        crm_err("CMAP provider is not authentic:"
++                " process %lld (uid: %lld, gid: %lld)",
++                (long long) PCMK__SPECIAL_PID_AS_0(found_pid),
++                (long long) found_uid, (long long) found_gid);
++        cmap_finalize(local_handle);
++        return FALSE;
++    } else if (rv < 0) {
++        crm_err("Could not verify authenticity of CMAP provider: %s (%d)",
++                strerror(-rv), -rv);
++        cmap_finalize(local_handle);
++        return FALSE;
++    }
++
+     stack = get_cluster_type();
+     crm_info("Reading configure for stack: %s", name_for_cluster_type(stack));
+ 
+-- 
+1.8.3.1
+
+
+From 4d6f6e01b309cda7b3f8fe791247566d247d8028 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jan=20Pokorn=C3=BD?= <jpokorny@redhat.com>
+Date: Tue, 16 Apr 2019 00:08:28 +0200
+Subject: [PATCH 6/7] High: pacemakerd vs. IPC/procfs confused deputy
+ authenticity issue (4/4)
+
+[4/4: CPG users to be careful about now-more-probable rival processes]
+
+In essence, this comes down to pacemaker confusing at-node CPG members
+with effectively the only plausible to co-exist at particular node,
+which doesn't hold and asks for a wider reconciliation of this
+reality-check.
+
+However, in practical terms, since there are two factors lowering the
+priority of doing so:
+
+1/ possibly the only non-self-inflicted scenario is either that
+   some of the cluster stack processes fail -- this the problem
+   that shall rather be deferred to arranged node disarming/fencing
+   to stay on the safe side with 100% certainty, at the cost of
+   possibly long-lasting failover process at other nodes
+   (for other possibility, someone running some of these by accident
+   so they effectively become rival processes, it's like getting
+   hands cut when playing with a lawnmower in an unintended way)
+
+2/ for state tracking of the peer nodes, it may possibly cause troubles
+   in case the process observed as left wasn't the last for the
+   particular node, even if presumably just temporary, since the
+   situation may eventually resolve with imposed serialization of
+   the rival processes via API end-point singleton restriction (this
+   is also the most likely cause of why such non-final leave gets
+   observed in the first place), except in one case -- the legitimate
+   API end-point carrier won't possibly acknowledged as returned
+   by its peers, at least not immediately, unless it tries to join
+   anew, which verges on undefined behaviour (at least per corosync
+   documentation)
+
+we make do just with a light code change so as to
+
+* limit 1/ some more with in-daemon self-check for pre-existing
+  end-point existence (this is to complement the checks already made in
+  the parent daemon prior to spawning new instances, only some moments
+  later; note that we don't have any lock file etc. mechanisms to
+  prevent parallel runs of the same daemons, and people could run these
+  on their own deliberation), and to
+
+* guard against the interferences from the rivals at the same node
+  per 2/ with ignoring their non-final leave messages altogether.
+
+Note that CPG at this point is already expected to be authenticity-safe.
+
+Regarding now-more-probable part, we actually traded the inherently racy
+procfs scanning for something (exactly that singleton mentioned above)
+rather firm (and unfakeable), but we admittedly got lost track of
+processes that are after CPG membership (that is, another form of
+a shared state) prior to (or in non-deterministic order allowing for
+the same) carring about publishing the end-point.
+
+Big thanks is owed to Yan Gao of SUSE, for early discovery and reporting
+this discrepancy arising from the earlier commits in the set.
+---
+ attrd/main.c      | 19 ++++++++++-
+ cib/main.c        | 35 ++++++++++++---------
+ crmd/main.c       | 35 ++++++++++++---------
+ fencing/main.c    | 32 +++++++++++--------
+ lib/cluster/cpg.c | 94 ++++++++++++++++++++++++++++++++++++++++++++++++++-----
+ 5 files changed, 163 insertions(+), 52 deletions(-)
+
+diff --git a/attrd/main.c b/attrd/main.c
+index 4cc15cc..e0a1e7c 100644
+--- a/attrd/main.c
++++ b/attrd/main.c
+@@ -1,5 +1,7 @@
+ /*
+- * Copyright 2013-2019 Andrew Beekhof <andrew@beekhof.net>
++ * Copyright 2013-2019 the Pacemaker project contributors
++ *
++ * The version control history for this file may have further details.
+  *
+  * This program is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU General Public
+@@ -336,6 +338,7 @@ main(int argc, char **argv)
+     int index = 0;
+     int argerr = 0;
+     qb_ipcs_service_t *ipcs = NULL;
++    crm_ipc_t *old_instance = NULL;
+ 
+     attrd_init_mainloop();
+     crm_log_preinit(NULL, argc, argv);
+@@ -372,6 +375,20 @@ main(int argc, char **argv)
+ 
+     crm_log_init(T_ATTRD, LOG_INFO, TRUE, FALSE, argc, argv, FALSE);
+     crm_info("Starting up");
++
++    old_instance = crm_ipc_new(T_ATTRD, 0);
++    if (crm_ipc_connect(old_instance)) {
++        /* IPC end-point already up */
++        crm_ipc_close(old_instance);
++        crm_ipc_destroy(old_instance);
++        crm_err("attrd is already active, aborting startup");
++        crm_exit(EX_OK);
++    } else {
++        /* not up or not authentic, we'll proceed either way */
++        crm_ipc_destroy(old_instance);
++        old_instance = NULL;
++    }
++
+     attributes = g_hash_table_new_full(crm_str_hash, g_str_equal, NULL, free_attribute);
+ 
+     attrd_exit_status = attrd_cluster_connect();
+diff --git a/cib/main.c b/cib/main.c
+index 5473d40..7c745da 100644
+--- a/cib/main.c
++++ b/cib/main.c
+@@ -1,19 +1,10 @@
+ /*
+- * Copyright (C) 2004 Andrew Beekhof <andrew@beekhof.net>
++ * Copyright 2004-2019 the Pacemaker project contributors
+  *
+- * This program is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU General Public
+- * License as published by the Free Software Foundation; either
+- * version 2 of the License, or (at your option) any later version.
++ * The version control history for this file may have further details.
+  *
+- * This software is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+- * General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public
+- * License along with this library; if not, write to the Free Software
+- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
++ * This source code is licensed under the GNU General Public License version 2
++ * or later (GPLv2+) WITHOUT ANY WARRANTY.
+  */
+ 
+ #include <crm_internal.h>
+@@ -135,13 +126,12 @@ main(int argc, char **argv)
+     int index = 0;
+     int argerr = 0;
+     struct passwd *pwentry = NULL;
++    crm_ipc_t *old_instance = NULL;
+ 
+     crm_log_preinit(NULL, argc, argv);
+     crm_set_options(NULL, "[options]",
+                     long_options, "Daemon for storing and replicating the cluster configuration");
+ 
+-    crm_peer_init();
+-
+     mainloop_add_signal(SIGTERM, cib_shutdown);
+     mainloop_add_signal(SIGPIPE, cib_enable_writes);
+ 
+@@ -216,6 +206,19 @@ main(int argc, char **argv)
+ 
+     crm_log_init(NULL, LOG_INFO, TRUE, FALSE, argc, argv, FALSE);
+ 
++    old_instance = crm_ipc_new(cib_channel_ro, 0);
++    if (crm_ipc_connect(old_instance)) {
++        /* IPC end-point already up */
++        crm_ipc_close(old_instance);
++        crm_ipc_destroy(old_instance);
++        crm_err("cib is already active, aborting startup");
++        crm_exit(EX_OK);
++    } else {
++        /* not up or not authentic, we'll proceed either way */
++        crm_ipc_destroy(old_instance);
++        old_instance = NULL;
++    }
++
+     if (cib_root == NULL) {
+         if ((g_file_test(CRM_CONFIG_DIR "/cib.xml", G_FILE_TEST_EXISTS) == FALSE)
+             && (g_file_test(CRM_LEGACY_CONFIG_DIR "/cib.xml", G_FILE_TEST_EXISTS) == TRUE)) {
+@@ -238,6 +241,8 @@ main(int argc, char **argv)
+         return 100;
+     }
+ 
++    crm_peer_init();
++
+     /* read local config file */
+     rc = cib_init();
+ 
+diff --git a/crmd/main.c b/crmd/main.c
+index e8baa12..6eb7c03 100644
+--- a/crmd/main.c
++++ b/crmd/main.c
+@@ -1,19 +1,10 @@
+ /* 
+- * Copyright (C) 2004 Andrew Beekhof <andrew@beekhof.net>
+- * 
+- * This program is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU General Public
+- * License as published by the Free Software Foundation; either
+- * version 2 of the License, or (at your option) any later version.
+- * 
+- * This software is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+- * General Public License for more details.
+- * 
+- * You should have received a copy of the GNU General Public
+- * License along with this library; if not, write to the Free Software
+- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
++ * Copyright 2004-2019 the Pacemaker project contributors
++ *
++ * The version control history for this file may have further details.
++ *
++ * This source code is licensed under the GNU General Public License version 2
++ * or later (GPLv2+) WITHOUT ANY WARRANTY.
+  */
+ 
+ #include <crm_internal.h>
+@@ -61,6 +52,7 @@ main(int argc, char **argv)
+     int flag;
+     int index = 0;
+     int argerr = 0;
++    crm_ipc_t *old_instance = NULL;
+ 
+     crmd_mainloop = g_main_new(FALSE);
+     crm_log_preinit(NULL, argc, argv);
+@@ -104,6 +96,19 @@ main(int argc, char **argv)
+         crm_help('?', EX_USAGE);
+     }
+ 
++    old_instance = crm_ipc_new(CRM_SYSTEM_CRMD, 0);
++    if (crm_ipc_connect(old_instance)) {
++        /* IPC end-point already up */
++        crm_ipc_close(old_instance);
++        crm_ipc_destroy(old_instance);
++        crm_err("crmd is already active, aborting startup");
++        crm_exit(EX_OK);
++    } else {
++        /* not up or not authentic, we'll proceed either way */
++        crm_ipc_destroy(old_instance);
++        old_instance = NULL;
++    }
++
+     if (pcmk__daemon_can_write(PE_STATE_DIR, NULL) == FALSE) {
+         crm_err("Terminating due to bad permissions on " PE_STATE_DIR);
+         fprintf(stderr,
+diff --git a/fencing/main.c b/fencing/main.c
+index 16663f6..c46c9a5 100644
+--- a/fencing/main.c
++++ b/fencing/main.c
+@@ -1,19 +1,10 @@
+ /*
+- * Copyright (C) 2009 Andrew Beekhof <andrew@beekhof.net>
++ * Copyright 2009-2019 the Pacemaker project contributors
+  *
+- * This program is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU General Public
+- * License as published by the Free Software Foundation; either
+- * version 2 of the License, or (at your option) any later version.
++ * The version control history for this file may have further details.
+  *
+- * This software is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+- * General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public
+- * License along with this library; if not, write to the Free Software
+- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
++ * This source code is licensed under the GNU General Public License version 2
++ * or later (GPLv2+) WITHOUT ANY WARRANTY.
+  */
+ 
+ #include <crm_internal.h>
+@@ -1289,6 +1280,7 @@ main(int argc, char **argv)
+     int option_index = 0;
+     crm_cluster_t cluster;
+     const char *actions[] = { "reboot", "off", "on", "list", "monitor", "status" };
++    crm_ipc_t *old_instance = NULL;
+ 
+     crm_log_preinit("stonith-ng", argc, argv);
+     crm_set_options(NULL, "mode [options]", long_options,
+@@ -1459,6 +1451,20 @@ main(int argc, char **argv)
+     }
+ 
+     crm_log_init("stonith-ng", LOG_INFO, TRUE, FALSE, argc, argv, FALSE);
++
++    old_instance = crm_ipc_new("stonith-ng", 0);
++    if (crm_ipc_connect(old_instance)) {
++        /* IPC end-point already up */
++        crm_ipc_close(old_instance);
++        crm_ipc_destroy(old_instance);
++        crm_err("stonithd is already active, aborting startup");
++        crm_exit(EX_OK);
++    } else {
++        /* not up or not authentic, we'll proceed either way */
++        crm_ipc_destroy(old_instance);
++        old_instance = NULL;
++    }
++
+     mainloop_add_signal(SIGTERM, stonith_shutdown);
+ 
+     crm_peer_init();
+diff --git a/lib/cluster/cpg.c b/lib/cluster/cpg.c
+index a61d492..c5ecc67 100644
+--- a/lib/cluster/cpg.c
++++ b/lib/cluster/cpg.c
+@@ -385,6 +385,20 @@ pcmk_message_common_cs(cpg_handle_t handle, uint32_t nodeid, uint32_t pid, void
+     return NULL;
+ }
+ 
++static int cmp_member_list_nodeid(const void *first,
++                                  const void *second)
++{
++    const struct cpg_address *const a = *((const struct cpg_address **) first),
++                             *const b = *((const struct cpg_address **) second);
++    if (a->nodeid < b->nodeid) {
++        return -1;
++    } else if (a->nodeid > b->nodeid) {
++        return 1;
++    }
++    /* don't bother with "reason" nor "pid" */
++    return 0;
++}
++
+ void
+ pcmk_cpg_membership(cpg_handle_t handle,
+                     const struct cpg_name *groupName,
+@@ -396,29 +410,91 @@ pcmk_cpg_membership(cpg_handle_t handle,
+     gboolean found = FALSE;
+     static int counter = 0;
+     uint32_t local_nodeid = get_local_nodeid(handle);
++    const struct cpg_address *key, **rival, **sorted;
++
++    sorted = malloc(member_list_entries * sizeof(const struct cpg_address *));
++    CRM_ASSERT(sorted != NULL);
++
++    for (size_t iter = 0; iter < member_list_entries; iter++) {
++        sorted[iter] = member_list + iter;
++    }
++    /* so that the cross-matching multiply-subscribed nodes is then cheap */
++    qsort(sorted, member_list_entries, sizeof(const struct cpg_address *),
++          cmp_member_list_nodeid);
+ 
+     for (i = 0; i < left_list_entries; i++) {
+         crm_node_t *peer = crm_find_peer(left_list[i].nodeid, NULL);
+ 
+-        crm_info("Node %u left group %s (peer=%s, counter=%d.%d)",
++        crm_info("Node %u left group %s (peer=%s:%llu, counter=%d.%d)",
+                  left_list[i].nodeid, groupName->value,
+-                 (peer? peer->uname : "<none>"), counter, i);
++                 (peer? peer->uname : "<none>"),
++                 (unsigned long long) left_list[i].pid, counter, i);
++
++        /* in CPG world, NODE:PROCESS-IN-MEMBERSHIP-OF-G is an 1:N relation
++           and not playing by this rule may go wild in case of multiple
++           residual instances of the same pacemaker daemon at the same node
++           -- we must ensure that the possible local rival(s) won't make us
++           cry out and bail (e.g. when they quit themselves), since all the
++           surrounding logic denies this simple fact that the full membership
++           is discriminated also per the PID of the process beside mere node
++           ID (and implicitly, group ID); practically, this will be sound in
++           terms of not preventing progress, since all the CPG joiners are
++           also API end-point carriers, and that's what matters locally
++           (who's the winner);
++           remotely, we will just compare leave_list and member_list and if
++           the left process has it's node retained in member_list (under some
++           other PID, anyway) we will just ignore it as well
++           XXX: long-term fix is to establish in-out PID-aware tracking? */
+         if (peer) {
+-            crm_update_peer_proc(__FUNCTION__, peer, crm_proc_cpg, OFFLINESTATUS);
++            key = &left_list[i];
++            rival = bsearch(&key, sorted, member_list_entries,
++                            sizeof(const struct cpg_address *),
++                            cmp_member_list_nodeid);
++            if (rival == NULL) {
++                crm_update_peer_proc(__FUNCTION__, peer, crm_proc_cpg,
++                                     OFFLINESTATUS);
++            } else if (left_list[i].nodeid == local_nodeid) {
++                crm_info("Ignoring the above event %s.%d, comes from a local"
++                         " rival process (presumably not us): %llu",
++                         groupName->value, counter,
++                         (unsigned long long) left_list[i].pid);
++            } else {
++                crm_info("Ignoring the above event %s.%d, comes from"
++                         " a rival-rich node: %llu (e.g. %llu process"
++                         " carries on)",
++                         groupName->value, counter,
++                         (unsigned long long) left_list[i].pid,
++                         (unsigned long long) (*rival)->pid);
++            }
+         }
+     }
++    free(sorted);
++    sorted = NULL;
+ 
+     for (i = 0; i < joined_list_entries; i++) {
+-        crm_info("Node %u joined group %s (counter=%d.%d)",
+-                 joined_list[i].nodeid, groupName->value, counter, i);
++        crm_info("Node %u joined group %s (counter=%d.%d, pid=%llu,"
++                 " unchecked for rivals)",
++                 joined_list[i].nodeid, groupName->value, counter, i,
++                 (unsigned long long) left_list[i].pid);
+     }
+ 
+     for (i = 0; i < member_list_entries; i++) {
+         crm_node_t *peer = crm_get_peer(member_list[i].nodeid, NULL);
+ 
+-        crm_info("Node %u still member of group %s (peer=%s, counter=%d.%d)",
++        crm_info("Node %u still member of group %s (peer=%s:%llu,"
++                 " counter=%d.%d, at least once)",
+                  member_list[i].nodeid, groupName->value,
+-                 (peer? peer->uname : "<none>"), counter, i);
++                 (peer? peer->uname : "<none>"), member_list[i].pid,
++                 counter, i);
++
++        if (member_list[i].nodeid == local_nodeid
++                && member_list[i].pid != getpid()) {
++            /* see the note above */
++            crm_info("Ignoring the above event %s.%d, comes from a local rival"
++                     " process: %llu", groupName->value, counter,
++                     (unsigned long long) member_list[i].pid);
++            continue;
++        }
+ 
+         /* Anyone that is sending us CPG messages must also be a _CPG_ member.
+          * But it's _not_ safe to assume it's in the quorum membership.
+@@ -438,7 +514,9 @@ pcmk_cpg_membership(cpg_handle_t handle,
+                  *
+                  * Set the threshold to 1 minute
+                  */
+-                crm_err("Node %s[%u] appears to be online even though we think it is dead", peer->uname, peer->id);
++                crm_err("Node %s[%u] appears to be online even though we think"
++                        " it is dead (unchecked for rivals)",
++                        peer->uname, peer->id);
+                 if (crm_update_peer_state(__FUNCTION__, peer, CRM_NODE_MEMBER, 0)) {
+                     peer->votes = 0;
+                 }
+-- 
+1.8.3.1
+
+
+From 9dc38d81cb6e1967c368faed78de1927cabf06b3 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jan=20Pokorn=C3=BD?= <jpokorny@redhat.com>
+Date: Wed, 17 Apr 2019 15:17:50 +0200
+Subject: [PATCH 7/7] Med: controld: fix possible NULL pointer dereference
+
+This is now more likely triggerable once the problems related to
+CVE-2018-16878 are avoided.
+---
+ crmd/control.c | 32 +++++++++++++-------------------
+ 1 file changed, 13 insertions(+), 19 deletions(-)
+
+diff --git a/crmd/control.c b/crmd/control.c
+index e01066a..488ea88 100644
+--- a/crmd/control.c
++++ b/crmd/control.c
+@@ -1,19 +1,10 @@
+ /*
+- * Copyright (C) 2004 Andrew Beekhof <andrew@beekhof.net>
++ * Copyright 2004-2019 the Pacemaker project contributors
+  *
+- * This program is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU General Public
+- * License as published by the Free Software Foundation; either
+- * version 2 of the License, or (at your option) any later version.
++ * The version control history for this file may have further details.
+  *
+- * This software is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+- * General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public
+- * License along with this library; if not, write to the Free Software
+- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
++ * This source code is licensed under the GNU General Public License version 2
++ * or later (GPLv2+) WITHOUT ANY WARRANTY.
+  */
+ 
+ #include <crm_internal.h>
+@@ -127,12 +118,15 @@ do_ha_control(long long action,
+             }
+ #endif
+         }
+-        controld_election_init(cluster->uname);
+-        fsa_our_uname = cluster->uname;
+-        fsa_our_uuid = cluster->uuid;
+-        if(cluster->uuid == NULL) {
+-            crm_err("Could not obtain local uuid");
+-            registered = FALSE;
++
++        if (registered == TRUE) {
++            controld_election_init(cluster->uname);
++            fsa_our_uname = cluster->uname;
++            fsa_our_uuid = cluster->uuid;
++            if(cluster->uuid == NULL) {
++                crm_err("Could not obtain local uuid");
++                registered = FALSE;
++            }
+         }
+ 
+         if (registered == FALSE) {
+-- 
+1.8.3.1
+

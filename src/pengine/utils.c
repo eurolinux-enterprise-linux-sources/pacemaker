@@ -1,5 +1,5 @@
 /* 
- * Copyright (C) 2004 Andrew Beekhof <andrew@beekhof.net>
+ * Copyright 2004-2019 Andrew Beekhof <andrew@beekhof.net>
  * 
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public
@@ -21,50 +21,12 @@
 #include <allocate.h>
 #include <utils.h>
 
-void
-pe_free_ordering(GListPtr constraints)
-{
-    GListPtr iterator = constraints;
-
-    while (iterator != NULL) {
-        order_constraint_t *order = iterator->data;
-
-        iterator = iterator->next;
-
-        free(order->lh_action_task);
-        free(order->rh_action_task);
-        free(order);
-    }
-    if (constraints != NULL) {
-        g_list_free(constraints);
-    }
-}
-
-void
-pe_free_rsc_to_node(GListPtr constraints)
-{
-    GListPtr iterator = constraints;
-
-    while (iterator != NULL) {
-        rsc_to_node_t *cons = iterator->data;
-
-        iterator = iterator->next;
-
-        g_list_free_full(cons->node_list_rh, free);
-        free(cons->id);
-        free(cons);
-    }
-    if (constraints != NULL) {
-        g_list_free(constraints);
-    }
-}
-
-rsc_to_node_t *
-rsc2node_new(const char *id, resource_t * rsc,
+pe__location_t *
+rsc2node_new(const char *id, pe_resource_t *rsc,
              int node_weight, const char *discover_mode,
-             node_t * foo_node, pe_working_set_t * data_set)
+             pe_node_t *foo_node, pe_working_set_t *data_set)
 {
-    rsc_to_node_t *new_con = NULL;
+    pe__location_t *new_con = NULL;
 
     if (rsc == NULL || id == NULL) {
         pe_err("Invalid constraint %s for rsc=%p", crm_str(id), rsc);
@@ -74,7 +36,7 @@ rsc2node_new(const char *id, resource_t * rsc,
         CRM_CHECK(node_weight == 0, return NULL);
     }
 
-    new_con = calloc(1, sizeof(rsc_to_node_t));
+    new_con = calloc(1, sizeof(pe__location_t));
     if (new_con != NULL) {
         new_con->id = strdup(id);
         new_con->rsc_lh = rsc;
@@ -439,4 +401,31 @@ create_pseudo_resource_op(resource_t * rsc, const char *task, bool optional, boo
         update_action_flags(action, pe_action_runnable, __FUNCTION__, __LINE__);
     }
     return action;
+}
+
+/*!
+ * \internal
+ * \brief Create a shutdown op for a scheduler transition
+ *
+ * \param[in] rsc          Resource of action to cancel
+ * \param[in] task         Name of action to cancel
+ * \param[in] interval_ms  Interval of action to cancel
+ * \param[in] node         Node of action to cancel
+ * \param[in] data_set     Working set of cluster
+ *
+ * \return Created op
+ */
+pe_action_t *
+sched_shutdown_op(pe_node_t *node, pe_working_set_t *data_set)
+{
+    char *shutdown_id = crm_strdup_printf("%s-%s", CRM_OP_SHUTDOWN,
+                                          node->details->uname);
+
+    pe_action_t *shutdown_op = custom_action(NULL, shutdown_id, CRM_OP_SHUTDOWN,
+                                             node, FALSE, TRUE, data_set);
+
+    crm_notice("Scheduling shutdown of node %s", node->details->uname);
+    shutdown_constraints(node, shutdown_op, data_set);
+    add_hash_param(shutdown_op->meta, XML_ATTR_TE_NOWAIT, XML_BOOLEAN_TRUE);
+    return shutdown_op;
 }

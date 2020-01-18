@@ -21,6 +21,9 @@
 #include <crm/common/mainloop.h>
 #include <crm/cluster/internal.h>
 #include <crm/cluster.h>
+#ifdef SUPPORT_COROSYNC
+#include <corosync/cfg.h>
+#endif
 
 #include <dirent.h>
 #include <ctype.h>
@@ -68,7 +71,6 @@ static pcmk_child_t pcmk_children[] = {
 /* *INDENT-ON* */
 
 static gboolean start_child(pcmk_child_t * child);
-static gboolean check_active_before_startup_processes(gpointer user_data);
 void update_process_clients(crm_client_t *client);
 void update_process_peers(void);
 
@@ -140,6 +142,28 @@ pcmk_process_exit(pcmk_child_t * child)
         crm_notice("Respawning failed child process: %s", child->name);
         start_child(child);
     }
+}
+
+static void pcmk_exit_with_cluster(int exitcode)
+{
+#ifdef SUPPORT_COROSYNC
+    corosync_cfg_handle_t cfg_handle;
+    cs_error_t err;
+
+    if (exitcode == DAEMON_RESPAWN_STOP) {
+	    crm_info("Asking Corosync to shut down");
+	    err = corosync_cfg_initialize(&cfg_handle, NULL);
+	    if (err != CS_OK) {
+		    crm_warn("Unable to open handle to corosync to close it down. err=%d", err);
+	    }
+	    err = corosync_cfg_try_shutdown(cfg_handle, COROSYNC_CFG_SHUTDOWN_FLAG_IMMEDIATE);
+	    if (err != CS_OK) {
+		    crm_warn("Corosync shutdown failed. err=%d", err);
+	    }
+	    corosync_cfg_finalize(cfg_handle);
+    }
+#endif
+    crm_exit(exitcode);
 }
 
 static void
@@ -367,9 +391,6 @@ pcmk_shutdown_worker(gpointer user_data)
     if (phase == 0) {
         crm_notice("Shutting down Pacemaker");
         phase = max;
-
-        /* Add a second, more frequent, check to speed up shutdown */
-        g_timeout_add_seconds(5, check_active_before_startup_processes, NULL);
     }
 
     for (; phase > 0; phase--) {
@@ -423,7 +444,7 @@ pcmk_shutdown_worker(gpointer user_data)
 
     if (fatal_error) {
         crm_notice("Attempting to inhibit respawning after fatal error");
-        crm_exit(DAEMON_RESPAWN_STOP);
+        pcmk_exit_with_cluster(DAEMON_RESPAWN_STOP);
     }
 
     return TRUE;
@@ -675,6 +696,7 @@ mcp_chown(const char *path, uid_t uid, gid_t gid)
     }
 }
 
+#if SUPPORT_PROCFS
 static gboolean
 check_active_before_startup_processes(gpointer user_data)
 {
@@ -710,6 +732,7 @@ check_active_before_startup_processes(gpointer user_data)
 
     return keep_tracking;
 }
+#endif // SUPPORT_PROCFS
 
 static void
 find_and_track_existing_processes(void)

@@ -146,6 +146,8 @@ peer_update_callback(enum crm_status_type type, crm_node_t * node, const void *d
                 if (!is_remote) {
                     remove_stonith_cleanup(node->uname);
                 }
+            } else {
+                controld_remove_voter(node->uname);
             }
 
             crmd_alert_node_event(node);
@@ -166,7 +168,13 @@ peer_update_callback(enum crm_status_type type, crm_node_t * node, const void *d
                 /* Peer process did not change */
                 crm_trace("No change %6x %6x %6x", old, node->processes, proc_flags);
                 return;
-            } else if (is_not_set(fsa_input_register, R_CIB_CONNECTED)) {
+            }
+
+            if (!appeared) {
+                controld_remove_voter(node->uname);
+            }
+
+            if (is_not_set(fsa_input_register, R_CIB_CONNECTED)) {
                 crm_trace("Not connected");
                 return;
             } else if (fsa_state == S_STOPPING) {
@@ -197,9 +205,15 @@ peer_update_callback(enum crm_status_type type, crm_node_t * node, const void *d
                     erase_status_tag(node->uname, XML_TAG_TRANSIENT_NODEATTRS, cib_scope_local);
                 }
 
-            } else if(AM_I_DC && appeared == FALSE) {
-                crm_info("Peer %s left us", node->uname);
-                erase_status_tag(node->uname, XML_TAG_TRANSIENT_NODEATTRS, cib_scope_local);
+            } else if(AM_I_DC) {
+                if (appeared == FALSE) {
+                    crm_info("Peer %s left us", node->uname);
+                    erase_status_tag(node->uname, XML_TAG_TRANSIENT_NODEATTRS, cib_scope_local);
+                } else {
+                    crm_info("New peer %s we want to sync fence history with",
+                             node->uname);
+                    te_trigger_stonith_history_sync();
+                }
             }
             break;
     }
@@ -278,8 +292,11 @@ peer_update_callback(enum crm_status_type type, crm_node_t * node, const void *d
 
         /* Update the CIB node state */
         update = create_node_state_update(node, flags, NULL, __FUNCTION__);
-        fsa_cib_anon_update(XML_CIB_TAG_STATUS, update,
-                            cib_scope_local | cib_quorum_override | cib_can_create);
+        if (update == NULL) {
+            crm_debug("Node state update not yet possible for %s", node->uname);
+        } else {
+            fsa_cib_anon_update(XML_CIB_TAG_STATUS, update);
+        }
         free_xml(update);
     }
 

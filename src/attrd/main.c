@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2013 Andrew Beekhof <andrew@beekhof.net>
+ * Copyright 2013-2019 Andrew Beekhof <andrew@beekhof.net>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public
@@ -35,17 +35,14 @@
 #include <crm/common/iso8601.h>
 #include <crm/common/ipc.h>
 #include <crm/common/ipcs.h>
-#include <crm/cluster/internal.h>
-#include <crm/cluster/election.h>
-
 #include <crm/common/xml.h>
+#include <crm/cluster/internal.h>
 
 #include <crm/attrd.h>
 #include <internal.h>
 
 lrmd_t *the_lrmd = NULL;
 crm_cluster_t *attrd_cluster = NULL;
-election_t *writer = NULL;
 crm_trigger_t *attrd_config_read = NULL;
 static int attrd_exit_status = pcmk_ok;
 
@@ -96,9 +93,12 @@ static void
 attrd_cib_replaced_cb(const char *event, xmlNode * msg)
 {
     crm_notice("Updating all attributes after %s event", event);
-    if(election_state(writer) == election_won) {
-        write_attributes(TRUE);
+    if (attrd_election_won()) {
+        write_attributes(TRUE, FALSE);
     }
+
+    // Check for changes in alerts
+    mainloop_set_trigger(attrd_config_read);
 }
 
 static void
@@ -380,22 +380,22 @@ main(int argc, char **argv)
     }
     crm_info("Cluster connection active");
 
+    attrd_election_init();
+
     attrd_exit_status = attrd_cib_connect(10);
     if (attrd_exit_status != pcmk_ok) {
         goto done;
     }
     crm_info("CIB connection active");
 
-    writer = election_init(T_ATTRD, attrd_cluster->uname, 120000, attrd_election_cb);
     attrd_init_ipc(&ipcs, attrd_ipc_dispatch);
     crm_info("Accepting attribute updates");
-
     attrd_run_mainloop();
 
   done:
     crm_info("Shutting down attribute manager");
 
-    election_fini(writer);
+    attrd_election_fini();
     if (ipcs) {
         crm_client_disconnect_all(ipcs);
         qb_ipcs_destroy(ipcs);
